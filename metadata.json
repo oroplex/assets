@@ -1,0 +1,29 @@
+{
+  "name": "wORLX",
+  "symbol": "wORLX",
+  "description": "wORLX (Wrapped Oroplex) is a BTC hashpower-backed utility token designed for high-speed DeFi on Solana. Each token is backed by real Bitcoin mining hashpower, with yields and treasury growth transparently tracked on-chain.",
+  "image": "https://raw.githubusercontent.com/oroplex/assets/main/worlx-logo.png",
+  "external_url": "https://oroplex.lovable.app",
+  "seller_fee_basis_points": 0,
+  "attributes": [
+    { "trait_type": "Backing", "value": "BTC hashpower" },
+    { "trait_type": "Network", "value": "Solana Devnet" },
+    { "trait_type": "Standard", "value": "Fungible Token (SPL)" },
+    { "trait_type": "Token Type", "value": "Wrapped Oroplex (wORLX)" }
+  ],
+  "properties": {
+    "category": "token",
+    "creators": [
+      {
+        "address": "qZeAX9TkfdBuC2k3YaNGXCNL9qaKzABUwSbJLqQAuxD",
+        "share": 100
+      }
+    ],
+    "files": [
+      {
+        "uri": "https://raw.githubusercontent.com/oroplex/assets/main/worlx-logo.png",
+        "type": "image/png"
+      }
+    ]
+  }
+}

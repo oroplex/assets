@@ -9,8 +9,10 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.TextMeasurer
@@ -55,6 +57,13 @@ internal object OverlayColors {
     }
 }
 
+/** Overlay color of a wall's quality grade (green / amber / red). */
+internal fun gradeColor(grade: CaptureGrade): Color = when (grade) {
+    CaptureGrade.GOOD -> OverlayColors.Good
+    CaptureGrade.FAIR -> OverlayColors.Caution
+    CaptureGrade.POOR -> OverlayColors.Bad
+}
+
 /** Beyond this reticle distance, depth readings get too noisy for accurate walls. */
 internal const val MAX_ACCURATE_DISTANCE = 4.0
 
@@ -73,6 +82,8 @@ internal data class OverlayGeometry(
     val walls: List<WallLine>,
     val edges: List<EdgeLine>,
     val cornerTaps: List<Vec2>,
+    /** Corner being re-captured (index into [cornerTaps]). */
+    val highlightedCorner: Int?,
     val openings: List<OpeningLine>,
     /** First mark of a baseline wall or of an opening, waiting for its second mark. */
     val pendingMark: Vec2?,
@@ -82,12 +93,23 @@ internal data class OverlayGeometry(
     val rubberBandFromLastCorner: Boolean,
     val fadedWalls: Boolean,
     val showReticle: Boolean,
-    /** Warn when the reticle is beyond accurate range (only while measuring). */
+    /** Color the distance readout when the reticle is beyond accurate range (capture steps only). */
     val warnRange: Boolean,
 ) {
-    data class WallLine(val a: Vec2, val b: Vec2, val labelAt: Vec2, val label: String)
+    /** A captured wall, numbered in capture order; [highlighted] while it is being re-captured. */
+    data class WallLine(
+        val a: Vec2,
+        val b: Vec2,
+        val labelAt: Vec2,
+        val label: String,
+        val grade: CaptureGrade,
+        val highlighted: Boolean,
+    )
+
     data class EdgeLine(val a: Vec2, val b: Vec2, val labelAt: Vec2, val label: String)
-    data class OpeningLine(val a: Vec2, val b: Vec2, val color: Color)
+
+    /** [parked]: kept while the room is reopened; drawn dimmed until it is placed on a wall again. */
+    data class OpeningLine(val a: Vec2, val b: Vec2, val color: Color, val parked: Boolean = false)
 
     companion object {
         fun from(ui: CaptureUiState): OverlayGeometry {
@@ -100,7 +122,7 @@ internal data class OverlayGeometry(
                 val b = o.extentEnd + dir * WALL_LINE_EXTENSION
                 // line.normal points into the room: put the number on the interior side of the line.
                 val labelAt = Vec2.lerp(o.extentStart, o.extentEnd, 0.5) + o.line.normal * 0.3
-                WallLine(a, b, labelAt, "${i + 1}")
+                WallLine(a, b, labelAt, "${i + 1}", wallGrade(o), highlighted = d.recaptureIndex == i)
             }
             val room = ui.draftRoom
             val edges = room?.let { r ->
@@ -110,7 +132,7 @@ internal data class OverlayGeometry(
                     EdgeLine(e.a, e.b, e.midpoint + inward * 0.25, formatLengthSafe(e.length, settings))
                 }
             }.orEmpty()
-            val openings = room?.let { r ->
+            val placed = room?.let { r ->
                 r.openings.mapNotNull { o ->
                     val seg = try {
                         RoomOps.openingSegment(r, o)
@@ -120,6 +142,9 @@ internal data class OverlayGeometry(
                     OpeningLine(seg.first, seg.second, OverlayColors.forOpening(o.type))
                 }
             }.orEmpty()
+            val parked = d.parkedOpenings.map { p ->
+                OpeningLine(p.start, p.end, OverlayColors.forOpening(p.opening.type), parked = true)
+            }
             val pendingMark = when (ui.step) {
                 CaptureStep.WALLS -> d.baseline?.firstTap?.toPlan()
                 CaptureStep.OPENINGS -> d.pendingOpeningEdge
@@ -130,27 +155,31 @@ internal data class OverlayGeometry(
                 walls = walls,
                 edges = edges,
                 cornerTaps = if (d.method == CaptureMethod.CORNERS) d.cornerTaps else emptyList(),
-                openings = openings,
+                highlightedCorner = if (d.method == CaptureMethod.CORNERS) d.recaptureIndex else null,
+                openings = placed + parked,
                 pendingMark = pendingMark,
                 pendingOnSurface = ui.step == CaptureStep.OPENINGS && d.openingType == OpeningType.WINDOW,
-                rubberBandFromLastCorner = ui.step == CaptureStep.CORNERS && d.cornerTaps.isNotEmpty(),
+                rubberBandFromLastCorner = ui.step == CaptureStep.CORNERS && d.cornerTaps.isNotEmpty() && d.recaptureIndex == null,
                 fadedWalls = ui.step == CaptureStep.OPENINGS || ui.step == CaptureStep.REVIEW,
                 showReticle = ui.step != CaptureStep.REVIEW,
-                warnRange = ui.step != CaptureStep.REVIEW && ui.step != CaptureStep.FIND_FLOOR,
+                warnRange = ui.step == CaptureStep.WALLS || ui.step == CaptureStep.CORNERS || ui.step == CaptureStep.OPENINGS,
             )
         }
     }
 }
 
 /**
- * Full-screen AR overlay drawn over the camera feed: captured walls, the live solved outline with
- * lengths, corner taps, openings, pending marks and the center reticle with its distance readout.
- * [frame] is read only inside the draw phase, so new AR frames redraw the canvas without recomposing.
+ * Full-screen AR overlay drawn over the camera feed: captured walls (numbered, ringed in their quality
+ * color), the live solved outline with lengths, corner taps, openings, pending marks and the center
+ * reticle with its distance readout, measurement progress ring and success / failure animation ([fx]).
+ * [frame] and [fx] are read only inside the draw phase, so new AR frames and animation ticks redraw the
+ * canvas without recomposing.
  */
 @Composable
 internal fun CaptureOverlay(
     ui: CaptureUiState,
     frame: () -> ArFrameState,
+    fx: ReticleFx,
     modifier: Modifier = Modifier,
 ) {
     val textMeasurer = rememberTextMeasurer(cacheSize = 48)
@@ -160,7 +189,7 @@ internal fun CaptureOverlay(
         val f = frame()
         val projector = FloorProjector.create(f, geometry.floorY, size)
         if (projector != null) drawWorld(geometry, projector, f, textMeasurer, settings)
-        if (geometry.showReticle) drawReticle(f, textMeasurer, settings, geometry.warnRange)
+        if (geometry.showReticle) drawReticle(f, textMeasurer, settings, geometry.warnRange, fx)
     }
 }
 
@@ -239,13 +268,17 @@ private fun DrawScope.drawWorld(
     val wallWidth = 3.dp.toPx()
     val wallAlpha = if (g.fadedWalls) 0.35f else 0.95f
 
-    // Captured walls (observed extent ± 0.5 m) as lines on the floor.
-    val wallLabels = ArrayList<Pair<Offset, String>>(g.walls.size)
+    // Captured walls (observed extent ± 0.5 m) as lines on the floor; the one being re-captured in amber.
+    val wallBadges = ArrayList<Pair<Offset, OverlayGeometry.WallLine>>(g.walls.size)
     for (w in g.walls) {
         projector.segment(w.a, w.b)?.let { (a, b) ->
-            outlinedLine(OverlayColors.Wall.copy(alpha = wallAlpha), a, b, wallWidth)
+            if (w.highlighted) {
+                outlinedLine(OverlayColors.Caution, a, b, wallWidth * 2f)
+            } else {
+                outlinedLine(OverlayColors.Wall.copy(alpha = wallAlpha), a, b, wallWidth)
+            }
         }
-        if (!g.fadedWalls) projector.point(w.labelAt)?.let { wallLabels += it to w.label }
+        if (!g.fadedWalls) projector.point(w.labelAt)?.let { wallBadges += it to w }
     }
 
     // Solved outline preview, in the accent color.
@@ -255,9 +288,11 @@ private fun DrawScope.drawWorld(
         projector.point(e.labelAt)?.let { edgeLabels += it to e.label }
     }
 
-    // Openings as thick colored segments along their wall.
+    // Openings as thick colored segments along their wall (parked ones dimmed).
     for (o in g.openings) {
-        projector.segment(o.a, o.b)?.let { (a, b) -> outlinedLine(o.color, a, b, 8.dp.toPx()) }
+        projector.segment(o.a, o.b)?.let { (a, b) ->
+            outlinedLine(if (o.parked) o.color.copy(alpha = 0.55f) else o.color, a, b, 8.dp.toPx())
+        }
     }
 
     // Corner taps: dots joined in capture order.
@@ -267,7 +302,9 @@ private fun DrawScope.drawWorld(
             outlinedLine(OverlayColors.Wall, a, b, 2.5.dp.toPx())
         }
     }
-    for (p in tapPoints) if (p != null) markerDot(p, OverlayColors.Accent)
+    tapPoints.forEachIndexed { i, p ->
+        if (p != null) markerDot(p, if (i == g.highlightedCorner) OverlayColors.Caution else OverlayColors.Accent)
+    }
 
     // Live line from the pending mark / last corner to where the reticle meets the floor.
     val aim: Vec2? = when {
@@ -287,11 +324,21 @@ private fun DrawScope.drawWorld(
 
     // Labels last so they stay on top of the lines.
     for ((p, text) in edgeLabels) label(textMeasurer, text, p, Color.White, OverlayColors.LabelBackground)
-    for ((p, text) in wallLabels) badge(textMeasurer, text, p)
+    for ((p, w) in wallBadges) badge(textMeasurer, w.label, p, gradeColor(w.grade), w.highlighted)
 }
 
-/** Center reticle (ring + crosshair) colored by what it hits, with distance readout and range warning. */
-private fun DrawScope.drawReticle(f: ArFrameState, textMeasurer: TextMeasurer, settings: PlanSettings, warnRange: Boolean) {
+/**
+ * Center reticle (ring + crosshair) colored by what it hits, with the distance readout (amber beyond
+ * accurate range), the measurement progress ring around it, and a check mark / red flash when a capture
+ * finishes.
+ */
+private fun DrawScope.drawReticle(
+    f: ArFrameState,
+    textMeasurer: TextMeasurer,
+    settings: PlanSettings,
+    warnRange: Boolean,
+    fx: ReticleFx,
+) {
     val center = Offset(size.width / 2f, size.height / 2f)
     val hit = f.reticle
     val trackingProblem = f.tracking != TrackingStatus.TRACKING || f.problem != TrackingProblem.NONE
@@ -302,30 +349,68 @@ private fun DrawScope.drawReticle(f: ArFrameState, textMeasurer: TextMeasurer, s
         else -> OverlayColors.Caution
     }
     val radius = 24.dp.toPx()
+    val check = fx.check.value.coerceIn(0f, 1f)
+    val crosshair = 1f - check
     drawCircle(OverlayColors.Outline, radius, center, style = Stroke(width = 6.dp.toPx()))
     drawCircle(color, radius, center, style = Stroke(width = 3.dp.toPx()))
-    val inner = radius * 0.35f
-    val outer = radius * 0.75f
-    for ((dx, dy) in listOf(1f to 0f, -1f to 0f, 0f to 1f, 0f to -1f)) {
-        val a = center + Offset(dx * inner, dy * inner)
-        val b = center + Offset(dx * outer, dy * outer)
-        drawLine(OverlayColors.Outline, a, b, strokeWidth = 4.dp.toPx(), cap = StrokeCap.Round)
-        drawLine(color, a, b, strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+    if (crosshair > 0.01f) {
+        val inner = radius * 0.35f
+        val outer = radius * 0.75f
+        val outline = OverlayColors.Outline.copy(alpha = OverlayColors.Outline.alpha * crosshair)
+        for ((dx, dy) in listOf(1f to 0f, -1f to 0f, 0f to 1f, 0f to -1f)) {
+            val a = center + Offset(dx * inner, dy * inner)
+            val b = center + Offset(dx * outer, dy * outer)
+            drawLine(outline, a, b, strokeWidth = 4.dp.toPx(), cap = StrokeCap.Round)
+            drawLine(color.copy(alpha = crosshair), a, b, strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+        }
+        drawCircle(color.copy(alpha = crosshair), 2.5.dp.toPx(), center)
     }
-    drawCircle(color, 2.5.dp.toPx(), center)
+
+    // Measurement progress: an arc filling clockwise from 12 o'clock just outside the reticle.
+    val progress = fx.ring.value.coerceIn(0f, 1f)
+    val fail = fx.fail.value.coerceIn(0f, 1f)
+    if (progress > 0.001f || fail > 0.001f) {
+        val ringRadius = radius + 9.dp.toPx()
+        val stroke = 5.dp.toPx()
+        drawCircle(OverlayColors.Outline, ringRadius, center, style = Stroke(width = stroke + 3.dp.toPx()))
+        if (fail > 0.001f) {
+            drawCircle(OverlayColors.Bad.copy(alpha = fail), ringRadius, center, style = Stroke(width = stroke))
+        } else {
+            drawArc(
+                color = if (progress >= 0.999f) OverlayColors.Good else OverlayColors.Accent,
+                startAngle = -90f,
+                sweepAngle = 360f * progress,
+                useCenter = false,
+                topLeft = center - Offset(ringRadius, ringRadius),
+                size = Size(ringRadius * 2, ringRadius * 2),
+                style = Stroke(width = stroke, cap = StrokeCap.Round),
+            )
+        }
+    }
+    if (check > 0.01f) drawCheck(center, radius * (0.55f + 0.45f * check), check)
 
     val distance = hit?.distance?.takeIf { it.isFinite() && it >= 0.0 } ?: return
     if (trackingProblem) return
-    label(textMeasurer, formatLengthSafe(distance, settings), center + Offset(0f, radius + 18.dp.toPx()), Color.White, OverlayColors.LabelBackground)
-    if (warnRange && distance > MAX_ACCURATE_DISTANCE) {
-        label(
-            textMeasurer,
-            "Too far for accuracy. Move within ${formatLengthSafe(MAX_ACCURATE_DISTANCE, settings)}.",
-            center - Offset(0f, radius + 22.dp.toPx()),
-            Color.Black,
-            OverlayColors.Caution,
-        )
+    val outOfRange = warnRange && distance > MAX_ACCURATE_DISTANCE
+    label(
+        textMeasurer,
+        formatLengthSafe(distance, settings),
+        center + Offset(0f, radius + 26.dp.toPx()),
+        if (outOfRange) Color.Black else Color.White,
+        if (outOfRange) OverlayColors.Caution else OverlayColors.LabelBackground,
+    )
+}
+
+/** Green disc with a white check mark, of [radius], faded by [alpha]. */
+private fun DrawScope.drawCheck(center: Offset, radius: Float, alpha: Float) {
+    drawCircle(OverlayColors.Outline.copy(alpha = OverlayColors.Outline.alpha * alpha), radius + 2.dp.toPx(), center)
+    drawCircle(OverlayColors.Good.copy(alpha = alpha), radius, center)
+    val path = Path().apply {
+        moveTo(center.x - radius * 0.45f, center.y + radius * 0.02f)
+        lineTo(center.x - radius * 0.12f, center.y + radius * 0.34f)
+        lineTo(center.x + radius * 0.48f, center.y - radius * 0.30f)
     }
+    drawPath(path, Color.White.copy(alpha = alpha), style = Stroke(width = radius * 0.18f, cap = StrokeCap.Round, join = StrokeJoin.Round))
 }
 
 private fun DrawScope.outlinedLine(color: Color, a: Offset, b: Offset, width: Float) {
@@ -356,12 +441,13 @@ private fun DrawScope.label(textMeasurer: TextMeasurer, text: String, center: Of
     drawText(layout, topLeft = Offset(center.x - layout.size.width / 2f, center.y - layout.size.height / 2f))
 }
 
-/** Wall number in a filled circle. */
-private fun DrawScope.badge(textMeasurer: TextMeasurer, text: String, center: Offset) {
+/** Wall number in a white disc ringed in its quality color ([ring]); amber-filled while [highlighted]. */
+private fun DrawScope.badge(textMeasurer: TextMeasurer, text: String, center: Offset, ring: Color, highlighted: Boolean) {
     val layout = textMeasurer.measure(text, TextStyle(color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.Bold))
     val r = max(layout.size.width, layout.size.height) / 2f + 5.dp.toPx()
-    drawCircle(OverlayColors.Outline, r + 1.5.dp.toPx(), center)
-    drawCircle(Color.White, r, center)
+    drawCircle(OverlayColors.Outline, r + 4.dp.toPx(), center)
+    drawCircle(ring, r + 2.5.dp.toPx(), center)
+    drawCircle(if (highlighted) OverlayColors.Caution else Color.White, r, center)
     drawText(layout, topLeft = Offset(center.x - layout.size.width / 2f, center.y - layout.size.height / 2f))
 }
 

@@ -76,6 +76,8 @@ fun PlanSettings.sanitized(): PlanSettings {
         defaultDoorHeight = defaultDoorHeight.validOr(0.3..6.0, d.defaultDoorHeight),
         defaultWindowHeight = defaultWindowHeight.validOr(0.05..6.0, d.defaultWindowHeight),
         defaultWindowSill = defaultWindowSill.validOr(0.0..6.0, d.defaultWindowSill),
+        defaultDoorWidth = defaultDoorWidth.validOr(0.2..5.0, d.defaultDoorWidth),
+        defaultWindowWidth = defaultWindowWidth.validOr(0.1..6.0, d.defaultWindowWidth),
     )
 }
 

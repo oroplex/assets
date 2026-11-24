@@ -26,7 +26,16 @@ import java.io.InputStream
 
 /** One-off events for the projects screen. */
 sealed interface ProjectListEvent {
-    data class Open(val projectId: String) : ProjectListEvent
+    /** Open the editor of [projectId]; [issuedAt] (wall-clock ms) lets the screen drop requests that waited too long. */
+    data class Open(val projectId: String, val issuedAt: Long = 0L) : ProjectListEvent {
+        /** True when the request is older than [STALE_AFTER_MS] at [now]; requests without a time never are. */
+        fun isStale(now: Long): Boolean = issuedAt > 0L && now - issuedAt > STALE_AFTER_MS
+
+        companion object {
+            /** Creating or importing a project takes milliseconds; anything this old waited while the screen was away. */
+            const val STALE_AFTER_MS = 10_000L
+        }
+    }
 
     /** [undo] is the deleted project, offered for restoring from the snackbar. */
     data class Message(val text: String, val undo: Project? = null) : ProjectListEvent
@@ -54,7 +63,7 @@ class ProjectListViewModel(
         val created = repository.create(name, address)
         val defaults = settings.defaults.value
         repository.update(created.id) { it.copy(settings = defaults) }
-        _events.send(ProjectListEvent.Open(created.id))
+        _events.send(ProjectListEvent.Open(created.id, issuedAt = clock()))
     }
 
     fun rename(projectId: String, name: String, address: String) = launchReporting("Couldn't rename the project") {
@@ -85,7 +94,7 @@ class ProjectListViewModel(
         // Show the sample in the user's preferred units.
         val localized = sample.settings.copy(unitSystem = defaults.unitSystem, imperialDenominator = defaults.imperialDenominator)
         val saved = repository.save(sample.copy(id = Ids.newId(), createdAt = now, updatedAt = now, settings = localized))
-        _events.send(ProjectListEvent.Open(saved.id))
+        _events.send(ProjectListEvent.Open(saved.id, issuedAt = clock()))
     }
 
     /** Writes the project's JSON backup to a document picked with CreateDocument. */

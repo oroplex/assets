@@ -2,7 +2,9 @@ package com.oroplex.floorplan.ui.editor
 
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.provider.Settings
 import android.util.Log
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -22,16 +24,23 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -54,24 +63,46 @@ private val CornerHandleRadius = 24.dp
 private val WallTolerance = 16.dp
 private val LabelSlop = 8.dp
 private val FitMargin = 32.dp
-private val SnapTolerance = 8.dp
+
+/** Corner drags snap onto square / alignment guides within this distance (secondary guides: 3/4 of it). */
+private val CornerSnapTolerance = 8.dp
+
+/** A moved room released within this distance of a neighbour's wall snaps against it. */
+private val MoveSnapTolerance = 24.dp
 private val DoubleTapSlop = 48.dp
 private const val DOUBLE_TAP_MS = 300L
+
+/** Duration of the animated zoom-to-fit / focus moves. */
+private const val VIEW_ANIMATION_MS = 360.0
 
 /** Zoom limits in px per meter, per unit of screen density. */
 private const val MIN_PX_PER_METER_PER_DENSITY = 2.0
 private const val MAX_PX_PER_METER_PER_DENSITY = 2000.0
+
+/** Snap guide styling (points). */
+private const val GUIDE_PT = 1.0
+private const val GUIDE_DASH_PT = 3.0
+private const val GHOST_PT = 1.5
+private const val GHOST_DASH_PT = 4.0
+private const val GHOST_FILL = 0x221A73E8
+private val GuideOvershoot = 20.dp
+private val RightAngleSize = 10.dp
 
 /**
  * The interactive plan of one floor.
  *
  * Gestures (one custom detector so they never fight each other):
  *  * two fingers: pinch-zoom and pan, always;
- *  * one finger starting on a corner handle of the selected room: drag that corner (live preview, snapped
- *    square to its neighbours, committed on release as one undo step);
- *  * one finger in Move mode with a room selected: translate the room;
+ *  * one finger starting on a corner handle of the selected room: drag that corner (live preview, snapped onto
+ *    square and alignment guides with a haptic tick, committed on release as one undo step);
+ *  * one finger in Move mode with a room selected: translate the room; near a neighbour a dashed outline shows
+ *    where it will snap when released;
  *  * any other one-finger drag: pan;
- *  * tap: select corner handle > wall-length label > wall > room > nothing; double tap: fit the plan.
+ *  * tap: select corner handle > wall-length label > wall > room > nothing; double tap: zoom to fit.
+ *
+ * Drawing is clipped to the canvas, so neither the white background nor panned walls ever paint over the
+ * floor tabs above it. View changes requested by the ViewModel (fit, focus a room) are animated unless the
+ * system's animations are turned off; any gesture takes over immediately.
  */
 @Composable
 fun PlanCanvas(
@@ -82,6 +113,8 @@ fun PlanCanvas(
     selection: Selection?,
     moveMode: Boolean,
     modifier: Modifier = Modifier,
+    highlightRoomIds: Set<String> = emptySet(),
+    guides: DragGuides? = null,
 ) {
     val density = LocalDensity.current
     val pxPerPt = density.density * 160.0 / 72.0
@@ -89,15 +122,18 @@ fun PlanCanvas(
         selectedRoomId = selection?.roomId,
         showCornerHandles = selection != null,
         selectedWall = (selection as? Selection.Wall)?.wallIndex,
+        highlightRoomIds = highlightRoomIds,
     )
     val render = remember(rooms, settings, options) { renderSafely(rooms, settings, options) }
     val drawList = render ?: EMPTY_DRAW_LIST
 
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     val fitMarginPx = with(density) { FitMargin.toPx() }.toDouble()
+    val overshootPx = with(density) { GuideOvershoot.toPx() }.toDouble()
+    val rightAnglePx = with(density) { RightAngleSize.toPx() }.toDouble()
 
-    // Fit when this floor has no transform yet (first layout, double tap, new rooms...). Derived so that
-    // pan/zoom updates (which only change the transform) redraw the canvas without recomposing it.
+    // Fit when this floor has no transform yet (first layout, new floor...). Derived so that pan/zoom
+    // updates (which only change the transform) redraw the canvas without recomposing it.
     val needsFit by remember(viewModel, floorId) { derivedStateOf { viewModel.viewFor(floorId) == null } }
     LaunchedEffect(needsFit, canvasSize, floorId, drawList.bounds) {
         if (needsFit && canvasSize.width > 0 && canvasSize.height > 0) {
@@ -105,33 +141,83 @@ fun PlanCanvas(
         }
     }
 
+    // Animated view requests (zoom to fit, bring a room into view). The effect restarts from wherever the view
+    // is when the canvas size or the plan's bounds change mid-way (the bottom panel opening, the rooms arriving
+    // a frame after the request), and is cancelled when a pinch or pan drops the request.
+    val context = LocalContext.current
+    val animationsEnabled = remember(context) { animatorScale(context) > 0f }
+    val request = viewModel.viewRequest(floorId)
+    LaunchedEffect(request, canvasSize, drawList.bounds) {
+        val r = request ?: return@LaunchedEffect
+        if (canvasSize.width <= 0 || canvasSize.height <= 0) return@LaunchedEffect
+        val w = canvasSize.width.toDouble()
+        val h = canvasSize.height.toDouble()
+        val fit = fitView(drawList.bounds, canvasSize, fitMarginPx, pxPerPt)
+        val from = viewModel.viewFor(floorId)
+        val target = when (r) {
+            is ViewRequest.Fit -> fit
+            is ViewRequest.Focus -> ViewAnimation.focus(from ?: fit, r.bounds, w, h, fitMarginPx)
+        }
+        if (from == null || !animationsEnabled || from == target) {
+            viewModel.setView(floorId, target)
+        } else {
+            val start = withFrameNanos { it }
+            while (true) {
+                val now = withFrameNanos { it }
+                // A gesture dropped the request since the last frame: never overwrite the user's own pan.
+                if (viewModel.viewRequest(floorId) != r) return@LaunchedEffect
+                val t = ((now - start) / 1e6 / VIEW_ANIMATION_MS).coerceIn(0.0, 1.0)
+                val eased = FastOutSlowInEasing.transform(t.toFloat()).toDouble()
+                viewModel.setView(floorId, if (t >= 1.0) target else ViewAnimation.interpolate(from, target, eased, w, h))
+                if (t >= 1.0) break
+            }
+        }
+        viewModel.consumeViewRequest(floorId, r)
+    }
+
     // When a selection opens the bottom panel the canvas gets shorter; nudge the plan up so the selected
-    // room is not left hidden below the new bottom edge.
+    // room is not left hidden below the new bottom edge. A pending fit / focus takes care of that itself.
     val latestRooms by rememberUpdatedState(rooms)
     val selectedRoomId = selection?.roomId
     LaunchedEffect(selectedRoomId, canvasSize, floorId) {
         val id = selectedRoomId ?: return@LaunchedEffect
+        // Never pan under a finger that is dragging, and leave a pending fit / focus to do its own job.
+        if (viewModel.state.value.preview != null || viewModel.viewRequest(floorId) != null) return@LaunchedEffect
         val view = viewModel.viewFor(floorId) ?: return@LaunchedEffect
         val room = latestRooms.firstOrNull { it.id == id } ?: return@LaunchedEffect
         val dy = revealShift(room, view, canvasSize.height.toDouble(), fitMarginPx)
         if (dy < 0) viewModel.setView(floorId, view.panned(Vec2(0.0, dy)))
     }
 
+    // A light tick whenever a drag snaps onto a new guide (square corner, alignment, neighbour wall).
+    val haptics = LocalHapticFeedback.current
+    val snapKey = guides?.snapKey
+    LaunchedEffect(snapKey) {
+        if (snapKey != null) haptics.performHapticFeedback(HapticFeedbackType.SegmentTick)
+    }
+
     val gestureState = rememberUpdatedState(
         GestureInputs(viewModel, floorId, rooms, drawList, settings, selection, moveMode, canvasSize, pxPerPt, fitMarginPx),
     )
     val textMeasurer = remember { LabelMeasurer() }
+    val description = canvasDescription(rooms, selection)
 
     Box(modifier) {
         Canvas(
             Modifier
                 .fillMaxSize()
+                .clipToBounds()
                 .onSizeChanged { canvasSize = it }
+                .semantics { contentDescription = description }
                 .pointerInput(floorId) { detectPlanGestures(gestureState::value, textMeasurer) },
         ) {
             val view = viewModel.viewFor(floorId) ?: return@Canvas
             drawIntoCanvas { canvas ->
                 PlanPainter.draw(canvas.nativeCanvas, drawList, view, background = PlanColors.BACKGROUND)
+                if (guides != null) {
+                    val ops = guideOps(guides, view, overshootPx, rightAnglePx)
+                    if (ops.isNotEmpty()) PlanPainter.draw(canvas.nativeCanvas, DrawList(ops, Bounds.EMPTY), view)
+                }
             }
         }
         if (render == null && rooms.isNotEmpty()) {
@@ -157,6 +243,53 @@ private fun renderSafely(rooms: List<Room>, settings: PlanSettings, options: Ren
 
 private fun fitView(bounds: Bounds, size: IntSize, marginPx: Double, pxPerPt: Double): ViewTransform =
     ViewTransform.fit(bounds, size.width.toDouble(), size.height.toDouble(), marginPx, pxPerPt)
+
+/** The system "animator duration scale" (0 when the user turned animations off). */
+private fun animatorScale(context: android.content.Context): Float = try {
+    Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f)
+} catch (e: RuntimeException) {
+    1f
+}
+
+private fun canvasDescription(rooms: List<Room>, selection: Selection?): String {
+    val count = if (rooms.size == 1) "1 room" else "${rooms.size} rooms"
+    val selected = selection?.let { s -> rooms.firstOrNull { it.id == s.roomId }?.name }
+    return if (selected != null) "Floor plan, $count, $selected selected" else "Floor plan, $count"
+}
+
+/**
+ * Draw ops for the snap guides: dashed guide lines from the aligned corner through the dragged one (with a
+ * short overshoot), small right-angle marks at square corners and a dashed "ghost" of the snap landing spot.
+ * Screen-sized parts are converted to plan meters with the current [view].
+ */
+internal fun guideOps(guides: DragGuides, view: ViewTransform, overshootPx: Double, rightAnglePx: Double): List<DrawOp> {
+    if (!(view.pxPerMeter > 0) || !view.pxPerMeter.isFinite()) return emptyList()
+    val ops = ArrayList<DrawOp>()
+    guides.snapOutline?.takeIf { it.size >= 3 && it.all { p -> p.isFinite() } }?.let { outline ->
+        ops += DrawOp.FillPolygon(outline, GHOST_FILL)
+        ops += DrawOp.Polyline(outline, closed = true, widthPt = GHOST_PT, color = PlanColors.SELECTION, dashPt = GHOST_DASH_PT)
+    }
+    val overshoot = overshootPx / view.pxPerMeter
+    for (line in guides.lines) {
+        val dir = (line.b - line.a).normalized()
+        if (dir == Vec2.ZERO || !line.a.isFinite() || !line.b.isFinite()) continue
+        ops += DrawOp.Polyline(
+            listOf(line.a - dir * overshoot, line.b + dir * overshoot),
+            closed = false,
+            widthPt = GUIDE_PT,
+            color = PlanColors.SELECTION,
+            dashPt = GUIDE_DASH_PT,
+        )
+    }
+    val size = rightAnglePx / view.pxPerMeter
+    for (mark in guides.rightAngles) {
+        val p1 = mark.vertex + mark.a * size
+        val p2 = p1 + mark.b * size
+        val p3 = mark.vertex + mark.b * size
+        ops += DrawOp.Polyline(listOf(p1, p2, p3), closed = false, widthPt = GUIDE_PT * 1.25, color = PlanColors.SELECTION)
+    }
+    return ops
+}
 
 /**
  * Vertical screen shift (pixels, <= 0) that brings the bottom of [room] above the canvas bottom minus
@@ -194,7 +327,8 @@ private suspend fun PointerInputScope.detectPlanGestures(inputs: () -> GestureIn
     val cornerRadiusPx = CornerHandleRadius.toPx().toDouble()
     val wallTolPx = WallTolerance.toPx().toDouble()
     val labelSlopPx = LabelSlop.toPx().toDouble()
-    val snapPx = SnapTolerance.toPx().toDouble()
+    val cornerSnapPx = CornerSnapTolerance.toPx().toDouble()
+    val moveSnapPx = MoveSnapTolerance.toPx().toDouble()
     val doubleTapSlopPx = DoubleTapSlop.toPx()
     val minPxPerMeter = MIN_PX_PER_METER_PER_DENSITY * density
     val maxPxPerMeter = MAX_PX_PER_METER_PER_DENSITY * density
@@ -268,7 +402,7 @@ private suspend fun PointerInputScope.detectPlanGestures(inputs: () -> GestureIn
                     next = next.zoomedAround(centroid.toVec2(), target / view.pxPerMeter)
                 }
                 if (pan != Offset.Zero) next = next.panned(pan.toVec2())
-                if (next != view) current.viewModel.setView(current.floorId, next)
+                if (next != view) userMovesView(current, next)
                 event.changes.forEach { it.consume() }
                 continue
             }
@@ -276,7 +410,7 @@ private suspend fun PointerInputScope.detectPlanGestures(inputs: () -> GestureIn
             if (transforming) {
                 // A finger lifted after a pinch: keep panning with the remaining one.
                 val delta = change.positionChange()
-                if (delta != Offset.Zero) current.viewModel.setView(current.floorId, view.panned(delta.toVec2()))
+                if (delta != Offset.Zero) userMovesView(current, view.panned(delta.toVec2()))
                 change.consume()
                 continue
             }
@@ -294,23 +428,22 @@ private suspend fun PointerInputScope.detectPlanGestures(inputs: () -> GestureIn
             when (kind) {
                 DragKind.PAN -> {
                     val delta = change.positionChange()
-                    if (delta != Offset.Zero) current.viewModel.setView(current.floorId, view.panned(delta.toVec2()))
+                    if (delta != Offset.Zero) userMovesView(current, view.panned(delta.toVec2()))
                 }
-                DragKind.CORNER -> {
-                    val base = selectedRoom
-                    if (base != null) {
-                        val target = plan + grabOffset
-                        val snapped = CornerSnap.snap(
-                            base.corners, cornerIndex, target, CornerSnap.axisAngle(base.corners), snapPx / view.pxPerMeter,
-                        )
-                        current.viewModel.updateCornerDrag(snapped)
-                    }
+                DragKind.CORNER -> current.viewModel.updateCornerDrag(plan + grabOffset, cornerSnapPx / view.pxPerMeter)
+                DragKind.MOVE -> if (downPlan != null) {
+                    current.viewModel.updateMove(plan - downPlan, moveSnapPx / view.pxPerMeter)
                 }
-                DragKind.MOVE -> if (downPlan != null) current.viewModel.updateMove(plan - downPlan)
             }
             change.consume()
         }
     }
+}
+
+/** A pan or pinch by the user: it wins over any running zoom-to-fit / focus animation. */
+private fun userMovesView(inputs: GestureInputs, next: ViewTransform) {
+    inputs.viewModel.cancelViewRequest(inputs.floorId)
+    inputs.viewModel.setView(inputs.floorId, next)
 }
 
 private fun handleTap(

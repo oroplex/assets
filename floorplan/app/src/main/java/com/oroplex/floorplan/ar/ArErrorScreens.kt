@@ -39,8 +39,8 @@ import androidx.compose.ui.unit.dp
 
 /**
  * Full-screen message used for every AR setup problem: centered icon, title, explanation, an optional
- * primary action and Back. System back also calls [onBack]. Scrolls when the text does not fit (large
- * font scales, landscape).
+ * primary action and Back. System back also calls [onBack] unless [handleSystemBack] is false (then the
+ * screen underneath keeps handling it). Scrolls when the text does not fit (large font scales, landscape).
  */
 @Composable
 internal fun ArMessageScreen(
@@ -51,8 +51,9 @@ internal fun ArMessageScreen(
     modifier: Modifier = Modifier,
     primaryLabel: String? = null,
     onPrimary: (() -> Unit)? = null,
+    handleSystemBack: Boolean = true,
 ) {
-    BackHandler(onBack = onBack)
+    BackHandler(enabled = handleSystemBack, onBack = onBack)
     ArScreenFrame(modifier) {
         Icon(
             imageVector = icon,
@@ -108,6 +109,7 @@ internal fun ArSetupErrorScreen(
     onPrimary: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    handleSystemBack: Boolean = true,
 ) {
     val icon = when (error) {
         ArSetupError.DEVICE_NOT_SUPPORTED -> Icons.Outlined.MobileOff
@@ -130,6 +132,7 @@ internal fun ArSetupErrorScreen(
         modifier = modifier,
         primaryLabel = primaryLabel,
         onPrimary = onPrimary.takeIf { primaryLabel != null },
+        handleSystemBack = handleSystemBack,
     )
 }
 

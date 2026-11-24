@@ -73,6 +73,7 @@ internal class ArCoreCaptureController(
     private val projectionMatrix = FloatArray(16)
     private var lastFrameTimestamp = Long.MIN_VALUE
     private var lastTracking = false
+    private val anchorErrors = ThrottledLog(TAG)
 
     override suspend fun measure(request: MeasureRequest): MeasureResult {
         invalidRequestReason(request)?.let { return MeasureResult.Failed(it) }
@@ -143,13 +144,7 @@ internal class ArCoreCaptureController(
         failOutstanding(MSG_CLOSED)
         incomingMeasurements.clear()
         pendingAnchors.clear()
-        for (anchor in anchors.values) {
-            try {
-                anchor.detach()
-            } catch (e: Exception) {
-                Log.w(TAG, "Anchor.detach failed", e)
-            }
-        }
+        for (anchor in anchors.values) detachQuietly(anchor)
         anchors.clear()
         publishWithoutPose(TrackingStatus.STOPPED, mutableFrameState.value.problem)
     }
@@ -198,13 +193,22 @@ internal class ArCoreCaptureController(
 
         processAnchorRequests(session, poseValid)
 
-        val floor = floorTracker.update(session.getAllTrackables(Plane::class.java), cameraPosition?.y)
         val hasViewport = viewportWidth > 0 && viewportHeight > 0
         val centerHits = if (poseValid && hasViewport) {
             frame.hitTest(viewportWidth / 2f, viewportHeight / 2f)
         } else {
             emptyList()
         }
+        // A floor-like surface at the crosshair: evidence that lets the tracker veto raised planes.
+        val floorLikeHitY = cameraPosition?.takeIf { poseValid && centerHits.isNotEmpty() }?.let {
+            HitTesting.floorFallbackSample(centerHits, it).world?.y
+        }
+        val floor = floorTracker.update(
+            session.getAllTrackables(Plane::class.java),
+            cameraPosition?.takeIf { poseValid }?.y,
+            floorLikeHitY,
+            nowNs,
+        )
         val reticle = cameraPosition?.takeIf { poseValid }?.let {
             HitTesting.resolveReticle(centerHits, it, floor?.y, invViewProjection, viewportWidth, viewportHeight)
         }
@@ -280,26 +284,48 @@ internal class ArCoreCaptureController(
                 Log.w(TAG, "Could not create the anchor for room ${request.roomId}", e)
                 continue
             }
-            anchors.put(request.roomId, anchor)?.let { replaced ->
-                try {
-                    replaced.detach()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Detaching the replaced anchor failed", e)
-                }
+            val initial = try {
+                anchor.pose.toPlanTransform().takeIf { it.isFinite() }
+            } catch (e: Exception) {
+                null
             }
-            val initial = anchor.pose.toPlanTransform()
+            if (initial == null) {
+                // A glitched pose would poison anchorCorrections(); try again on a later frame (bounded).
+                detachQuietly(anchor)
+                if (request.attempts < MAX_ANCHOR_ATTEMPTS) pendingAnchors += request.retried()
+                break
+            }
+            anchors.put(request.roomId, anchor)?.let { replaced -> detachQuietly(replaced) }
             anchorPoses[request.roomId] =
                 AnchorPoses(initial, initial, tracking = anchor.trackingState == TrackingState.TRACKING)
         }
     }
 
-    /** Publishes the latest plan-space pose of every anchor that is still tracking. */
+    private fun detachQuietly(anchor: Anchor) {
+        try {
+            anchor.detach()
+        } catch (e: Exception) {
+            Log.w(TAG, "Anchor.detach failed", e)
+        }
+    }
+
+    /**
+     * Publishes the latest plan-space pose of every anchor that is still tracking. A pose that is not
+     * finite, or an anchor that throws, keeps the last good snapshot marked as not tracking, so a single
+     * bad anchor neither fails the frame nor feeds NaN into anchorCorrections().
+     */
     private fun snapshotAnchors() {
         if (anchors.isEmpty()) return
         for ((roomId, anchor) in anchors) {
             val previous = anchorPoses[roomId] ?: continue
-            anchorPoses[roomId] = if (anchor.trackingState == TrackingState.TRACKING) {
-                previous.copy(current = anchor.pose.toPlanTransform(), tracking = true)
+            val current = try {
+                if (anchor.trackingState == TrackingState.TRACKING) anchor.pose.toPlanTransform() else null
+            } catch (e: Exception) {
+                anchorErrors.warn("Reading the anchor pose for room $roomId failed", e)
+                null
+            }
+            anchorPoses[roomId] = if (current != null && current.isFinite()) {
+                previous.copy(current = current, tracking = true)
             } else {
                 previous.copy(tracking = false)
             }
@@ -316,7 +342,12 @@ internal class ArCoreCaptureController(
         )
     }
 
-    private class AnchorRequest(val roomId: String, val position: Vec3)
+    private class AnchorRequest(val roomId: String, val position: Vec3, val attempts: Int = 0) {
+        fun retried() = AnchorRequest(roomId, position, attempts + 1)
+    }
+
+    private fun RigidTransform2.isFinite(): Boolean =
+        angle.isFinite() && translation.x.isFinite() && translation.y.isFinite()
 
     private data class AnchorPoses(
         val initial: RigidTransform2,
@@ -328,6 +359,9 @@ internal class ArCoreCaptureController(
         private const val TAG = "ArCaptureController"
         const val NEAR_PLANE = 0.05f
         const val FAR_PLANE = 100f
+
+        /** A room anchor whose pose keeps coming back unusable is given up after this many frames. */
+        private const val MAX_ANCHOR_ATTEMPTS = 30
 
         /** Caller-side safety net, above the GL-thread timeout of 4 s. */
         private const val WATCHDOG_MS = 6_000L

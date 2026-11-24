@@ -64,9 +64,12 @@ internal object WallSampleGrid {
     const val COUNT = SIZE * SIZE
     const val SIDE_FRACTION = 0.25f
 
+    /** Index of the middle sample, which is exactly the view center (the crosshair). */
+    const val CENTER_INDEX = COUNT / 2
+
     /**
      * Writes [COUNT] (x, y) view-pixel pairs into [out] (length >= 2 * COUNT), row by row from the top-left.
-     * The middle sample (index COUNT / 2) is exactly the view center.
+     * The middle sample ([CENTER_INDEX]) is exactly the view center.
      */
     fun positions(viewportWidth: Int, viewportHeight: Int, out: FloatArray) {
         require(out.size >= 2 * COUNT) { "out needs ${2 * COUNT} floats" }
@@ -219,7 +222,7 @@ private sealed class Sampler {
         const val MAX_FRAMES = 90
 
         fun forRequest(request: MeasureRequest): Sampler = when (request) {
-            MeasureRequest.LockFloor -> LockFloorSampler
+            MeasureRequest.LockFloor -> LockFloorSampler()
             is MeasureRequest.Wall -> WallSampler(request)
             is MeasureRequest.FloorPoint -> FloorPointSampler(request)
             is MeasureRequest.SurfacePoint -> SurfacePointSampler(request)
@@ -230,37 +233,106 @@ private sealed class Sampler {
     }
 }
 
-/** Upward plane under the crosshair, else the tracked best floor, else a failure. One frame. */
-private object LockFloorSampler : Sampler() {
+/**
+ * Locks the floor height, in order of preference, on every tracking frame:
+ * 1. an upward plane under the crosshair (its height; CaptureViewModel rejects raised surfaces);
+ * 2. the tracked floor ([FloorTracker], the lowest large upward plane), unless it is only a little below
+ *    the phone and the crosshair sees floor clearly below it ([FloorLockFallback.contradictsTrackedFloor]);
+ * 3. fallback when ARCore has detected no floor plane at all (glossy tile, polished concrete): the
+ *    median height of DepthPoint / feature hits at the crosshair over [FloorLockFallback.TARGET_SAMPLES]
+ *    frames, taken only while the phone points down ≥ 30°, and only if the readings agree
+ *    ([FloorLockFallback.MAX_MAD]). Gives up with a specific hint when no usable hit shows up.
+ */
+private class LockFloorSampler : Sampler() {
     override val timeoutMessage =
         "Couldn't lock the floor because tracking isn't ready. Move the phone slowly and try again."
 
-    override fun onTrackingFrame(input: FrameInputs): MeasureResult {
+    private val samples = ArrayList<Double>(FloorLockFallback.TARGET_SAMPLES)
+    private var frames = 0
+    private var framesNotPointingDown = 0
+
+    /** Set once the crosshair showed floor clearly below the tracked (ambiguous) floor during this request. */
+    private var trackedFloorRejected = false
+
+    override fun onTrackingFrame(input: FrameInputs): MeasureResult? {
         val plane = input.reticle?.plane
         if (plane != null && plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING) {
             val y = plane.centerPose.ty().toDouble()
             if (y.isFinite()) return MeasureResult.FloorLocked(y)
         }
-        input.floor?.let { return MeasureResult.FloorLocked(it.y) }
+        val camera = input.cameraPosition ?: return null
+
+        val inv = input.invViewProjection
+        val rayY = inv?.let { HitTesting.centerRayDirection(it, input.viewportWidth, input.viewportHeight)?.y }
+        val pointingDown = rayY == null || rayY <= -FloorLockFallback.MIN_RAY_DOWN
+        // Aiming at a wall or the horizon: whatever the ray hits is not the floor.
+        val sample = if (pointingDown) HitTesting.floorFallbackSample(input.centerHits, camera) else null
+        val hitY = sample?.world?.y
+
+        val tracked = input.floor
+        if (tracked != null && tracked.y.isFinite() && !trackedFloorRejected) {
+            if (hitY == null || !FloorLockFallback.contradictsTrackedFloor(tracked.y, camera.y, hitY)) {
+                return MeasureResult.FloorLocked(tracked.y)
+            }
+            // The user aims at floor well below a plane that may be a bed or table: measure it instead.
+            trackedFloorRejected = true
+        }
+
+        frames++
+        if (hitY != null) {
+            samples += hitY
+        } else if (!pointingDown || sample?.rejection == FloorLockFallback.Rejection.NOT_POINTING_DOWN) {
+            framesNotPointingDown++
+        }
+
+        if (samples.size >= FloorLockFallback.TARGET_SAMPLES) {
+            val evaluation = FloorLockFallback.evaluate(samples)
+            return evaluation.floorY?.let { MeasureResult.FloorLocked(it) } ?: MeasureResult.Failed(MSG_UNSTEADY)
+        }
+        val gaveUp = (samples.isEmpty() && frames >= FloorLockFallback.FRAMES_WITHOUT_SAMPLE_LIMIT) ||
+            frames >= FloorLockFallback.MAX_FRAMES
+        if (!gaveUp) return null
         return MeasureResult.Failed(
-            "No floor found yet. Point the phone at the floor and move it slowly until the floor is detected.",
+            when {
+                samples.isNotEmpty() -> MSG_UNSTEADY
+                framesNotPointingDown * 2 > frames -> MSG_TILT_DOWN
+                else -> MSG_NO_FLOOR
+            },
         )
+    }
+
+    private companion object {
+        const val MSG_NO_FLOOR =
+            "No floor found yet. Aim at a textured patch of floor near your feet, move the phone slowly, " +
+                "then tap Lock floor again."
+        const val MSG_TILT_DOWN = "Tilt the phone down toward the floor near your feet, then tap Lock floor."
+        const val MSG_UNSTEADY =
+            "The floor reading wasn't steady. Hold the phone still, aimed at the floor, and try again."
     }
 }
 
 /**
  * Accumulates wall points from the 9 × 9 grid over N frames, then fits them with
- * [WallEstimator.fromPoints]. The depth fit wins whenever it succeeds; otherwise a VERTICAL plane seen
- * under the crosshair during sampling is used ([WallEstimator.fromPlane]); otherwise the failed depth fit
- * is returned so the UI can show its [WallFit.failure] message.
+ * [WallEstimator.fromPoints]. The crosshair hit of every frame is also kept: their median is passed as
+ * the `aimPoint`, so the fit locks onto the surface the user aimed at (not furniture in front of it, a
+ * wall behind a doorway, or a side wall seen at a grazing angle). Far walls (crosshair beyond
+ * [WallSampling.LONG_RANGE_DISTANCE]) are sampled over more frames to average depth noise.
+ *
+ * The depth fit wins whenever it succeeds; otherwise a VERTICAL plane seen under the crosshair during
+ * sampling is used ([WallEstimator.fromPlane]); otherwise the failed depth fit is returned so the UI can
+ * show its [WallFit.failure] message.
  */
 private class WallSampler(private val request: MeasureRequest.Wall) : Sampler() {
     override val timeoutMessage = "Wall measurement timed out. Hold the phone steady while it samples."
 
-    private val targetFrames = frameTarget(request.frames)
-    private val points = ArrayList<Vec3>(targetFrames * WallSampleGrid.COUNT)
+    private val baseFrames = frameTarget(request.frames)
+    private val maxFrames = frameTarget(WallSampling.targetFrames(baseFrames, Double.POSITIVE_INFINITY))
+    private val points = ArrayList<Vec3>(maxFrames * WallSampleGrid.COUNT)
+    private val centerPoints = ArrayList<Vec3>(maxFrames)
+    private val aimDistances = ArrayList<Double>(maxFrames)
     private val grid = FloatArray(WallSampleGrid.COUNT * 2)
     private var frames = 0
+    private var firstFrameNs = 0L
     private var viewerX = 0.0
     private var viewerY = 0.0
     private var viewerZ = 0.0
@@ -269,23 +341,39 @@ private class WallSampler(private val request: MeasureRequest.Wall) : Sampler() 
     override fun onTrackingFrame(input: FrameInputs): MeasureResult? {
         val camera = input.cameraPosition ?: return null
         if (input.viewportWidth <= 0 || input.viewportHeight <= 0) return null
+        if (frames == 0) firstFrameNs = input.nowNs
         WallSampleGrid.positions(input.viewportWidth, input.viewportHeight, grid)
         for (i in 0 until WallSampleGrid.COUNT) {
+            // The grid's middle sample is the crosshair, which the frame already hit-tested.
+            if (i == WallSampleGrid.CENTER_INDEX) continue
             val hits = input.frame.hitTest(grid[2 * i], grid[2 * i + 1])
             HitTesting.firstWallSample(hits, camera)?.let { points += it }
+        }
+        val center = HitTesting.firstWallSample(input.centerHits, camera)
+        if (center != null) {
+            points += center
+            centerPoints += center
+            aimDistances += center.distanceTo(camera)
+        } else {
+            input.reticle?.hit?.distance?.takeIf { it.isFinite() }?.let { aimDistances += it }
         }
         HitTesting.firstVerticalPlane(input.centerHits, camera)?.let { centerPlane = it }
         viewerX += camera.x
         viewerY += camera.y
         viewerZ += camera.z
         frames++
-        return if (frames >= targetFrames) finish() else null
+        val aimDistance = if (aimDistances.isEmpty()) null else RobustStats.median(aimDistances)
+        val done = frames >= maxFrames ||
+            WallSampling.isComplete(frames, baseFrames, aimDistance, input.nowNs - firstFrameNs)
+        return if (done) finish() else null
     }
 
     private fun finish(): MeasureResult {
         // The phone moves a little while sampling; the mean pose is the most representative viewer.
         val viewer = Vec3(viewerX / frames, viewerY / frames, viewerZ / frames)
-        val depthFit = WallEstimator.fromPoints(points, request.floorY, request.ceilingY, viewer)
+        val band = WallSampling.wallBand(request.floorY, request.ceilingY)
+        val aimPoint = WallSampling.aimPoint(centerPoints, frames, band)
+        val depthFit = WallEstimator.fromPoints(points, request.floorY, request.ceilingY, viewer, aimPoint = aimPoint)
         if (depthFit.failure == null && depthFit.observation != null) return MeasureResult.WallMeasured(depthFit)
         val planeObservation = centerPlane?.let { HitTesting.wallFromPlane(it, viewer) }
             ?: return MeasureResult.WallMeasured(depthFit)
@@ -341,8 +429,11 @@ private class SurfacePointSampler(request: MeasureRequest.SurfacePoint) : Sample
 }
 
 /**
- * Center-ray hits on downward planes or depth / feature points more than [MIN_HEIGHT] above the floor.
- * Height = median(y) − floorY, spread = MAD of the heights.
+ * Ceiling height from the center ray over N frames (AR layer AR-2). Per frame the highest ceiling-like
+ * hit is taken ([HitTesting.ceilingSampleY]: downward planes, or depth / feature hits on roughly
+ * horizontal surfaces reached by a steep upward ray, more than 1.8 m above the floor). The result is the
+ * median of the UPPER cluster of those heights ([CeilingSampling.upperCluster]) minus floorY, so frames
+ * that grazed a cabinet top or a lamp do not pull the height down; spread = MAD of that cluster.
  */
 private class CeilingSampler(private val request: MeasureRequest.CeilingHeight) : Sampler() {
     override val timeoutMessage =
@@ -353,23 +444,18 @@ private class CeilingSampler(private val request: MeasureRequest.CeilingHeight) 
 
     override fun onTrackingFrame(input: FrameInputs): MeasureResult? {
         val camera = input.cameraPosition ?: return null
-        val y = HitTesting.firstCeilingSampleY(
-            input.centerHits,
-            camera,
-            minY = request.floorY + MIN_HEIGHT,
-            maxY = request.floorY + MAX_HEIGHT,
-        ) ?: return null
+        val y = HitTesting.ceilingSampleY(input.centerHits, camera, request.floorY) ?: return null
         heights += y
         if (heights.size < target) return null
-        val median = RobustStats.median(heights)
-        return MeasureResult.Height(median - request.floorY, heights.size, RobustStats.mad(heights))
+        val cluster = CeilingSampling.upperCluster(heights)
+        if (cluster.isEmpty()) return MeasureResult.Failed(MSG_INCONSISTENT)
+        val median = RobustStats.median(cluster)
+        return MeasureResult.Height(median - request.floorY, cluster.size, RobustStats.mad(cluster))
     }
 
     private companion object {
-        /** Ceilings are at least this high above the floor (rejects tabletops and shelves), meters. */
-        const val MIN_HEIGHT = 1.5
-
-        /** Above this (m) a hit is a glitch rather than a residential ceiling. */
-        const val MAX_HEIGHT = 7.0
+        const val MSG_INCONSISTENT =
+            "The ceiling readings didn't agree. Aim straight up at a plain spot, away from lights and " +
+                "cabinets, and hold steady."
     }
 }

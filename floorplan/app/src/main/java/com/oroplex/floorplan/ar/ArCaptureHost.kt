@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.opengl.GLSurfaceView
 import android.util.Log
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -199,17 +200,24 @@ private fun ArSessionContent(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    val backDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
     Box(Modifier.fillMaxSize()) {
         AndroidView(factory = { runner.view }, modifier = Modifier.fillMaxSize())
         // Once started, the capture UI stays composed (keeping its state) even under the error overlay.
-        if (runner.started) content(holder.controller)
+        val inSession = runner.started
+        if (inSession) content(holder.controller)
         if (runner.cameraUnavailable) {
+            // Mid-session, Back must go through the capture flow (discard prompt, anchor corrections), not
+            // pop the screen: the overlay leaves system Back to the content's BackHandler, and its Back
+            // button dispatches a regular back press. Before the session ever ran, Back simply exits.
+            val sessionBack = backDispatcher?.takeIf { inSession }
             ArSetupErrorScreen(
                 error = ArSetupError.CAMERA_UNAVAILABLE,
                 onPrimary = {
                     if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) runner.resume()
                 },
-                onBack = onExit,
+                onBack = if (sessionBack != null) ({ sessionBack.onBackPressed() }) else onExit,
+                handleSystemBack = sessionBack == null,
             )
         }
     }

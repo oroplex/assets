@@ -103,6 +103,19 @@ internal object HitTesting {
         return p
     }
 
+    /** Unit direction of the screen-center ray, or null when the matrix / viewport is unusable. */
+    fun centerRayDirection(invViewProjection: FloatArray, viewportWidth: Int, viewportHeight: Int): Vec3? {
+        if (viewportWidth <= 0 || viewportHeight <= 0) return null
+        val ray = Projection.screenRay(
+            invViewProjection,
+            viewportWidth / 2.0,
+            viewportHeight / 2.0,
+            viewportWidth,
+            viewportHeight,
+        )
+        return ray.direction.takeIf { it != Vec3.ZERO && it.isFinite() }
+    }
+
     /**
      * Wall sample from one grid ray: the first DepthPoint, feature Point, or VERTICAL plane hit (inside its
      * polygon, front side). Horizontal planes along the ray are skipped, not treated as blockers.
@@ -134,24 +147,84 @@ internal object HitTesting {
     }
 
     /**
-     * Height (world Y) of the first ceiling sample along the center ray: a downward-facing plane or a
-     * depth / feature point whose height lies in (minY, maxY]. Lower hits (lamps, shelves) are skipped.
+     * Height (world Y) of the ceiling sample along the center ray, or null (AR layer AR-2).
+     *
+     * Accepted hits ([CeilingSampling.isCeilingSample]): downward-facing planes (inside the polygon, seen
+     * from below), and DepthPoints / feature Points only when the ray points steeply upward and, where
+     * ARCore estimated one, the surface normal is roughly vertical, so wall faces, cabinet fronts and
+     * door frames above 1.8 m are rejected. Everything must lie above the camera and more than
+     * [CeilingSampling.MIN_HEIGHT_ABOVE_FLOOR] above [floorY]. Of the accepted hits the HIGHEST is
+     * returned: along an upward ray that is the farthest surface, i.e. the ceiling behind a lamp.
      */
-    fun firstCeilingSampleY(hits: List<HitResult>, camera: Vec3, minY: Double, maxY: Double): Double? {
+    fun ceilingSampleY(hits: List<HitResult>, camera: Vec3, floorY: Double): Double? {
+        var best = Double.NEGATIVE_INFINITY
         for (hit in hits) {
             val pose = hit.hitPose
-            val y = pose.ty().toDouble()
-            if (!y.isFinite() || y <= minY || y > maxY) continue
-            val usable = when (val trackable = hit.trackable) {
-                is Plane -> trackable.type == Plane.Type.HORIZONTAL_DOWNWARD_FACING &&
-                    isUsablePlaneHit(trackable, pose, camera)
-                is DepthPoint, is Point -> true
-                else -> false
+            val p = pose.position()
+            if (!p.isFinite()) continue
+            val evidence = when (val trackable = hit.trackable) {
+                is Plane ->
+                    if (trackable.type == Plane.Type.HORIZONTAL_DOWNWARD_FACING && isUsablePlaneHit(trackable, pose, camera)) {
+                        SurfaceEvidence.DOWNWARD_PLANE
+                    } else {
+                        continue
+                    }
+                is DepthPoint -> SurfaceEvidence.POINT_WITH_NORMAL
+                is Point -> pointEvidence(trackable)
+                else -> continue
             }
-            if (usable) return y
+            val rayUp = unitDirectionY(camera, p) ?: continue
+            val normalY = if (evidence == SurfaceEvidence.POINT_WITH_NORMAL) pose.yAxis[1].toDouble() else null
+            if (CeilingSampling.isCeilingSample(evidence, p.y, camera.y, floorY, rayUp, normalY) && p.y > best) {
+                best = p.y
+            }
         }
-        return null
+        return best.takeIf { it.isFinite() }
     }
+
+    /**
+     * Floor-lock fallback sample (Capture flow AR-4): the FIRST surface along the center ray, when it is a
+     * DepthPoint or feature Point that [FloorLockFallback.classify] accepts as floor. A plane in front of
+     * it (a wall, a table edge) blocks the ray. Returns the hit or, when rejected, why.
+     */
+    fun floorFallbackSample(hits: List<HitResult>, camera: Vec3): FloorFallbackSample {
+        for (hit in hits) {
+            val pose = hit.hitPose
+            val p = pose.position()
+            if (!p.isFinite()) continue
+            val evidence = when (val trackable = hit.trackable) {
+                is Plane -> {
+                    if (!isUsablePlaneHit(trackable, pose, camera)) continue
+                    // An upward plane is handled by the plane path of LockFloor; anything else blocks the ray.
+                    return FloorFallbackSample(null, FloorLockFallback.Rejection.NOT_FLOOR_LIKE)
+                }
+                is DepthPoint -> SurfaceEvidence.POINT_WITH_NORMAL
+                is Point -> pointEvidence(trackable)
+                else -> continue
+            }
+            val rayY = unitDirectionY(camera, p) ?: continue
+            val normalY = if (evidence == SurfaceEvidence.POINT_WITH_NORMAL) pose.yAxis[1].toDouble() else null
+            val rejection = FloorLockFallback.classify(p.y, camera.y, rayY, normalY)
+            return FloorFallbackSample(p.takeIf { rejection == FloorLockFallback.Rejection.NONE }, rejection)
+        }
+        return FloorFallbackSample(null, FloorLockFallback.Rejection.NOT_FLOOR_LIKE)
+    }
+
+    /** Y component of the unit direction camera -> [p]; null when they coincide. */
+    private fun unitDirectionY(camera: Vec3, p: Vec3): Double? {
+        val d = p - camera
+        val length = d.length
+        if (!(length > MIN_RAY_LENGTH) || !length.isFinite()) return null
+        return d.y / length
+    }
+
+    /** Feature points only carry a surface normal when ARCore estimated one. */
+    private fun pointEvidence(point: Point): SurfaceEvidence =
+        if (point.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL) {
+            SurfaceEvidence.POINT_WITH_NORMAL
+        } else {
+            SurfaceEvidence.POINT_WITHOUT_NORMAL
+        }
 
     /**
      * Wall observation from an ARCore vertical plane: center pose, its +Y axis as the normal, and the
@@ -197,7 +270,13 @@ internal object HitTesting {
 
     /** Subsumption chains are short in practice; the bound only guards against a malformed cycle. */
     private const val MAX_SUBSUMPTION_CHAIN = 8
+
+    /** Hits closer than this to the camera (m) have no meaningful direction. */
+    private const val MIN_RAY_LENGTH = 1e-3
 }
+
+/** One floor-lock fallback reading: [world] is null when the hit was rejected for [rejection]. */
+internal class FloorFallbackSample(val world: Vec3?, val rejection: FloorLockFallback.Rejection)
 
 /** Translation of an ARCore pose as a world-space [Vec3]. */
 internal fun Pose.position(): Vec3 = Vec3(tx().toDouble(), ty().toDouble(), tz().toDouble())

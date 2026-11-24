@@ -2,14 +2,15 @@ package com.oroplex.floorplan.export
 
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.text.TextPaint
 import android.text.TextUtils
+import com.oroplex.floorplan.core.measure.Measurements
+import com.oroplex.floorplan.core.measure.Units
 import com.oroplex.floorplan.core.model.Floor
 import com.oroplex.floorplan.core.model.Project
 import com.oroplex.floorplan.core.model.UnitSystem
-import com.oroplex.floorplan.core.measure.Measurements
-import com.oroplex.floorplan.core.measure.Units
 import com.oroplex.floorplan.core.render.DrawList
 import com.oroplex.floorplan.core.render.PlanColors
 import com.oroplex.floorplan.core.render.PlanRenderer
@@ -24,6 +25,7 @@ data class FloorSheet(
     val projectName: String,
     val address: String,
     val floorName: String,
+    /** e.g. "November 24, 2026"; printed as "Generated …" on the bottom line. */
     val dateText: String,
     /** Null when there is nothing to draw; [emptyMessage] is printed in the plan area instead. */
     val drawList: DrawList?,
@@ -37,6 +39,8 @@ data class FloorSheet(
     val pageLabel: String? = null,
     /** Print the "1:N at 100 %" ratio under the scale bar (only meaningful for paper output). */
     val showScaleRatio: Boolean = false,
+    /** Company block for the header; null prints the project in its place. */
+    val branding: SheetBranding? = null,
 )
 
 object FloorSheets {
@@ -50,6 +54,15 @@ object FloorSheets {
 
     fun roomCountText(count: Int): String = if (count == 1) "1 room" else "$count rooms"
 
+    /** Right-hand text of the bottom line: "Generated <date> · Page i of n" (either part may be absent). */
+    fun bottomLineText(dateText: String, pageLabel: String?): String {
+        val date = dateText.trim().takeIf { it.isNotEmpty() }?.let { "Generated $it" }
+        return listOfNotNull(date, pageLabel?.trim()?.takeIf { it.isNotEmpty() }).joinToString(" · ")
+    }
+
+    /** "Page 3 of 5". */
+    fun pageLabel(page: Int, total: Int): String = "Page $page of $total"
+
     /**
      * Renders [floor] with the project's settings and the export toggles. Returns null for a floor
      * without rooms. Throws [ExportException] when the rooms cannot be drawn (corrupt geometry).
@@ -57,8 +70,7 @@ object FloorSheets {
     fun renderFloor(
         project: Project,
         floor: Floor,
-        showWallLengths: Boolean,
-        showAreas: Boolean,
+        labels: PlanLabels,
         textScale: Double = SHEET_TEXT_SCALE,
     ): DrawList? {
         if (floor.rooms.isEmpty()) return null
@@ -66,7 +78,12 @@ object FloorSheets {
             PlanRenderer.render(
                 floor.rooms,
                 project.settings,
-                RenderOptions(textScale = textScale, showWallLengths = showWallLengths, showAreas = showAreas),
+                RenderOptions(
+                    textScale = textScale,
+                    showWallLengths = labels.showWallLengths,
+                    showAreas = labels.showAreas,
+                    showOverallDimensions = labels.showOverallDimensions,
+                ),
             )
         } catch (e: Exception) {
             throw ExportException(
@@ -92,21 +109,22 @@ object FloorSheets {
     fun build(
         project: Project,
         floor: Floor,
-        showWallLengths: Boolean,
-        showAreas: Boolean,
+        labels: PlanLabels,
         dateText: String,
+        branding: SheetBranding? = null,
     ): FloorSheet {
         val system = project.settings.unitSystem
         return FloorSheet(
-            projectName = project.name.ifBlank { "Untitled project" },
+            projectName = project.name.trim().ifEmpty { "Untitled project" },
             address = project.address.trim(),
-            floorName = floor.name.ifBlank { "Floor" },
+            floorName = floor.name.trim().ifEmpty { "Floor" },
             dateText = dateText,
-            drawList = renderFloor(project, floor, showWallLengths, showAreas),
+            drawList = renderFloor(project, floor, labels),
             emptyMessage = EMPTY_FLOOR_MESSAGE,
             areaText = "Total net floor area: ${formatFloorArea(floor, system)}",
             roomCountText = roomCountText(floor.rooms.size),
             unitSystem = system,
+            branding = branding,
         )
     }
 }
@@ -118,6 +136,11 @@ object FloorSheets {
  * the plan itself is drawn unscaled through [PlanPainter] with `pxPerPt = scale`, so line widths and
  * label sizes in the DrawList come out at their intended point sizes on every output
  * (PDF: scale 1, PNG: bitmap px per pt, preview: screen px per pt).
+ *
+ * Layout (see [SheetLayout]): the header band names who made the plan (company block, when branding
+ * is set) and for which property; the footer title block names the sheet (floor), its area and room
+ * count, and carries the scale bar; the bottom line has the disclaimer, generated date and page number.
+ * There is deliberately no north arrow: AR headings are arbitrary.
  */
 object PlanSheetPainter {
     internal const val RULE_COLOR: Int = 0xFFBDC1C6.toInt()
@@ -147,7 +170,7 @@ object PlanSheetPainter {
 
         canvas.save()
         canvas.scale(scale.toFloat(), scale.toFloat())
-        drawHeader(canvas, widthPt, sheet.projectName, sheet.address, sheet.floorName, sheet.dateText)
+        drawHeader(canvas, widthPt, sheet.projectName, sheet.address, sheet.branding)
         if (drawList == null) {
             val paint = SheetText.paint(12.0, color = PlanColors.TEXT_SECONDARY, align = Paint.Align.CENTER)
             SheetText.drawCentered(canvas, sheet.emptyMessage, planRect, paint)
@@ -157,36 +180,66 @@ object PlanSheetPainter {
     }
 
     /**
-     * Title block: project name (bold 16 pt) and address on the left, floor / sheet title and date
-     * on the right, a hairline underneath. Long texts are ellipsized so the columns never collide.
+     * Header band. With [branding]: logo + company name + contact line on the left, project name and
+     * address right-aligned on the right. Without: project name (bold 16 pt) and address on the left.
+     * Long texts are ellipsized so the blocks never collide; a hairline closes the band.
      */
     internal fun drawHeader(
         canvas: Canvas,
         widthPt: Double,
         projectName: String,
         address: String,
-        rightTitle: String,
-        dateText: String,
+        branding: SheetBranding?,
     ) {
         val rect = SheetLayout.header(widthPt)
-        val titlePaint = SheetText.paint(16.0, bold = true)
-        val addressPaint = SheetText.paint(10.0, color = PlanColors.TEXT_SECONDARY)
-        val rightTitlePaint = SheetText.paint(12.0, bold = true, align = Paint.Align.RIGHT)
-        val datePaint = SheetText.paint(9.0, color = PlanColors.TEXT_SECONDARY, align = Paint.Align.RIGHT)
-
-        val maxRight = rect.width * 0.42
-        val rightTitleText = SheetText.ellipsize(rightTitle, rightTitlePaint, maxRight)
-        val dateLine = SheetText.ellipsize(dateText, datePaint, maxRight)
-        val rightWidth = maxOf(rightTitlePaint.measureText(rightTitleText), datePaint.measureText(dateLine)).toDouble()
-        val leftMax = (rect.width - rightWidth - 18.0).coerceAtLeast(40.0)
-
-        SheetText.draw(canvas, SheetText.ellipsize(projectName, titlePaint, leftMax), rect.left, rect.top + 16, titlePaint)
-        if (address.isNotEmpty()) {
-            SheetText.draw(canvas, SheetText.ellipsize(address, addressPaint, leftMax), rect.left, rect.top + 31, addressPaint)
+        if (branding == null) {
+            val titlePaint = SheetText.paint(16.0, bold = true)
+            val addressPaint = SheetText.paint(10.0, color = PlanColors.TEXT_SECONDARY)
+            SheetText.draw(canvas, SheetText.ellipsize(projectName, titlePaint, rect.width), rect.left, rect.top + 20, titlePaint)
+            if (address.isNotEmpty()) {
+                SheetText.draw(canvas, SheetText.ellipsize(address, addressPaint, rect.width), rect.left, rect.top + 35, addressPaint)
+            }
+        } else {
+            drawBrandedHeader(canvas, rect, projectName, address, branding)
         }
-        SheetText.draw(canvas, rightTitleText, rect.right, rect.top + 16, rightTitlePaint)
-        SheetText.draw(canvas, dateLine, rect.right, rect.top + 31, datePaint)
         SheetText.hairline(canvas, rect.left, rect.right, rect.bottom - 2, RULE_COLOR, 0.75)
+    }
+
+    private fun drawBrandedHeader(canvas: Canvas, rect: SheetRect, projectName: String, address: String, branding: SheetBranding) {
+        // Right: the property.
+        val projectPaint = SheetText.paint(13.0, bold = true, align = Paint.Align.RIGHT)
+        val addressPaint = SheetText.paint(9.0, color = PlanColors.TEXT_SECONDARY, align = Paint.Align.RIGHT)
+        val rightMax = rect.width * HeaderLayout.PROJECT_MAX_FRACTION
+        val projectText = SheetText.ellipsize(projectName, projectPaint, rightMax)
+        val addressText = SheetText.ellipsize(address, addressPaint, rightMax)
+        val rightWidth = maxOf(projectPaint.measureText(projectText), addressPaint.measureText(addressText)).toDouble()
+        SheetText.draw(canvas, projectText, rect.right, rect.top + 21, projectPaint)
+        SheetText.draw(canvas, addressText, rect.right, rect.top + 35, addressPaint)
+
+        // Left: the company.
+        val logo = branding.logo?.takeUnless { it.isRecycled }
+        val layout = HeaderLayout.brandBlock(rect, logo?.let { it.width to it.height })
+        val logoRect = layout.logo
+        if (logo != null && logoRect != null) {
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            val dst = RectF(logoRect.left.toFloat(), logoRect.top.toFloat(), logoRect.right.toFloat(), logoRect.bottom.toFloat())
+            canvas.drawBitmap(logo, null, dst, paint)
+        }
+        val textMax = (rect.right - rightWidth - HeaderLayout.BLOCK_GAP - layout.textLeft).coerceAtLeast(0.0)
+        val namePaint = SheetText.paint(12.0, bold = true)
+        val contactPaint = SheetText.paint(8.5, color = PlanColors.TEXT_SECONDARY)
+        when {
+            branding.companyName.isNotEmpty() && branding.contactLine.isNotEmpty() -> {
+                SheetText.draw(canvas, SheetText.ellipsize(branding.companyName, namePaint, textMax), layout.textLeft, rect.top + 21, namePaint)
+                SheetText.draw(canvas, SheetText.ellipsize(branding.contactLine, contactPaint, textMax), layout.textLeft, rect.top + 34, contactPaint)
+            }
+            branding.companyName.isNotEmpty() ->
+                SheetText.draw(canvas, SheetText.ellipsize(branding.companyName, namePaint, textMax), layout.textLeft, rect.top + 29, namePaint)
+            branding.contactLine.isNotEmpty() -> {
+                val single = SheetText.paint(10.0, color = PlanColors.TEXT_SECONDARY)
+                SheetText.draw(canvas, SheetText.ellipsize(branding.contactLine, single, textMax), layout.textLeft, rect.top + 29, single)
+            }
+        }
     }
 
     private fun drawFooter(
@@ -204,30 +257,32 @@ object PlanSheetPainter {
         val bar = ptPerMeter?.let { ScaleBars.choose(it, planWidthPt, sheet.unitSystem, maxBar) }
         val leftMax = rect.width - (bar?.lengthPt ?: 0.0) - 24.0
 
-        val areaPaint = SheetText.paint(11.0, bold = true)
-        val countPaint = SheetText.paint(9.0, color = PlanColors.TEXT_SECONDARY)
-        SheetText.draw(canvas, SheetText.ellipsize(sheet.areaText, areaPaint, leftMax), rect.left, rect.top + 16, areaPaint)
-        SheetText.draw(canvas, SheetText.ellipsize(sheet.roomCountText, countPaint, leftMax), rect.left, rect.top + 29, countPaint)
+        val titlePaint = SheetText.paint(12.0, bold = true)
+        val detailPaint = SheetText.paint(9.0, color = PlanColors.TEXT_SECONDARY)
+        val detail = "${sheet.areaText} · ${sheet.roomCountText}"
+        SheetText.draw(canvas, SheetText.ellipsize(sheet.floorName, titlePaint, leftMax), rect.left, rect.top + 17, titlePaint)
+        SheetText.draw(canvas, SheetText.ellipsize(detail, detailPaint, leftMax), rect.left, rect.top + 31, detailPaint)
 
         if (bar != null) {
             val ratio = if (sheet.showScaleRatio) ScaleBars.ratio(bar.lengthPt / bar.lengthMeters) else null
-            drawScaleBar(canvas, bar, right = rect.right, top = rect.top + 9, ratio = ratio)
+            drawScaleBar(canvas, bar, right = rect.right, top = rect.top + 10, ratio = ratio)
         }
 
-        drawSmallFooter(canvas, widthPt, heightPt, sheet.pageLabel)
+        drawBottomLine(canvas, widthPt, heightPt, FloorSheets.bottomLineText(sheet.dateText, sheet.pageLabel))
     }
 
-    /** Disclaimer (7 pt) on the bottom line, with the page label right-aligned on the same line. */
-    internal fun drawSmallFooter(canvas: Canvas, widthPt: Double, heightPt: Double, pageLabel: String?) {
+    /** Disclaimer (7 pt) on the bottom line, with "Generated … · Page i of n" right-aligned on the same line. */
+    internal fun drawBottomLine(canvas: Canvas, widthPt: Double, heightPt: Double, rightText: String) {
         val left = SheetLayout.MARGIN
         val right = widthPt - SheetLayout.MARGIN
         val baseline = heightPt - SheetLayout.MARGIN
         val disclaimerPaint = SheetText.paint(7.0, color = PlanColors.TEXT_SECONDARY)
         var disclaimerMax = right - left
-        if (pageLabel != null) {
+        if (rightText.isNotEmpty()) {
             val pagePaint = SheetText.paint(7.0, color = PlanColors.TEXT_SECONDARY, align = Paint.Align.RIGHT)
-            SheetText.draw(canvas, pageLabel, right, baseline, pagePaint)
-            disclaimerMax -= pagePaint.measureText(pageLabel) + 12.0
+            val fitted = SheetText.ellipsize(rightText, pagePaint, (right - left) * 0.5)
+            SheetText.draw(canvas, fitted, right, baseline, pagePaint)
+            disclaimerMax -= pagePaint.measureText(fitted) + 12.0
         }
         SheetText.draw(
             canvas,
@@ -292,7 +347,7 @@ internal object SheetText {
     }
 
     fun ellipsize(text: String, paint: TextPaint, maxWidth: Double): String {
-        if (maxWidth <= 0) return ""
+        if (maxWidth <= 0 || text.isEmpty()) return ""
         if (paint.measureText(text) <= maxWidth) return text
         return TextUtils.ellipsize(text, paint, maxWidth.toFloat(), TextUtils.TruncateAt.END).toString()
     }

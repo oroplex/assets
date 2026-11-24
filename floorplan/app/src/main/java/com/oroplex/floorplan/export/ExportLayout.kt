@@ -23,12 +23,15 @@ data class SheetRect(val left: Double, val top: Double, val right: Double, val b
     val centerY: Double get() = (top + bottom) / 2
 }
 
-/** Fixed geometry of a plan sheet: header band, plan area, footer band. */
+/**
+ * Fixed geometry of a plan sheet: header band (who and which property), plan area, footer title block
+ * (which sheet, area, scale bar, date, page).
+ */
 object SheetLayout {
     /** Page margin on every side (0.5 in). */
     const val MARGIN = 36.0
-    const val HEADER_HEIGHT = 46.0
-    const val FOOTER_HEIGHT = 48.0
+    const val HEADER_HEIGHT = 54.0
+    const val FOOTER_HEIGHT = 52.0
 
     /** Space between the header/footer bands and the plan area. */
     const val GAP = 10.0
@@ -78,6 +81,79 @@ object SheetLayout {
         }
         return CHROME_HEIGHT + planHeight
     }
+}
+
+/** Where the parts of the company block go inside the header band (sheet points, y down). */
+data class BrandBlockLayout(
+    /** Rectangle the logo is drawn into (aspect preserved), or null without a usable logo. */
+    val logo: SheetRect?,
+    /** Left edge of the company name / contact text. */
+    val textLeft: Double,
+)
+
+object HeaderLayout {
+    /** The logo is fitted into this box at the left of the header (about 0.55 x 1.7 in). */
+    const val LOGO_MAX_HEIGHT = 40.0
+    const val LOGO_MAX_WIDTH = 120.0
+
+    /** Space between the logo and the company text. */
+    const val LOGO_TEXT_GAP = 10.0
+
+    /** The project block on the right never takes more than this fraction of the header width. */
+    const val PROJECT_MAX_FRACTION = 0.45
+
+    /** Minimum space between the left and right blocks. */
+    const val BLOCK_GAP = 18.0
+
+    /**
+     * Size of an [imageWidth] x [imageHeight] image scaled to fit inside [maxWidth] x [maxHeight]
+     * with its aspect ratio preserved (scaled up or down). Null for empty / invalid sizes.
+     */
+    fun containSize(imageWidth: Double, imageHeight: Double, maxWidth: Double, maxHeight: Double): Pair<Double, Double>? {
+        if (!(imageWidth > 0 && imageHeight > 0 && maxWidth > 0 && maxHeight > 0)) return null
+        if (!imageWidth.isFinite() || !imageHeight.isFinite() || !maxWidth.isFinite() || !maxHeight.isFinite()) return null
+        val f = minOf(maxWidth / imageWidth, maxHeight / imageHeight)
+        return imageWidth * f to imageHeight * f
+    }
+
+    /**
+     * Company block layout inside [header]: the logo (when [logoPixels] is a valid size) left-aligned and
+     * vertically centered in the band, the text starting [LOGO_TEXT_GAP] to its right.
+     */
+    fun brandBlock(header: SheetRect, logoPixels: Pair<Int, Int>?): BrandBlockLayout {
+        val size = logoPixels?.let {
+            containSize(it.first.toDouble(), it.second.toDouble(), LOGO_MAX_WIDTH, minOf(LOGO_MAX_HEIGHT, header.height - 6))
+        } ?: return BrandBlockLayout(logo = null, textLeft = header.left)
+        val (w, h) = size
+        // The band's hairline sits 2 pt above its bottom; center the logo in the space above it.
+        val centerY = header.top + (header.height - 2) / 2
+        val logo = SheetRect(header.left, centerY - h / 2, header.left + w, centerY + h / 2)
+        return BrandBlockLayout(logo, logo.right + LOGO_TEXT_GAP)
+    }
+}
+
+/** Geometry of the room schedule pages (below the same header band as the plan sheets). */
+object ScheduleLayout {
+    /** Space for the "Room schedule" title between the header band and the table. */
+    const val TITLE_SPACE = 30.0
+    const val HEADER_ROW_HEIGHT = 20.0
+    const val ROW_HEIGHT = 18.0
+
+    /** Line under the table for the "* estimated, not measured" footnote. */
+    const val FOOTNOTE_SPACE = 16.0
+
+    /** Bottom line (disclaimer, date, page number) plus breathing room. */
+    const val BOTTOM_RESERVE = 22.0
+
+    fun titleBaseline(heightPt: Double): Double = SheetLayout.planArea(0.0, heightPt).top + 14.0
+
+    fun tableTop(heightPt: Double): Double = SheetLayout.planArea(0.0, heightPt).top + TITLE_SPACE
+
+    fun tableBottom(heightPt: Double): Double = heightPt - SheetLayout.MARGIN - BOTTOM_RESERVE - FOOTNOTE_SPACE
+
+    /** How many body rows fit under the column header on a page [heightPt] tall (at least 1). */
+    fun rowsPerPage(heightPt: Double): Int =
+        floor((tableBottom(heightPt) - tableTop(heightPt) - HEADER_ROW_HEIGHT) / ROW_HEIGHT).toInt().coerceAtLeast(1)
 }
 
 /** A scale bar of [segments] alternating black / white blocks, [lengthPt] long, labeled [label]. */

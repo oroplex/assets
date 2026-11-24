@@ -1,5 +1,6 @@
 package com.oroplex.floorplan.ui.settings
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.consumeWindowInsets
@@ -11,16 +12,21 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.RestartAlt
+import androidx.compose.material.icons.outlined.School
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -30,6 +36,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -41,12 +48,15 @@ import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.UnitSystem
 import com.oroplex.floorplan.data.SettingsRepository
 import com.oroplex.floorplan.data.appContainer
+import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 /** Accepted ranges for the editable lengths (meters); deliberately narrower than the repository's sanity limits. */
 private val WALL_THICKNESS_RANGE = 0.025..0.6
 private val CEILING_RANGE = 1.5..6.0
 private val DOOR_RANGE = 1.5..3.5
+private val DOOR_WIDTH_RANGE = 0.4..2.5
+private val WINDOW_WIDTH_RANGE = 0.2..4.0
 private val WINDOW_HEIGHT_RANGE = 0.2..3.0
 private val WINDOW_SILL_RANGE = 0.0..2.5
 private const val MIN_TOLERANCE_DEG = 1f
@@ -55,16 +65,31 @@ private const val MAX_TOLERANCE_DEG = 10f
 /** Imperial display precision choices: denominator to label. */
 private val PRECISIONS = listOf(1 to "1\"", 2 to "1/2\"", 4 to "1/4\"", 8 to "1/8\"")
 
+/**
+ * App settings: defaults for new projects, company branding for exports, help and about.
+ *
+ * @param onShowTutorial replays the welcome tour; the "Show tutorial again" row is hidden when null.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(onBack: () -> Unit) {
-    val repository = appContainer().settings
+fun SettingsScreen(onBack: () -> Unit, onShowTutorial: (() -> Unit)? = null) {
+    val container = appContainer()
+    val repository = container.settings
     val settings by repository.defaults.collectAsStateWithLifecycle()
     var confirmReset by rememberSaveable { mutableStateOf(false) }
     val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
+    val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    val showMessage: (String) -> Unit = { text ->
+        scope.launch {
+            snackbar.currentSnackbarData?.dismiss()
+            snackbar.showSnackbar(text)
+        }
+    }
 
     Scaffold(
         modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
             TopAppBar(
                 title = { Text("Settings") },
@@ -118,6 +143,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                     checked = settings.showRoomAreas,
                     onCheckedChange = { v -> repository.update { it.copy(showRoomAreas = v) } },
                 )
+                SwitchSetting(
+                    title = "Show overall dimensions",
+                    supporting = "Total width and depth of the floor, outside the plan",
+                    checked = settings.showOverallDimensions,
+                    onCheckedChange = { v -> repository.update { it.copy(showOverallDimensions = v) } },
+                )
             }
 
             item(key = "walls") {
@@ -135,7 +166,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             }
 
             item(key = "heights") {
-                SectionHeader("Default heights")
+                SectionHeader("Defaults for new rooms")
                 LengthSettingField(
                     label = "Ceiling height",
                     valueMeters = settings.defaultCeilingHeight,
@@ -146,6 +177,15 @@ fun SettingsScreen(onBack: () -> Unit) {
                     onCommit = { v -> repository.update { it.copy(defaultCeilingHeight = v) } },
                 )
                 LengthSettingField(
+                    label = "Door width",
+                    valueMeters = settings.defaultDoorWidth,
+                    unitSystem = settings.unitSystem,
+                    imperialDenominator = settings.imperialDenominator,
+                    range = DOOR_WIDTH_RANGE,
+                    supportingText = "For newly placed doors and openings",
+                    onCommit = { v -> repository.update { it.copy(defaultDoorWidth = v) } },
+                )
+                LengthSettingField(
                     label = "Door height",
                     valueMeters = settings.defaultDoorHeight,
                     unitSystem = settings.unitSystem,
@@ -153,6 +193,15 @@ fun SettingsScreen(onBack: () -> Unit) {
                     range = DOOR_RANGE,
                     supportingText = "For newly placed doors and openings",
                     onCommit = { v -> repository.update { it.copy(defaultDoorHeight = v) } },
+                )
+                LengthSettingField(
+                    label = "Window width",
+                    valueMeters = settings.defaultWindowWidth,
+                    unitSystem = settings.unitSystem,
+                    imperialDenominator = settings.imperialDenominator,
+                    range = WINDOW_WIDTH_RANGE,
+                    supportingText = "For newly placed windows",
+                    onCommit = { v -> repository.update { it.copy(defaultWindowWidth = v) } },
                 )
                 LengthSettingField(
                     label = "Window height",
@@ -175,8 +224,24 @@ fun SettingsScreen(onBack: () -> Unit) {
                 )
             }
 
+            item(key = "branding") {
+                SectionHeader("Company branding")
+                BrandingSection(container.branding, onMessage = showMessage)
+            }
+
             item(key = "tips") {
-                SectionHeader("Scanning tips for best accuracy")
+                SectionHeader("Help and scanning tips")
+                if (onShowTutorial != null) {
+                    ListItem(
+                        modifier = Modifier.clickable(onClick = onShowTutorial),
+                        leadingContent = {
+                            Icon(Icons.Outlined.School, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        },
+                        headlineContent = { Text("Show tutorial again") },
+                        supportingContent = { Text("The four-page welcome tour: how scanning works and how to get accurate plans") },
+                        colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surface),
+                    )
+                }
                 ScanningTips()
             }
 
@@ -191,7 +256,12 @@ fun SettingsScreen(onBack: () -> Unit) {
         AlertDialog(
             onDismissRequest = { confirmReset = false },
             title = { Text("Restore defaults?") },
-            text = { Text("Units, labels, wall thickness, squaring and default heights go back to their original values.") },
+            text = {
+                Text(
+                    "Units, labels, wall thickness, squaring and default sizes go back to their original values. " +
+                        "Company branding is kept.",
+                )
+            },
             confirmButton = {
                 TextButton(onClick = {
                     repository.update { PlanSettings() }

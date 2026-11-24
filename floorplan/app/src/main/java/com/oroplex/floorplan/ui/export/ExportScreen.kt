@@ -89,7 +89,7 @@ fun ExportScreen(projectId: String, onBack: () -> Unit) {
     val context = LocalContext.current
     val appContext = context.applicationContext
     val vm: ExportViewModel = viewModel(key = "export:$projectId") {
-        ExportViewModel(projectId, container.projects, appContext, createSavedStateHandle())
+        ExportViewModel(projectId, container.projects, container.branding, appContext, createSavedStateHandle())
     }
     val state by vm.state.collectAsStateWithLifecycle()
     val preview by vm.preview.collectAsStateWithLifecycle()
@@ -113,6 +113,12 @@ fun ExportScreen(projectId: String, onBack: () -> Unit) {
             vm.events.collect { event ->
                 when (event) {
                     is ExportEvent.Message -> scope.launch { snackbar.showSnackbar(event.text) }
+                    is ExportEvent.PickSaveLocation -> try {
+                        saveLaunchers.getValue(event.format).launch(event.fileName)
+                    } catch (e: ActivityNotFoundException) {
+                        Log.w(TAG, "No document picker", e)
+                        scope.launch { snackbar.showSnackbar("No file manager is available to save files. Use Share instead.") }
+                    }
                     is ExportEvent.Share -> {
                         val problem = runCatchingShare {
                             context.startActivity(
@@ -156,15 +162,8 @@ fun ExportScreen(projectId: String, onBack: () -> Unit) {
             if (ready != null) {
                 ExportActions(
                     state = ready,
-                    onShare = vm::share,
-                    onSave = {
-                        try {
-                            saveLaunchers.getValue(ready.request.format).launch(ready.fileName)
-                        } catch (e: ActivityNotFoundException) {
-                            Log.w(TAG, "No document picker", e)
-                            scope.launch { snackbar.showSnackbar("No file manager is available to save files. Use Share instead.") }
-                        }
-                    },
+                    onShare = { vm.requestExport(ExportAction.SHARE) },
+                    onSave = { vm.requestExport(ExportAction.SAVE) },
                 )
             }
         },
@@ -179,8 +178,17 @@ fun ExportScreen(projectId: String, onBack: () -> Unit) {
                 preview = preview,
                 padding = padding,
                 vm = vm,
+                onBackToEditor = onBack,
             )
         }
+    }
+
+    ready?.confirmation?.let { confirmation ->
+        ExportAnywayDialog(
+            confirmation = confirmation,
+            onConfirm = vm::confirmExportAnyway,
+            onDismiss = vm::dismissConfirmation,
+        )
     }
 }
 
@@ -197,7 +205,13 @@ private inline fun runCatchingShare(block: () -> Unit): String? =
     }
 
 @Composable
-private fun ExportContent(state: ExportScreenState.Ready, preview: ExportPreview, padding: PaddingValues, vm: ExportViewModel) {
+private fun ExportContent(
+    state: ExportScreenState.Ready,
+    preview: ExportPreview,
+    padding: PaddingValues,
+    vm: ExportViewModel,
+    onBackToEditor: () -> Unit,
+) {
     val request = state.request
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -209,6 +223,18 @@ private fun ExportContent(state: ExportScreenState.Ready, preview: ExportPreview
     ) {
         item(key = "preview") {
             ExportPreviewCard(preview, Modifier.padding(horizontal = 16.dp))
+        }
+
+        if (state.blockedReason == null) {
+            item(key = "checks") {
+                PreExportCard(
+                    checks = state.checks,
+                    acknowledged = state.errorsAcknowledged,
+                    onExportAnyway = vm::acknowledgeErrors,
+                    onBackToEditor = onBackToEditor,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
         }
 
         if (request.format != ExportFormat.JSON && state.floorChoices.isNotEmpty()) {
@@ -236,6 +262,11 @@ private fun ExportContent(state: ExportScreenState.Ready, preview: ExportPreview
         }
 
         state.hint?.let { hint -> item(key = "hint") { Notice(hint, isError = false) } }
+        if (state.showBrandingTip) {
+            item(key = "branding-tip") {
+                Notice("Tip: add your company name and logo in Settings → Company branding to brand your exports.", isError = false)
+            }
+        }
         state.blockedReason?.let { reason -> item(key = "blocked") { Notice(reason, isError = true) } }
 
         item(key = "formats") {
@@ -255,8 +286,14 @@ private fun ExportContent(state: ExportScreenState.Ready, preview: ExportPreview
                         PaperSizeRow(request.paper, vm::selectPaper)
                     }
                     if (request.format != ExportFormat.DXF) {
-                        SwitchRow("Show wall lengths", request.showWallLengths, vm::setShowWallLengths)
-                        SwitchRow("Show room areas", request.showAreas, vm::setShowAreas)
+                        SwitchRow("Wall lengths", request.showWallLengths, vm::setShowWallLengths)
+                        SwitchRow("Room areas", request.showAreas, vm::setShowAreas)
+                        SwitchRow(
+                            "Overall dimensions",
+                            request.showOverallDimensions,
+                            vm::setShowOverallDimensions,
+                            supporting = "Total width and depth outside the plan",
+                        )
                     } else {
                         Text(
                             "DXF contains walls, doors, windows and room labels on separate layers.",
@@ -266,7 +303,12 @@ private fun ExportContent(state: ExportScreenState.Ready, preview: ExportPreview
                         )
                     }
                     if (request.format == ExportFormat.PDF) {
-                        SwitchRow("Include room schedule", request.includeRoomSchedule, vm::setIncludeRoomSchedule)
+                        SwitchRow(
+                            "Room schedule",
+                            request.includeRoomSchedule,
+                            vm::setIncludeRoomSchedule,
+                            supporting = "A page listing every room's size, area and ceiling height",
+                        )
                     }
                 }
             }
@@ -350,10 +392,11 @@ private fun PaperSizeRow(selected: PaperSize, onSelect: (PaperSize) -> Unit) {
 }
 
 @Composable
-private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit, supporting: String? = null) {
     ListItem(
         modifier = Modifier.toggleable(value = checked, onValueChange = onChange, role = Role.Switch),
         headlineContent = { Text(label) },
+        supportingContent = supporting?.let { { Text(it) } },
         trailingContent = { Switch(checked = checked, onCheckedChange = null) },
         colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surface),
     )

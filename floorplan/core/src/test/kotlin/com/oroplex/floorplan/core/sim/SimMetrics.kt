@@ -144,7 +144,7 @@ internal object SimReport {
 
     /** One aggregate row (accuracy columns over the accurate scans, in mm / % / degrees). */
     fun row(label: String, s: ErrorSummary): String {
-        val warnings = listOf("REORDERED", "far-corner", "missing-wall", "spike", "small-room")
+        val warnings = WARNING_KINDS
             .mapNotNull { k -> s.warningCount(k).takeIf { it > 0 }?.let { "$k x$it" } }
             .joinToString(", ")
         return String.format(
@@ -156,10 +156,20 @@ internal object SimReport {
         )
     }
 
+    /** Short report labels of the solver's warnings ("far-corner" is the round-1 warning, no longer produced). */
+    val WARNING_KINDS = listOf(
+        "REORDERED", "far-corner", "missing-wall", "step", "two-depths", "left-out", "shallow", "unsquared", "spike", "small-room",
+    )
+
     fun shortWarning(w: String): String = when {
         w.startsWith("Walls were re-ordered") -> "REORDERED"
         w.contains("beyond what was measured") -> "far-corner"
         w.contains("seems to be missing") -> "missing-wall"
+        w.contains("A step was assumed") -> "step"
+        w.contains("same wall measured") -> "two-depths"
+        w.contains("was left out") -> "left-out"
+        w.contains("shallow angle") -> "shallow"
+        w.contains("were not squared") -> "unsquared"
         w.contains("sharp spike") -> "spike"
         w.contains("very small") -> "small-room"
         else -> w.take(40)

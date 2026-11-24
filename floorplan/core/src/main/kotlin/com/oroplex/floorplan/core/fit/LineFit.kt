@@ -74,6 +74,187 @@ object LineFit {
     }
 
     /**
+     * Weighted orthogonal fit: the principal axis of the weighted scatter matrix, through the weighted
+     * centroid. With equal weights this is exactly [totalLeastSquares].
+     *
+     * Pairs are taken index by index up to the shorter of the two lists; pairs with a non-finite point or a
+     * non-finite / non-positive weight are ignored. Returns null for fewer than 2 usable pairs or a
+     * degenerate (all-coincident) set.
+     */
+    fun weightedTotalLeastSquares(points: List<Vec2>, weights: List<Double>): Line2? {
+        val n = minOf(points.size, weights.size)
+        var count = 0
+        var sw = 0.0
+        var sx = 0.0
+        var sy = 0.0
+        for (i in 0 until n) {
+            val p = points[i]
+            val w = weights[i]
+            if (!p.isFinite() || !(w > 0.0) || w.isInfinite()) continue
+            sw += w
+            sx += w * p.x
+            sy += w * p.y
+            count++
+        }
+        if (count < 2 || !(sw > 0.0)) return null
+        val mx = sx / sw
+        val my = sy / sw
+        var sxx = 0.0
+        var sxy = 0.0
+        var syy = 0.0
+        for (i in 0 until n) {
+            val p = points[i]
+            val w = weights[i]
+            if (!p.isFinite() || !(w > 0.0) || w.isInfinite()) continue
+            val dx = p.x - mx
+            val dy = p.y - my
+            sxx += w * dx * dx
+            sxy += w * dx * dy
+            syy += w * dy * dy
+        }
+        // lineFromMoments expects sums over n points; pass the weighted sums normalized to a mean.
+        return lineFromMoments(1, mx, my, sxx / sw, sxy / sw, syy / sw)
+    }
+
+    /**
+     * Maximum-likelihood line for depth samples whose error lies ALONG the viewing ray from [viewer]
+     * (depth sensors and depth-from-motion measure range, not position).
+     *
+     * Orthogonal regression (TLS) assumes isotropic noise. With range noise and a wall seen at incidence
+     * angle α, every sample is displaced along its ray, which has a component along the wall: the noise
+     * covariance then tilts the principal axis towards the viewing direction by roughly
+     * σ²·sin α·cos α / var(t) radians (≈ 0.1–0.2° for a 45° view at 2–4 m), which squaring turns into
+     * centimetres at the far corners. This fit instead minimizes Σ wᵢ·eᵢ² where
+     * eᵢ = (n·pᵢ − c) / (n·r̂ᵢ) is the distance from pᵢ to the line measured along its own ray r̂ᵢ
+     * (unit vector from [viewer] to pᵢ), i.e. the actual depth error. Gauss–Newton on (normal angle,
+     * offset) from [initial], with step halving so the cost never increases.
+     *
+     * * |n·r̂ᵢ| is floored at [minCos] (rays within ~acos(minCos) of grazing), so near-grazing samples cannot
+     *   blow up; such samples are down-weighted by 1/minCos² instead.
+     * * Pairs with a non-finite point, a point at the viewer, or a non-finite / non-positive weight are
+     *   ignored (see [weightedTotalLeastSquares] for the pairing rule).
+     * * Returns null for fewer than 2 usable samples, non-finite input, or a numerically singular system;
+     *   callers then keep [initial]. The returned line's point is on the fitted line near the samples.
+     */
+    fun fitAlongRays(
+        points: List<Vec2>,
+        weights: List<Double>,
+        viewer: Vec2,
+        initial: Line2,
+        minCos: Double = 0.2,
+        maxIterations: Int = 10,
+    ): Line2? {
+        if (!viewer.isFinite() || !initial.point.isFinite() || !initial.direction.isFinite()) return null
+        val floor = minCos.takeIf { it.isFinite() }?.coerceIn(1e-3, 1.0) ?: 0.2
+        val count = minOf(points.size, weights.size)
+        val qx = DoubleArray(count)
+        val qy = DoubleArray(count)
+        val rx = DoubleArray(count)
+        val ry = DoubleArray(count)
+        val ws = DoubleArray(count)
+        var m = 0
+        var sw = 0.0
+        var sx = 0.0
+        var sy = 0.0
+        for (i in 0 until count) {
+            val p = points[i]
+            val w = weights[i]
+            if (!p.isFinite() || !(w > 0.0) || w.isInfinite()) continue
+            val dx = p.x - viewer.x
+            val dy = p.y - viewer.y
+            val len = sqrt(dx * dx + dy * dy)
+            if (!(len > 1e-9)) continue
+            qx[m] = p.x
+            qy[m] = p.y
+            rx[m] = dx / len
+            ry[m] = dy / len
+            ws[m] = w
+            sw += w
+            sx += w * p.x
+            sy += w * p.y
+            m++
+        }
+        if (m < 2 || !(sw > 0.0)) return null
+        // Center on the weighted centroid for conditioning.
+        val mx = sx / sw
+        val my = sy / sw
+        for (i in 0 until m) {
+            qx[i] -= mx
+            qy[i] -= my
+        }
+        val n0 = initial.normal
+        var phi = atan2(n0.y, n0.x)
+        var c = n0.x * (initial.point.x - mx) + n0.y * (initial.point.y - my)
+
+        fun cost(phiV: Double, cV: Double): Double {
+            val nx = cos(phiV)
+            val ny = sin(phiV)
+            var s = 0.0
+            for (i in 0 until m) {
+                var g = nx * rx[i] + ny * ry[i]
+                if (abs(g) < floor) g = if (g < 0) -floor else floor
+                val e = (nx * qx[i] + ny * qy[i] - cV) / g
+                s += ws[i] * e * e
+            }
+            return s
+        }
+
+        var current = cost(phi, c)
+        if (!current.isFinite()) return null
+        for (iter in 0 until maxIterations.coerceAtLeast(0)) {
+            val nx = cos(phi)
+            val ny = sin(phi)
+            var aPP = 0.0
+            var aPC = 0.0
+            var aCC = 0.0
+            var bP = 0.0
+            var bC = 0.0
+            for (i in 0 until m) {
+                val gRaw = nx * rx[i] + ny * ry[i]
+                val clamped = abs(gRaw) < floor
+                val g = if (!clamped) gRaw else if (gRaw < 0) -floor else floor
+                // dn/dphi = (-ny, nx)
+                val dg = if (clamped) 0.0 else -ny * rx[i] + nx * ry[i]
+                val u = nx * qx[i] + ny * qy[i] - c
+                val du = -ny * qx[i] + nx * qy[i]
+                val e = u / g
+                val jP = (du * g - u * dg) / (g * g)
+                val jC = -1.0 / g
+                val w = ws[i]
+                aPP += w * jP * jP
+                aPC += w * jP * jC
+                aCC += w * jC * jC
+                bP -= w * jP * e
+                bC -= w * jC * e
+            }
+            val det = aPP * aCC - aPC * aPC
+            if (!(abs(det) > 1e-300) || !det.isFinite()) return null
+            var dPhi = (bP * aCC - bC * aPC) / det
+            var dC = (aPP * bC - aPC * bP) / det
+            if (!dPhi.isFinite() || !dC.isFinite()) return null
+            var accepted = false
+            for (halving in 0 until 8) {
+                val next = cost(phi + dPhi, c + dC)
+                if (next.isFinite() && next <= current) {
+                    phi += dPhi
+                    c += dC
+                    current = next
+                    accepted = true
+                    break
+                }
+                dPhi *= 0.5
+                dC *= 0.5
+            }
+            if (!accepted || (abs(dPhi) < 1e-12 && abs(dC) < 1e-12)) break
+        }
+        val nx = cos(phi)
+        val ny = sin(phi)
+        val point = Vec2(mx + nx * c, my + ny * c)
+        // Direction d with d.perp() == n.
+        return Line2(point, Vec2(ny, -nx))
+    }
+
+    /**
      * Deterministic RANSAC (seeded RNG) followed by TLS refinement on the inliers
      * (re-selecting inliers against the refined line, up to 3 refinement passes).
      * Returns null when no line reaches [minInliers].

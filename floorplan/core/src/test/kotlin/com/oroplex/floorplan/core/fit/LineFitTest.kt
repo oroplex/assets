@@ -82,6 +82,92 @@ class LineFitTest {
         assertEquals(1.0, abs(withNan.direction.x), 1e-12)
     }
 
+    // ---------------------------------------------------------------- weightedTotalLeastSquares
+
+    @Test fun weightedTlsWithEqualWeightsIsTls() {
+        val rnd = Random(5)
+        val truth = Line2.fromAngle(Vec2(0.5, 1.0), Math.toRadians(-20.0))
+        val pts = noisyLine(rnd, truth, 300, -1.0..1.0, 0.01)
+        val plain = assertNotNull(LineFit.totalLeastSquares(pts))
+        val weighted = assertNotNull(LineFit.weightedTotalLeastSquares(pts, pts.map { 3.7 }))
+        assertTrue(plain.point.approxEquals(weighted.point, 1e-12))
+        assertEquals(0.0, plain.sinAngleTo(weighted), 1e-12)
+    }
+
+    @Test fun weightedTlsFollowsTheHeavySamples() {
+        // Two parallel rows 0.1 m apart: the weighted line sits next to the heavy row.
+        val heavy = (0..20).map { Vec2(it * 0.1, 0.0) }
+        val light = (0..20).map { Vec2(it * 0.1, 0.1) }
+        val line = assertNotNull(LineFit.weightedTotalLeastSquares(heavy + light, heavy.map { 99.0 } + light.map { 1.0 }))
+        assertEquals(0.001, line.point.y, 1e-9)
+        assertEquals(1.0, abs(line.direction.x), 1e-9)
+    }
+
+    @Test fun weightedTlsDegenerateInputs() {
+        assertNull(LineFit.weightedTotalLeastSquares(emptyList(), emptyList()))
+        assertNull(LineFit.weightedTotalLeastSquares(listOf(Vec2(0.0, 0.0), Vec2(1.0, 0.0)), listOf(1.0, 0.0)))
+        assertNull(LineFit.weightedTotalLeastSquares(listOf(Vec2(0.0, 0.0), Vec2(1.0, 0.0)), listOf(1.0, Double.NaN)))
+        assertNull(LineFit.weightedTotalLeastSquares(List(4) { Vec2(1.0, 1.0) }, List(4) { 1.0 }))
+        // Mismatched sizes: pairs up to the shorter list.
+        assertNotNull(LineFit.weightedTotalLeastSquares(listOf(Vec2(0.0, 0.0), Vec2(1.0, 0.0), Vec2(5.0, 5.0)), listOf(1.0, 1.0)))
+    }
+
+    // ---------------------------------------------------------------- fitAlongRays
+
+    /** Samples of [truth] seen from [viewer], each moved along its own ray by N(0, sigma). */
+    private fun rangeNoisySamples(rnd: Random, truth: Line2, viewer: Vec2, count: Int, tRange: ClosedFloatingPointRange<Double>, sigma: Double) =
+        List(count) {
+            val q = truth.at(tRange.start + rnd.nextDouble() * (tRange.endInclusive - tRange.start))
+            q + (q - viewer).normalized() * (rnd.nextGaussian() * sigma)
+        }
+
+    @Test fun fitAlongRaysRemovesTheObliqueViewBiasOfTls() {
+        // A wall seen at ~45 degrees with 4 cm range noise: orthogonal regression tilts towards the view
+        // direction (~0.14 degrees); the along-ray fit does not.
+        val truth = Line2(Vec2(0.0, 0.0), Vec2(1.0, 0.0))
+        val viewer = Vec2(-1.5, 1.5)
+        val tls = ArrayList<Double>()
+        val ml = ArrayList<Double>()
+        for (k in 0 until 40) {
+            val rnd = Random(100L + k)
+            val pts = rangeNoisySamples(rnd, truth, viewer, 2000, 0.5..2.5, 0.04)
+            val t = assertNotNull(LineFit.totalLeastSquares(pts))
+            val m = assertNotNull(LineFit.fitAlongRays(pts, pts.map { 1.0 }, viewer, t))
+            fun signedDeg(l: Line2) = Math.toDegrees(Math.asin((truth.direction cross (if (l.direction.x < 0) -l.direction else l.direction)).coerceIn(-1.0, 1.0)))
+            tls += signedDeg(t)
+            ml += signedDeg(m)
+            assertTrue(abs(truth.signedDistance(m.point)) < 0.005, "the fitted line passes near the samples")
+        }
+        assertTrue(abs(tls.average()) > 0.08, "scene: TLS should be visibly biased (${tls.average()})")
+        assertTrue(abs(ml.average()) < 0.03, "along-ray fit biased by ${ml.average()} deg")
+    }
+
+    @Test fun fitAlongRaysOnExactDataAndHeadOnMatchesTls() {
+        val truth = Line2.fromAngle(Vec2(1.0, 2.0), Math.toRadians(70.0))
+        val exact = (0..30).map { truth.at(-1.0 + it / 15.0) }
+        val viewer = truth.point + truth.normal * 2.0
+        val fit = assertNotNull(LineFit.fitAlongRays(exact, exact.map { 1.0 }, viewer, truth.offset(0.05).rotatedAround(truth.point, 0.02)))
+        assertEquals(0.0, fit.sinAngleTo(truth), 1e-9)
+        assertEquals(0.0, truth.distance(fit.point), 1e-9)
+        // Head-on with isotropic-looking noise the two fits agree closely.
+        val rnd = Random(3)
+        val pts = rangeNoisySamples(rnd, truth, viewer, 500, -0.3..0.3, 0.01)
+        val tls = assertNotNull(LineFit.totalLeastSquares(pts))
+        val ml = assertNotNull(LineFit.fitAlongRays(pts, pts.map { 1.0 }, viewer, tls))
+        assertTrue(Math.toDegrees(Math.asin(tls.sinAngleTo(ml))) < 0.2)
+    }
+
+    @Test fun fitAlongRaysDegenerateInputs() {
+        val line = Line2(Vec2.ZERO, Vec2(1.0, 0.0))
+        assertNull(LineFit.fitAlongRays(listOf(Vec2(1.0, 0.0)), listOf(1.0), Vec2(0.0, 1.0), line))
+        assertNull(LineFit.fitAlongRays(listOf(Vec2(1.0, 0.0), Vec2(2.0, 0.0)), listOf(1.0, 1.0), Vec2(Double.NaN, 1.0), line))
+        assertNull(LineFit.fitAlongRays(listOf(Vec2(1.0, 0.0), Vec2(2.0, 0.0)), listOf(1.0, 1.0), Vec2(0.0, 1.0), Line2(Vec2(Double.NaN, 0.0), Vec2(1.0, 0.0))))
+        // Samples at the viewer are skipped; grazing rays are clamped and never blow up.
+        val grazing = (1..20).map { Vec2(it * 0.5, 0.001 * (it % 3)) }
+        val fit = LineFit.fitAlongRays(grazing + Vec2(0.0, 0.01), grazing.map { 1.0 } + 1.0, Vec2(0.0, 0.01), line)
+        if (fit != null) assertTrue(fit.point.isFinite() && fit.direction.isFinite())
+    }
+
     // ---------------------------------------------------------------- ransac
 
     /** 60 % inliers on a 4 m line with 5 mm noise, 40 % uniform outliers in a 6 x 6 m box. */

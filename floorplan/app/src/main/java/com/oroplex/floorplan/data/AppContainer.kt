@@ -10,6 +10,7 @@ class AppContainer(context: Context) {
     private val appContext = context.applicationContext
     val projects: ProjectRepository = FileProjectRepository(appContext.filesDir)
     val settings: SettingsRepository = PrefsSettingsRepository(appContext)
+    val branding: BrandingRepository = PrefsBrandingRepository(appContext)
 }
 
 /** Access the container from composables. */

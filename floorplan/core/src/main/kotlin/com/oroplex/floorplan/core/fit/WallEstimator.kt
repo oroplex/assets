@@ -136,6 +136,12 @@ object WallEstimator {
         ceilingY: Double?,
         viewer: Vec3,
         config: WallEstimatorConfig = WallEstimatorConfig(),
+        /**
+         * Where the user aimed: the reticle (screen-center) hit, e.g. the median of the center-ray hits over
+         * the sampling frames. When given, the fitted wall must be the surface at the aim point (this resolves
+         * furniture, doorways and side walls seen at grazing angles). Null = legacy heuristics only.
+         */
+        aimPoint: Vec3? = null,
     ): WallFit {
         val total = worldPoints.size
         fun fail(reason: WallFitFailure, used: Int) = WallFit(null, reason, used, total)

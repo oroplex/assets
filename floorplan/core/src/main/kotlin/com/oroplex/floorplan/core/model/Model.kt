@@ -30,6 +30,10 @@ data class PlanSettings(
     val defaultDoorHeight: Double = 2.032, // 80 in
     val defaultWindowHeight: Double = 1.2192, // 48 in
     val defaultWindowSill: Double = 0.9144, // 36 in
+    val defaultDoorWidth: Double = 0.8128, // 32 in
+    val defaultWindowWidth: Double = 0.9144, // 36 in
+    /** Draw overall exterior dimension lines (width / depth of the whole floor) around the plan. */
+    val showOverallDimensions: Boolean = true,
 )
 
 @Serializable
@@ -113,8 +117,13 @@ data class Room(
     val type: RoomType = RoomType.OTHER,
     /** Interior outline, counter-clockwise, plan meters, no repeated closing vertex. */
     val corners: List<Vec2>,
-    /** Floor-to-ceiling height in meters, null if not measured. */
+    /** Floor-to-ceiling height in meters, null if unknown. */
     val ceilingHeight: Double? = null,
+    /**
+     * True when [ceilingHeight] is an assumed default (ceiling step skipped) rather than measured or typed.
+     * UI and exports must mark such heights as estimated, and calibration must not rescale them.
+     */
+    val ceilingEstimated: Boolean = false,
     val openings: List<Opening> = emptyList(),
     val captureMethod: CaptureMethod = CaptureMethod.MANUAL,
     /** Raw capture data (walls mode), in the same order the user captured them. */
@@ -135,6 +144,8 @@ data class Calibration(
     val measuredLength: Double,
     val trueLength: Double,
     val appliedAt: Long,
+    /** Plan point the floor was scaled about; rooms added later are scaled about the same point. */
+    val origin: Vec2 = Vec2.ZERO,
 )
 
 @Serializable

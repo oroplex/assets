@@ -93,3 +93,12 @@ swing arc, blue window symbols, bold room names, secondary text for dimensions a
 * Core code: deterministic (seeded RNG), unit tests for every public function incl. edge cases.
 * Build: `./gradlew :core:test` and `./gradlew :app:assembleDebug` must pass (needs `local.properties`
   with `sdk.dir=/opt/android-sdk`, which is gitignored).
+
+## Round 2 additions (contracts)
+* Model: `Room.ceilingEstimated`, `Calibration.origin`, `PlanSettings.defaultDoorWidth/defaultWindowWidth/showOverallDimensions`.
+* Core: `WallEstimator.fromPoints(..., aimPoint)` (fit the surface the user aimed at), `SolverOptions.axisHint`
+  (share one squaring axis across rooms of a session), `FloorOps.straighten/rotate/snapRoom/applyCalibration`,
+  `FloorChecks` (pre-export checks, overlaps), `RoomQuality` (per-room trust grade), `RenderOptions.showOverallDimensions`
+  / `highlightRoomIds`, `Dollhouse` (3D model faces).
+* App: `AppContainer.branding` (`BrandingRepository`: company name/contact/logo, one-time flags),
+  `ui/view3d/DollhouseScreen`, `PlanEditorScreen(onOpen3d)`; route `view3d/{projectId}/{floorId}`.

@@ -24,6 +24,12 @@ data class SolverOptions(
     val parallelDeg: Double = 12.0,
     /** Parallel consecutive walls whose faces are within this distance are merged into one wall. */
     val sameWallOffset: Double = 0.10,
+    /**
+     * Preferred squaring axis (radians, mod 90deg), e.g. the dominant axis of rooms already captured in the
+     * same AR session, so neighbouring rooms come out exactly parallel. Used when the room's own dominant
+     * axis is within squareToleranceDeg of it; ignored otherwise.
+     */
+    val axisHint: Double? = null,
 )
 
 data class SolveResult(

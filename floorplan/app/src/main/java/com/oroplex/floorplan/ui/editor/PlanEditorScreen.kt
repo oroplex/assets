@@ -68,6 +68,8 @@ fun PlanEditorScreen(
     onScanRoom: (projectId: String, floorId: String) -> Unit,
     onExport: (projectId: String) -> Unit,
     onBack: () -> Unit,
+    /** Open the 3D dollhouse view of a floor (route view3d/{projectId}/{floorId}). */
+    onOpen3d: (projectId: String, floorId: String) -> Unit = { _, _ -> },
 ) {
     val container = appContainer()
     val viewModel: PlanEditorViewModel = viewModel(

@@ -405,4 +405,30 @@ object FloorOps {
         if (floor.rooms.none { it.id == roomId }) return floor
         return floor.copy(rooms = floor.rooms.filterNot { it.id == roomId })
     }
+
+    /**
+     * Rotate every room about the floor's bounds center so the floor's dominant wall direction becomes
+     * axis-aligned, using the smallest rotation (|angle| <= 45deg). Floors without rooms are returned unchanged.
+     */
+    fun straighten(floor: Floor): Floor = TODO("implement")
+
+    /** Rotate every room (geometry, observations, taps) about the floor's bounds center by [angle] radians, CCW. */
+    fun rotate(floor: Floor, angle: Double): Floor = TODO("implement")
+
+    /**
+     * Snap room [roomId] against its best neighbour: among pairs (edge of this room, edge of another room) whose
+     * faces are anti-parallel within [maxAngleDeg], whose extents overlap along the wall, and whose face gap is
+     * within [maxDistance] of [wallThickness], pick the best (smallest combined angle/gap error, longest overlap);
+     * rotate the room about its centroid so the two faces are exactly parallel, then translate it along the
+     * neighbour's normal so the gap equals [wallThickness]. Returns null when no pair qualifies.
+     */
+    fun snapRoom(floor: Floor, roomId: String, wallThickness: Double, maxDistance: Double = 0.6, maxAngleDeg: Double = 12.0): Floor? =
+        TODO("implement")
+
+    /**
+     * Apply the floor's existing calibration to a room that is being ADDED to it (e.g. newly captured), scaling
+     * about Calibration.origin. Only AR-measured quantities are scaled: corners, observations, taps, opening
+     * offsets/widths, and ceilingHeight unless ceilingEstimated. MANUAL rooms and uncalibrated floors: unchanged.
+     */
+    fun applyCalibration(floor: Floor, room: Room): Room = TODO("implement")
 }

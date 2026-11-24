@@ -21,6 +21,10 @@ data class RenderOptions(
     val selectedWall: Int? = null,
     /** Base text size multiplier (PDF may use 0.8, phone screen 1.0). */
     val textScale: Double = 1.0,
+    /** null = follow PlanSettings.showOverallDimensions. Overall width/depth dimension lines outside the plan. */
+    val showOverallDimensions: Boolean? = null,
+    /** Rooms to flag (e.g. overlapping rooms) with a WARNING-colored outline. */
+    val highlightRoomIds: Set<String> = emptySet(),
 )
 
 object PlanRenderer {

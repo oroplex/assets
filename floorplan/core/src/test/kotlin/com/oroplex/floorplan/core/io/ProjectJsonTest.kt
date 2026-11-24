@@ -1,5 +1,8 @@
 package com.oroplex.floorplan.core.io
 
+import com.oroplex.floorplan.core.geometry.Vec2
+import com.oroplex.floorplan.core.model.Calibration
+import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.RoomType
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -47,6 +50,31 @@ class ProjectJsonTest {
         assertEquals("P", p.name)
         assertEquals(RoomType.OTHER, p.floors.single().rooms.single().type, "unknown enum falls back to the default")
         assertEquals(1, p.schemaVersion)
+    }
+
+    @Test fun roundTwoFieldsRoundTripAndOldFilesGetSafeDefaults() {
+        val floor = sample.floors.first()
+        val room = floor.rooms.first().copy(ceilingEstimated = true)
+        val calibration = Calibration(1.02, room.id, 0, 4.0, 4.08, 5L, origin = Vec2(1.5, -2.25))
+        val settings = sample.settings.copy(defaultDoorWidth = 0.9, defaultWindowWidth = 1.2, showOverallDimensions = false)
+        val project = sample.copy(
+            settings = settings,
+            floors = listOf(floor.copy(rooms = listOf(room) + floor.rooms.drop(1), calibration = calibration)),
+        )
+        val json = ProjectJson.encode(project)
+        assertTrue("\"ceilingEstimated\":true" in json && "\"origin\"" in json && "\"showOverallDimensions\":false" in json)
+        assertEquals(project, ProjectJson.decode(json))
+        // A round-1 backup has none of these fields: ceilings count as measured, calibrations as scaled about
+        // the plan origin, and the new settings take their defaults.
+        val old = """{"id":"p","name":"P","createdAt":1,"updatedAt":2,"settings":{"unitSystem":"METRIC"},
+            |"floors":[{"id":"f","name":"F","calibration":{"factor":1.03,"roomId":"r","wallIndex":0,"measuredLength":4.0,
+            |"trueLength":4.12,"appliedAt":3},"rooms":[{"id":"r","name":"R","corners":[],"ceilingHeight":2.4}]}]}""".trimMargin()
+        val decoded = ProjectJson.decode(old)
+        val f = decoded.floors.single()
+        assertFalse(f.rooms.single().ceilingEstimated)
+        assertEquals(Vec2.ZERO, f.calibration?.origin)
+        assertEquals(PlanSettings().defaultDoorWidth, decoded.settings.defaultDoorWidth)
+        assertTrue(decoded.settings.showOverallDimensions)
     }
 
     @Test fun nonFiniteNumbersNeverMakeAProjectUnsavable() {

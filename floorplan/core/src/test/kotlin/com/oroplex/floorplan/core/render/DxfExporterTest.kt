@@ -11,6 +11,7 @@ import com.oroplex.floorplan.core.render.Fixtures.rect
 import com.oroplex.floorplan.core.render.Fixtures.room
 import com.oroplex.floorplan.core.render.Fixtures.settings
 import com.oroplex.floorplan.core.render.Fixtures.t
+import kotlin.math.abs
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -158,6 +159,33 @@ class DxfExporterTest {
         val empty = records(parse(DxfExporter.export(emptyList(), settings)))
         assertTrue(section(empty, "ENTITIES").isEmpty())
         assertEquals("EOF", empty.last().type)
+    }
+
+    @Test fun overallDimensionsGoOnTheirOwnLayer() {
+        val r = room("a", rect(0.0, 0.0, 4.0, 3.0))
+        val metric = Fixtures.withDimensions.copy(unitSystem = UnitSystem.METRIC)
+        val records = records(parse(DxfExporter.export(listOf(r), metric)))
+        assertTrue(section(records, "TABLES").any { it.type == "LAYER" && it.first(2) == "DIMENSIONS" })
+        val entities = section(records, "ENTITIES")
+        val dims = entities.filter { it.groups.any { g -> g.code == 8 && g.value == "DIMENSIONS" } }
+        // Per dimension: the line, two extension lines and two ticks, plus its label.
+        assertEquals(10, dims.count { it.type == "LINE" })
+        val labels = dims.filter { it.type == "TEXT" }
+        assertEquals(listOf("4.23 m", "3.23 m"), labels.map { it.first(1) })
+        assertTrue(labels.all { it.double(40) > 0 && it.first(72) == "1" && it.first(73) == "2" })
+        assertNear(0.0, labels[0].double(50), 1e-9)
+        assertNear(90.0, labels[1].double(50), 1e-9)
+        // The width line is horizontal, above the top wall band (y in mm), and spans the outer faces.
+        val lines = dims.filter { it.type == "LINE" }
+        val widthLine = lines.single { abs(it.double(20) - it.double(21)) < 1e-6 && abs(abs(it.double(11) - it.double(10)) - (4 + 2 * t) * 1000) < 1e-3 }
+        assertTrue(widthLine.double(20) > (3 + t) * 1000)
+        // The header extents include the dimensions.
+        val hdr = records.first().groups
+        val extMax = hdr.indexOfFirst { it.value == "\$EXTMAX" }
+        assertTrue(hdr[extMax + 2].value.toDouble() > widthLine.double(20))
+        // Off in the settings: no dimension entities (the layer is still defined).
+        val off = section(records(parse(DxfExporter.export(listOf(r), settings.copy(unitSystem = UnitSystem.METRIC)))), "ENTITIES")
+        assertTrue(off.none { it.groups.any { g -> g.code == 8 && g.value == "DIMENSIONS" } })
     }
 
     @Test fun textIsAsciiSafe() {

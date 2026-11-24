@@ -19,6 +19,7 @@ object DxfExporter {
     const val LAYER_DOORS = "DOORS"
     const val LAYER_WINDOWS = "WINDOWS"
     const val LAYER_TEXT = "TEXT"
+    const val LAYER_DIMENSIONS = "DIMENSIONS"
     private val LAYERS = listOf(
         "0" to 7,
         LAYER_ROOMS to 8, // gray
@@ -26,6 +27,7 @@ object DxfExporter {
         LAYER_DOORS to 1, // red
         LAYER_WINDOWS to 5, // blue
         LAYER_TEXT to 3, // green
+        LAYER_DIMENSIONS to 4, // cyan
     )
 
     /**
@@ -38,7 +40,10 @@ object DxfExporter {
      * ASCII DXF (AutoCAD R12 / AC1009, maximally compatible) of the rooms, in the plan frame (y up).
      * Units: inches when settings.unitSystem == IMPERIAL, millimeters when METRIC ($INSUNITS 1 / 4 in header).
      * Layers: ROOMS (closed interior outlines), WALLS (closed outer outlines offset by wall thickness),
-     * DOORS (leaf LINE + swing ARC), WINDOWS (LINEs), TEXT (room name / dims / area TEXT entities).
+     * DOORS (leaf LINE + swing ARC), WINDOWS (LINEs), TEXT (room name / dims / area TEXT entities),
+     * DIMENSIONS (when settings.showOverallDimensions: the overall width / depth dimension lines, extension
+     * lines and 45° ticks as LINEs plus their labels as TEXT, laid out like the on-screen plan with the same
+     * meters-per-point scale as the DXF text, see [OverallDimensions]).
      *
      * R12 has no LWPOLYLINE, so outlines are POLYLINE / VERTEX / SEQEND with the closed flag. Door and window
      * symbols use the same geometry as the on-screen plan. Rooms with an unusable outline (fewer than 3 finite
@@ -93,6 +98,16 @@ object DxfExporter {
             label.lines.forEachIndexed { k, line ->
                 val at = label.anchor + up * (label.offsetsPt[k] * TEXT_METERS_PER_PT)
                 entities.text(LAYER_TEXT, at, line.sizePt * TEXT_METERS_PER_PT, label.angle, line.text)
+            }
+        }
+
+        if (settings.showOverallDimensions) {
+            for (dim in OverallDimensions.compute(drawable, settings, thickness, TEXT_METERS_PER_PT, textScale = 1.0)) {
+                entities.line(LAYER_DIMENSIONS, dim.line.a, dim.line.b)
+                for (s in dim.extensions + dim.ticks) entities.line(LAYER_DIMENSIONS, s.a, s.b)
+                val up = Vec2.fromAngle(dim.labelAngle + PI / 2)
+                val at = dim.labelAnchor + up * (dim.labelOffsetPt * TEXT_METERS_PER_PT)
+                entities.text(LAYER_DIMENSIONS, at, dim.labelSizePt * TEXT_METERS_PER_PT, dim.labelAngle, dim.label)
             }
         }
 

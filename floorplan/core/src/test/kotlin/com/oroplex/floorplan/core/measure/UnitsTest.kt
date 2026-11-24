@@ -76,6 +76,9 @@ class UnitsTest {
             Locale.setDefault(Locale.GERMANY)
             assertEquals("3.76 m", Units.formatLength(3.76, METRIC))
             assertEquals("14.1 m²", Units.formatArea(14.06, METRIC))
+            // Thousands separators are always commas, never the locale's grouping character.
+            assertEquals("2,150 sq ft", Units.formatArea(199.74, IMPERIAL))
+            assertEquals("1,250.0 m²", Units.formatArea(1250.0, METRIC))
         } finally {
             Locale.setDefault(previous)
         }
@@ -94,7 +97,16 @@ class UnitsTest {
             Triple(14.1214, IMPERIAL, "152 sq ft"),
             Triple(1.0, IMPERIAL, "11 sq ft"),
             Triple(0.0, IMPERIAL, "0 sq ft"),
-            Triple(185.8, IMPERIAL, "2000 sq ft"),
+            Triple(185.8, IMPERIAL, "2,000 sq ft"),
+            Triple(199.74, IMPERIAL, "2,150 sq ft"),
+            Triple(92.8, IMPERIAL, "999 sq ft"),
+            Triple(92.9, IMPERIAL, "1,000 sq ft"),
+            Triple(114_700.0, IMPERIAL, "1,234,621 sq ft"),
+            Triple(-185.8, IMPERIAL, "-2,000 sq ft"),
+            Triple(1250.0, METRIC, "1,250.0 m²"),
+            Triple(999.96, METRIC, "1,000.0 m²"),
+            Triple(999.94, METRIC, "999.9 m²"),
+            Triple(-1250.04, METRIC, "-1,250.0 m²"),
             Triple(14.06, METRIC, "14.1 m²"),
             Triple(14.04, METRIC, "14.0 m²"),
             Triple(0.0, METRIC, "0.0 m²"),

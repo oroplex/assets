@@ -33,6 +33,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -167,9 +168,17 @@ internal fun ReviewPanel(
                 }
             }
 
+            // Local text state so fast typing never races the ViewModel's async state emissions. The only
+            // ViewModel-side rename (picking a type while the name isn't user-edited) is adopted here.
+            var nameText by remember(d.id) { mutableStateOf(d.name) }
+            LaunchedEffect(d.type) { if (!d.nameEdited) nameText = d.name }
             OutlinedTextField(
-                value = d.name,
-                onValueChange = actions::setName,
+                value = nameText,
+                onValueChange = {
+                    val text = it.take(CaptureViewModel.MAX_NAME_LENGTH)
+                    nameText = text
+                    actions.setName(text)
+                },
                 label = { Text("Room name") },
                 placeholder = { Text(d.type.displayName) },
                 singleLine = true,

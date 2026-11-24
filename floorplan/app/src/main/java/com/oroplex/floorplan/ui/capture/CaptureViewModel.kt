@@ -14,6 +14,7 @@ import com.oroplex.floorplan.core.geometry.RigidTransform2
 import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.geometry.Vec3
 import com.oroplex.floorplan.core.io.Ids
+import com.oroplex.floorplan.core.model.Calibration
 import com.oroplex.floorplan.core.model.CaptureMethod
 import com.oroplex.floorplan.core.model.Floor
 import com.oroplex.floorplan.core.model.Opening
@@ -52,6 +53,27 @@ data class UserMessage(val id: Long, val text: String)
  */
 data class BaselineCapture(val firstTap: Vec3? = null)
 
+/** One undoable change of a room's walls / corners: the captures before it, and what undoing it says. */
+data class CaptureEdit(
+    val observations: List<WallObservation>,
+    val cornerTaps: List<Vec2>,
+    val undoMessage: String,
+)
+
+enum class FeedbackKind {
+    /** A measurement succeeded: confirmation haptic and a check mark on the reticle. */
+    CAPTURED,
+
+    /** A step was completed (room closed, opening placed, room saved): confirmation haptic only. */
+    CONFIRMED,
+
+    /** A measurement failed: reject haptic and a red flash on the reticle. */
+    FAILED,
+}
+
+/** Outcome feedback the UI plays once (haptic + reticle animation), then acknowledges by [id]. */
+data class CaptureFeedback(val id: Long, val kind: FeedbackKind)
+
 /**
  * Everything captured so far for the room being scanned. Immutable; every change produces a copy.
  *
@@ -64,7 +86,11 @@ data class RoomDraft(
     val method: CaptureMethod = CaptureMethod.WALLS,
     val observations: List<WallObservation> = emptyList(),
     val cornerTaps: List<Vec2> = emptyList(),
-    /** Measured floor-to-ceiling height; null when skipped (the project default is used on save). */
+    /**
+     * Floor-to-ceiling height. Measured when [ceilingMeasured]; otherwise an assumption (another room's
+     * height) or null when the step was skipped, in which case the project default is saved. Either way an
+     * unmeasured height is saved with `Room.ceilingEstimated = true`.
+     */
     val ceilingHeight: Double? = null,
     val ceilingMeasured: Boolean = false,
     val openings: List<Opening> = emptyList(),
@@ -82,6 +108,12 @@ data class RoomDraft(
     val type: RoomType = RoomType.OTHER,
     /** The ARCore anchor for this room was requested. */
     val anchorCreated: Boolean = false,
+    /** Index of the wall (WALLS) or corner (CORNERS) being re-captured: the next capture replaces it. */
+    val recaptureIndex: Int? = null,
+    /** Doors and windows marked before the room was reopened; put back on the nearest wall when it is closed. */
+    val parkedOpenings: List<ParkedOpening> = emptyList(),
+    /** Undo history of wall / corner edits (add, re-capture, delete), newest last. */
+    val history: List<CaptureEdit> = emptyList(),
 ) {
     /** Walls (WALLS) or corners (CORNERS) captured so far. */
     val captureCount: Int
@@ -90,20 +122,24 @@ data class RoomDraft(
     /** True when discarding this draft would lose user work. */
     val hasCaptures: Boolean
         get() = observations.isNotEmpty() || cornerTaps.isNotEmpty() || openings.isNotEmpty() ||
-            baseline?.firstTap != null || pendingOpeningEdge != null
+            parkedOpenings.isNotEmpty() || baseline?.firstTap != null || pendingOpeningEdge != null
 
     /**
      * The draft as a [Room] (null until it has a valid solved outline). Used for the overlay, the mini-map,
-     * opening placement and saving.
+     * opening placement and saving. A ceiling that was not measured here is saved as an estimate: the
+     * assumed height (or the project default when skipped) with `ceilingEstimated = true`.
      */
     fun toRoom(sessionId: String?, settings: PlanSettings): Room? {
         val solved = solve ?: return null
+        val height = ceilingHeight?.takeIf { it.isFinite() && it > 0.0 }
+        val measured = ceilingMeasured && height != null
         return Room(
             id = id,
             name = name.trim(),
             type = type,
             corners = solved.corners,
-            ceilingHeight = ceilingHeight ?: settings.defaultCeilingHeight,
+            ceilingHeight = height ?: settings.defaultCeilingHeight,
+            ceilingEstimated = !measured,
             openings = openings,
             captureMethod = method,
             observations = if (method == CaptureMethod.WALLS) observations else emptyList(),
@@ -124,20 +160,41 @@ data class CaptureUiState(
     val loadError: String? = null,
     /** Latest rooms of the target floor as stored (rooms saved this session included). */
     val floorRooms: List<Room> = emptyList(),
+    /** Tape calibration of the target floor; applied to rooms saved into it. */
+    val floorCalibration: Calibration? = null,
     /** AR session the floor lock and [sessionRoomIds] belong to. */
     val sessionId: String? = null,
     /** Floor height (world Y) locked for this AR session; kept for every following room. */
     val floorY: Double? = null,
-    /** Rooms saved during the current AR session (they share its coordinate frame). */
+    /**
+     * Auto-lock the floor once a confident floor has been stable for a second. Turned off for the rest of
+     * the AR session when the user taps "Re-lock floor": they rejected what was found, so only their
+     * explicit "Lock floor" counts from then on.
+     */
+    val autoLockFloor: Boolean = true,
+    /** Floor height the user rejected with "Re-lock floor" (a manual lock near it asks for a second tap). */
+    val rejectedFloorY: Double? = null,
+    /** Rooms saved during the current AR session (they share its coordinate frame), in save order. */
     val sessionRoomIds: Set<String> = emptySet(),
+    /** Scale each session room was saved with (floor calibration), so anchor corrections can match it. */
+    val sessionRoomScales: Map<String, AppliedScale> = emptyMap(),
+    /** Ceiling height of the last session room whose ceiling was measured (offered as "Same as last room"). */
+    val lastMeasuredCeiling: Double? = null,
     /** A measurement is running ("Hold steady…"). */
     val measuring: Boolean = false,
     /** A save is running. */
     val saving: Boolean = false,
     /** Pending one-shot messages, oldest first. */
     val messages: List<UserMessage> = emptyList(),
-    /** A capture just succeeded: the UI should play a confirmation haptic, then call [CaptureViewModel.onHapticPlayed]. */
-    val hapticPending: Boolean = false,
+    /** Latest capture outcome; the UI plays it once when its id is newer than [feedbackPlayedId]. */
+    val feedback: CaptureFeedback? = null,
+    val feedbackPlayedId: Long = 0L,
+    /** The "Discard this room?" prompt is showing. */
+    val confirmDiscard: Boolean = false,
+    /** The "How to scan" sheet is showing (automatically on the very first scan, or from the help button). */
+    val showTips: Boolean = false,
+    /** The tips were opened from the help button (rather than automatically on the first scan). */
+    val tipsFromHelp: Boolean = false,
     /** The session is over: the UI navigates back (onDone). */
     val finished: Boolean = false,
 ) {
@@ -147,14 +204,37 @@ data class CaptureUiState(
     val hasRoomInProgress: Boolean
         get() = draft.hasCaptures || step == CaptureStep.OPENINGS || step == CaptureStep.REVIEW
 
-    val sessionRooms: List<Room> get() = floorRooms.filter { it.id in sessionRoomIds && it.id != draft.id }
+    /** Rooms saved in this AR session other than the draft, in save order. */
+    val sessionRooms: List<Room>
+        get() {
+            val byId = floorRooms.associateBy { it.id }
+            return sessionRoomIds.filter { it != draft.id }.mapNotNull { byId[it] }
+        }
 
     /** Rooms already on the floor that were captured in another AR session (or drawn by hand). */
     val otherSessionRoomCount: Int
         get() = floorRooms.count { it.id != draft.id && it.id !in sessionRoomIds && (sessionId == null || it.sessionId != sessionId) }
 
+    /** "Re-lock floor" is offered (before anything of this room is captured). */
+    val canRelockFloor: Boolean
+        get() = step == CaptureStep.CEILING && !draft.hasCaptures
+
     /** The draft as a room, when it has a solved outline. */
     val draftRoom: Room? get() = draft.toRoom(sessionId, settings)
+}
+
+/** A persisted "already seen" flag (e.g. the first-scan tips). Implementations must never throw. */
+interface OneTimeFlag {
+    fun isSet(): Boolean
+    fun set()
+
+    /** Not persisted; used by tests and previews. */
+    class InMemory(private var value: Boolean = false) : OneTimeFlag {
+        override fun isSet(): Boolean = value
+        override fun set() {
+            value = true
+        }
+    }
 }
 
 /**
@@ -165,21 +245,47 @@ data class CaptureUiState(
  * ViewModel never outlives or leaks an AR session. All public functions are main-thread only and ignore
  * calls that don't fit the current step (e.g. a double tap racing a step change), so the UI can wire
  * buttons directly.
+ *
+ * @param tipsFlag remembers that the first-scan "How to scan" sheet was seen.
+ * @param calibrateRoom scales a room added to a tape-calibrated floor (FloorOps.applyCalibration).
  */
 class CaptureViewModel(
     private val repository: ProjectRepository,
     private val projectId: String,
     private val floorId: String,
+    private val tipsFlag: OneTimeFlag = OneTimeFlag.InMemory(),
+    private val calibrateRoom: (Floor, Room) -> Room = FloorOps::applyCalibration,
 ) : ViewModel() {
 
-    private val mutableState = MutableStateFlow(CaptureUiState(draft = RoomDraft(id = Ids.newId())))
+    private val mutableState = MutableStateFlow(
+        CaptureUiState(draft = RoomDraft(id = Ids.newId()), showTips = !tipsFlag.isSet()),
+    )
     val state: StateFlow<CaptureUiState> = mutableState.asStateFlow()
 
+    private val mutableCoaching = MutableStateFlow<CoachingHint?>(null)
+
+    /** Live coaching hint derived from the AR frames (changes rarely; separate from [state] for that reason). */
+    val coaching: StateFlow<CoachingHint?> = mutableCoaching.asStateFlow()
+
+    private val coach = CaptureCoach()
     private var nextMessageId = 1L
+    private var nextFeedbackId = 1L
 
     // Auto floor lock: a confident floor whose height stays within tolerance for AUTO_LOCK_STABLE_NS.
     private var floorCandidateY: Double? = null
     private var floorCandidateSinceNs = 0L
+
+    /** The user was told once that their manual lock is at the rejected height; a second tap keeps it. */
+    private var rejectedFloorWarned = false
+
+    /** Raw anchor corrections of an AR session that ended (activity recreated) before the flow finished. */
+    private var orphanedSession: OrphanedSession? = null
+
+    private class OrphanedSession(
+        val sessionId: String,
+        val corrections: Map<String, RigidTransform2>,
+        val scales: Map<String, AppliedScale>,
+    )
 
     init {
         viewModelScope.launch { loadProject() }
@@ -201,17 +307,18 @@ class CaptureViewModel(
         applyProject(project)
     }
 
-    /** Take settings and the floor's rooms from a freshly loaded / saved project. */
+    /** Take settings, calibration and the floor's rooms from a freshly loaded / saved project. */
     private fun applyProject(project: Project) {
         mutableState.update { s ->
             val settingsChanged = s.settings != project.settings
-            val floorRooms = project.floors.firstOrNull { it.id == floorId }?.rooms.orEmpty()
-            val draft = if (settingsChanged && s.step.isCaptureStep) {
-                s.draft.copy(solve = solve(s.draft, project.settings))
-            } else {
-                s.draft
-            }
-            s.copy(settings = project.settings, projectLoaded = true, floorRooms = floorRooms, draft = draft)
+            val floor = project.floors.firstOrNull { it.id == floorId }
+            val next = s.copy(
+                settings = project.settings,
+                projectLoaded = true,
+                floorRooms = floor?.rooms.orEmpty(),
+                floorCalibration = floor?.calibration,
+            )
+            if (settingsChanged && s.step.isCaptureStep) next.copy(draft = next.draft.copy(solve = solveDraft(next.draft, next))) else next
         }
     }
 
@@ -222,46 +329,93 @@ class CaptureViewModel(
     /**
      * Bind to the running AR session. Rooms, the floor lock and anchors only make sense within one session
      * (one coordinate frame), so if the session was recreated, the floor is unlocked and the room in
-     * progress restarts.
+     * progress restarts. Rooms saved in the previous session keep the anchor corrections captured when it
+     * ended ([onSessionEnded]).
      */
     fun attach(controller: ArCaptureController) {
         val sid = controller.sessionId
         val s = mutableState.value
-        if (s.sessionId == sid) return
+        if (s.sessionId == sid) {
+            orphanedSession = null // the same session is back (e.g. recomposition); nothing was lost
+            return
+        }
         if (s.sessionId == null) {
             mutableState.update { it.copy(sessionId = sid) }
             return
         }
+        val orphan = orphanedSession?.takeIf { it.sessionId == s.sessionId }
+        orphanedSession = null
         val lostWork = s.hasRoomInProgress
         resetFloorCandidate()
+        rejectedFloorWarned = false
         mutableState.update {
             it.copy(
                 sessionId = sid,
                 floorY = null,
+                autoLockFloor = true,
+                rejectedFloorY = null,
                 step = CaptureStep.FIND_FLOOR,
                 draft = freshDraft(it.draft.method),
                 sessionRoomIds = emptySet(),
+                sessionRoomScales = emptyMap(),
+                lastMeasuredCeiling = null,
+                confirmDiscard = false,
             )
         }
-        if (lostWork) postMessage("The AR session restarted, so this room needs to be scanned again.")
+        if (orphan != null && orphan.corrections.isNotEmpty()) persistCorrections(orphan)
+        if (lostWork) postMessage("The camera session restarted, so this room needs to be scanned again. Saved rooms are kept.")
     }
 
     /**
-     * Called for every published AR frame. Auto-locks the floor once a confident floor
-     * (area ≥ [AUTO_LOCK_MIN_AREA]) has kept the same height for about a second, and creates the room
-     * anchor as soon as the camera pose is available.
+     * The UI is letting go of [controller] (its AR session is ending, e.g. the activity is being recreated).
+     * Snapshot the anchor corrections of this session's saved rooms while the controller can still answer,
+     * so a following [attach] to a new session (or [exit]) can apply them.
+     */
+    fun onSessionEnded(controller: ArCaptureController) {
+        val s = mutableState.value
+        if (s.finished || s.sessionId == null || controller.sessionId != s.sessionId) return
+        if (s.sessionRoomIds.isEmpty()) return
+        val corrections = safeCorrections(controller).filterKeys { it in s.sessionRoomIds }
+        orphanedSession = OrphanedSession(s.sessionId, corrections, s.sessionRoomScales)
+    }
+
+    private fun persistCorrections(orphan: OrphanedSession) {
+        val corrections = orphan.corrections.mapValues { (id, t) -> t.forScaledRoom(orphan.scales[id]) }
+        viewModelScope.launch {
+            try {
+                repository.update(projectId) { project ->
+                    project.withFloor(floorId, createIfMissing = false) { applyCorrections(it, corrections) }
+                }?.let(::applyProject)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Best effort: the rooms are saved, just not re-aligned by the old session's map refinements.
+            }
+        }
+    }
+
+    /**
+     * Called for every published AR frame. Updates the live coaching hint, auto-locks the floor once a
+     * confident floor (area ≥ [AUTO_LOCK_MIN_AREA], at least [AUTO_LOCK_MIN_CAMERA_DROP] below the phone,
+     * i.e. not a table or bed) has kept the same height for about a second, and creates the room anchor as
+     * soon as the camera pose is available.
      */
     fun onFrame(frame: ArFrameState, controller: ArCaptureController, nowNs: Long = System.nanoTime()) {
         val s = mutableState.value
+        updateCoaching(frame, s)
         if (s.step.isCaptureStep && !s.draft.anchorCreated) ensureAnchor(controller, frame)
 
-        if (s.step != CaptureStep.FIND_FLOOR || s.floorY != null || s.busy || s.loadError != null) {
+        if (s.step != CaptureStep.FIND_FLOOR || s.floorY != null || s.busy || s.loadError != null ||
+            !s.autoLockFloor || s.showTips || s.finished
+        ) {
             resetFloorCandidate()
             return
         }
         val y = frame.floorY
+        val camera = frame.cameraPosition
         val confident = frame.tracking == TrackingStatus.TRACKING && frame.problem == TrackingProblem.NONE &&
-            y != null && y.isFinite() && frame.floorArea >= AUTO_LOCK_MIN_AREA
+            y != null && y.isFinite() && frame.floorArea >= AUTO_LOCK_MIN_AREA &&
+            camera != null && camera.isFinite() && camera.y - y >= AUTO_LOCK_MIN_CAMERA_DROP
         if (!confident) {
             resetFloorCandidate()
             return
@@ -274,8 +428,35 @@ class CaptureViewModel(
         }
         if (nowNs - floorCandidateSinceNs >= AUTO_LOCK_STABLE_NS) {
             resetFloorCandidate()
-            acceptFloor(y, frame)
+            acceptFloor(y, frame, manual = false)
         }
+    }
+
+    private fun updateCoaching(frame: ArFrameState, s: CaptureUiState) {
+        val d = s.draft
+        val markingFloor = when (s.step) {
+            CaptureStep.WALLS -> d.baseline != null
+            CaptureStep.CORNERS -> true
+            CaptureStep.OPENINGS -> d.openingType != OpeningType.WINDOW
+            else -> false
+        }
+        val floorY = s.floorY
+        val ceilingY = if (floorY != null && d.ceilingMeasured) d.ceilingHeight?.let { floorY + it } else null
+        val input = CoachInput(
+            step = s.step,
+            floorY = floorY,
+            ceilingY = ceilingY,
+            measuring = s.measuring,
+            markingFloorPoints = markingFloor,
+            canRelockFloor = s.canRelockFloor,
+            units = s.settings.unitSystem,
+        )
+        val hint = try {
+            coach.update(frame, input)
+        } catch (e: Exception) {
+            null
+        }
+        mutableCoaching.value = if (s.showTips || s.finished) null else hint
     }
 
     private fun resetFloorCandidate() {
@@ -293,44 +474,61 @@ class CaptureViewModel(
             val result = measureSafely(controller, MeasureRequest.LockFloor)
             if (isStale(draftId, CaptureStep.FIND_FLOOR)) return@launchMeasurement
             when (result) {
-                is MeasureResult.FloorLocked -> acceptFloor(result.floorY, controller.frameState.value)
-                is MeasureResult.Failed -> postMessage(result.reason)
-                else -> postMessage(MSG_FLOOR_FAILED)
+                is MeasureResult.FloorLocked -> acceptFloor(result.floorY, controller.frameState.value, manual = true)
+                is MeasureResult.Failed -> measurementFailed(result.reason)
+                else -> measurementFailed(MSG_FLOOR_FAILED)
             }
         }
     }
 
     /**
      * Validate and lock floor height [y]. Rejects heights at or above the phone, and (for a manual lock)
-     * raised surfaces such as a table when a confident, lower floor is known.
+     * raised surfaces such as a table when a confident, lower floor is known (the AR layer's floor choice).
+     * A manual lock at the height the user just rejected with "Re-lock floor" needs a second tap.
      */
-    private fun acceptFloor(y: Double, frame: ArFrameState) {
+    private fun acceptFloor(y: Double, frame: ArFrameState, manual: Boolean) {
         if (!y.isFinite()) {
-            postMessage(MSG_FLOOR_FAILED)
+            measurementFailed(MSG_FLOOR_FAILED)
             return
         }
         val camera = frame.cameraPosition
         if (camera != null && camera.isFinite() && camera.y - y < MIN_CAMERA_ABOVE_FLOOR) {
-            postMessage("That surface is too close to the phone's height. Aim at the floor.")
+            measurementFailed("That surface is too close to the phone's height. Aim at the floor.")
             return
         }
         val bestFloor = frame.floorY
-        if (bestFloor != null && bestFloor.isFinite() && frame.floorArea >= AUTO_LOCK_MIN_AREA &&
+        if (manual && bestFloor != null && bestFloor.isFinite() && frame.floorArea >= AUTO_LOCK_MIN_AREA &&
             y - bestFloor > MAX_ABOVE_BEST_FLOOR
         ) {
-            postMessage("That looks like a raised surface, not the floor. Aim at open floor.")
+            measurementFailed("That looks like a raised surface, not the floor. Aim at open floor.")
             return
         }
-        mutableState.update { it.copy(floorY = y, step = CaptureStep.CEILING, hapticPending = true) }
+        val rejected = mutableState.value.rejectedFloorY
+        if (manual && rejected != null && abs(y - rejected) <= REJECTED_FLOOR_TOLERANCE && !rejectedFloorWarned) {
+            rejectedFloorWarned = true
+            postMessage("That's the height you just re-locked from. Aim at open floor, or tap Lock floor again to keep it.")
+            return
+        }
+        rejectedFloorWarned = false
+        mutableState.update { it.copy(floorY = y, step = CaptureStep.CEILING) }
+        feedback(FeedbackKind.CAPTURED)
         postMessage("Floor locked.")
     }
 
-    /** Go back to finding the floor (e.g. it locked onto a rug or step). Only before any capture. */
+    /**
+     * Go back to finding the floor (it locked onto a rug, step, bed or table). Only before any capture of the
+     * room. Auto-lock is turned off for the rest of this AR session, so the same surface can't lock again
+     * by itself before the user aims at the real floor and taps Lock floor.
+     */
     fun relockFloor() {
         val s = mutableState.value
-        if (s.busy || s.step != CaptureStep.CEILING || s.draft.hasCaptures) return
+        if (s.busy || !s.canRelockFloor) return
         resetFloorCandidate()
-        mutableState.update { it.copy(floorY = null, step = CaptureStep.FIND_FLOOR) }
+        rejectedFloorWarned = false
+        mutableState.update {
+            it.copy(floorY = null, step = CaptureStep.FIND_FLOOR, autoLockFloor = false, rejectedFloorY = it.floorY ?: it.rejectedFloorY)
+        }
+        postMessage("Floor unlocked. Aim at open floor, away from furniture, and tap Lock floor.")
     }
 
     fun measureCeiling(controller: ArCaptureController) {
@@ -342,27 +540,35 @@ class CaptureViewModel(
                 is MeasureResult.Height -> {
                     val h = result.height
                     if (!h.isFinite() || h < MIN_CEILING || h > MAX_CEILING) {
-                        postMessage("That ceiling reading looks wrong. Aim straight up at a clear spot and try again.")
+                        measurementFailed("That ceiling reading looks off. Aim straight up at a clear spot and try again.")
                     } else {
-                        mutableState.update {
-                            it.copy(draft = it.draft.copy(ceilingHeight = h, ceilingMeasured = true), hapticPending = true)
-                        }
-                        val s = mutableState.value
-                        postMessage("Ceiling: ${formatLengthSafe(h, s.settings)}")
+                        mutableState.update { it.copy(draft = it.draft.copy(ceilingHeight = h, ceilingMeasured = true)) }
+                        feedback(FeedbackKind.CAPTURED)
+                        postMessage("Ceiling: ${formatLengthSafe(h, mutableState.value.settings)}.")
                         enterCaptureStep(controller)
                     }
                 }
-                is MeasureResult.Failed -> postMessage(result.reason)
-                else -> postMessage("Couldn't measure the ceiling. Try again or tap Skip.")
+                is MeasureResult.Failed -> measurementFailed(result.reason)
+                else -> measurementFailed("Couldn't measure the ceiling. Try again or tap Skip.")
             }
         }
     }
 
-    /** Skip the ceiling: the project default height is used and shown as estimated. */
+    /** Skip the ceiling: the project default height is saved, marked as estimated. */
     fun skipCeiling(controller: ArCaptureController) {
         val s = mutableState.value
         if (s.busy || s.step != CaptureStep.CEILING) return
         mutableState.update { it.copy(draft = it.draft.copy(ceilingHeight = null, ceilingMeasured = false)) }
+        enterCaptureStep(controller)
+    }
+
+    /** Use the last measured ceiling of this session for this room (saved as an estimate, not a measurement). */
+    fun useLastCeiling(controller: ArCaptureController) {
+        val s = mutableState.value
+        val h = s.lastMeasuredCeiling ?: return
+        if (s.busy || s.step != CaptureStep.CEILING) return
+        mutableState.update { it.copy(draft = it.draft.copy(ceilingHeight = h, ceilingMeasured = false)) }
+        postMessage("Using ${formatLengthSafe(h, s.settings)} from the last room (marked as estimated).")
         enterCaptureStep(controller)
     }
 
@@ -402,7 +608,7 @@ class CaptureViewModel(
         mutableState.update {
             it.copy(
                 step = if (method == CaptureMethod.CORNERS) CaptureStep.CORNERS else CaptureStep.WALLS,
-                draft = it.draft.copy(method = method, baseline = null, offerBaseline = false, solve = null),
+                draft = it.draft.copy(method = method, baseline = null, offerBaseline = false, solve = null, recaptureIndex = null),
             )
         }
     }
@@ -434,13 +640,35 @@ class CaptureViewModel(
 
     private fun wallFailed(reason: String) {
         mutableState.update { it.copy(draft = it.draft.copy(offerBaseline = true)) }
-        postMessage(reason)
+        measurementFailed(reason)
     }
 
+    /** Append [observation], or replace the wall being re-captured. */
     private fun addObservation(observation: WallObservation) {
-        mutateCapture { it.copy(observations = it.observations + observation, baseline = null, offerBaseline = false) }
-        mutableState.update { it.copy(hapticPending = true) }
-        postMessage("Wall ${mutableState.value.draft.observations.size} captured.")
+        val d = mutableState.value.draft
+        val replace = d.recaptureIndex?.takeIf { it in d.observations.indices }
+        val grade = wallGrade(observation)
+        if (replace != null) {
+            val n = replace + 1
+            recordEdit("Wall $n is back to its earlier capture.") {
+                it.copy(observations = it.observations.replaced(replace, observation), recaptureIndex = null, baseline = null, offerBaseline = false)
+            }
+            feedback(FeedbackKind.CAPTURED)
+            postMessage(if (grade == CaptureGrade.POOR) "Wall $n re-captured, but the reading is still rough." else "Wall $n re-captured.")
+            return
+        }
+        val n = d.observations.size + 1
+        recordEdit("Removed wall $n.") {
+            it.copy(observations = it.observations + observation, recaptureIndex = null, baseline = null, offerBaseline = false)
+        }
+        feedback(FeedbackKind.CAPTURED)
+        postMessage(
+            when (grade) {
+                CaptureGrade.GOOD -> "Wall $n captured."
+                CaptureGrade.FAIR -> "Wall $n captured (fair reading)."
+                CaptureGrade.POOR -> "Wall $n captured, but the reading is rough. Tap it in the wall list to re-capture."
+            },
+        )
     }
 
     /** Start the baseline fallback: mark two points where the wall meets the floor. */
@@ -469,27 +697,26 @@ class CaptureViewModel(
             when (result) {
                 is MeasureResult.Point -> {
                     if (!result.world.isFinite()) {
-                        postMessage(MSG_POINT_FAILED)
+                        measurementFailed(MSG_POINT_FAILED)
                         return@launchMeasurement
                     }
                     val first = baseline.firstTap
                     if (first == null) {
-                        mutableState.update {
-                            it.copy(draft = it.draft.copy(baseline = BaselineCapture(result.world)), hapticPending = true)
-                        }
+                        mutableState.update { it.copy(draft = it.draft.copy(baseline = BaselineCapture(result.world))) }
+                        feedback(FeedbackKind.CAPTURED)
                     } else {
                         completeBaseline(first, result.world, controller.frameState.value.cameraPosition)
                     }
                 }
-                is MeasureResult.Failed -> postMessage(result.reason)
-                else -> postMessage(MSG_POINT_FAILED)
+                is MeasureResult.Failed -> measurementFailed(result.reason)
+                else -> measurementFailed(MSG_POINT_FAILED)
             }
         }
     }
 
     private fun completeBaseline(a: Vec3, b: Vec3, viewer: Vec3?) {
         if (viewer == null || !viewer.isFinite()) {
-            postMessage("Lost track of the phone's position. Hold steady and mark the second point again.")
+            measurementFailed("Lost track of the phone's position. Hold steady and mark the second point again.")
             return
         }
         val observation = try {
@@ -498,7 +725,7 @@ class CaptureViewModel(
             null
         }
         if (observation == null || !observation.isUsable()) {
-            postMessage("Couldn't make a wall from those points. Mark both ends of the wall base, well apart, from inside the room.")
+            measurementFailed("Couldn't make a wall from those points. Mark both ends of the wall base, well apart, from inside the room.")
             return
         }
         addObservation(observation)
@@ -512,22 +739,36 @@ class CaptureViewModel(
             if (isStale(draftId, CaptureStep.CORNERS)) return@launchMeasurement
             when (result) {
                 is MeasureResult.Point -> addCornerTap(result.world)
-                is MeasureResult.Failed -> postMessage(result.reason)
-                else -> postMessage(MSG_POINT_FAILED)
+                is MeasureResult.Failed -> measurementFailed(result.reason)
+                else -> measurementFailed(MSG_POINT_FAILED)
             }
         }
     }
 
     private fun addCornerTap(world: Vec3) {
         if (!world.isFinite()) {
-            postMessage(MSG_POINT_FAILED)
+            measurementFailed(MSG_POINT_FAILED)
             return
         }
         val p = world.toPlan()
-        val taps = mutableState.value.draft.cornerTaps
+        val d = mutableState.value.draft
+        val taps = d.cornerTaps
+        val replace = d.recaptureIndex?.takeIf { it in taps.indices }
+        if (replace != null) {
+            if (taps.withIndex().any { (i, t) -> i != replace && t.distanceTo(p) < MIN_CORNER_SPACING }) {
+                measurementFailed("That's another corner you already marked. Aim at corner ${replace + 1}.")
+                return
+            }
+            recordEdit("Corner ${replace + 1} is back to its earlier position.") {
+                it.copy(cornerTaps = it.cornerTaps.replaced(replace, p), recaptureIndex = null)
+            }
+            feedback(FeedbackKind.CAPTURED)
+            postMessage("Corner ${replace + 1} re-captured.")
+            return
+        }
         taps.lastOrNull()?.let { last ->
             if (last.distanceTo(p) < MIN_CORNER_SPACING) {
-                postMessage("That's the same corner as before. Aim at the next corner.")
+                measurementFailed("That's the same corner as before. Aim at the next corner.")
                 return
             }
         }
@@ -535,48 +776,127 @@ class CaptureViewModel(
             postMessage("That's your first corner. Tap Close room to finish.")
             return
         }
-        mutateCapture { it.copy(cornerTaps = it.cornerTaps + p) }
-        mutableState.update { it.copy(hapticPending = true) }
+        recordEdit("Removed corner ${taps.size + 1}.") { it.copy(cornerTaps = it.cornerTaps + p, recaptureIndex = null) }
+        feedback(FeedbackKind.CAPTURED)
     }
 
-    /** Remove the last capture of the current step (baseline point, wall, corner, opening edge or opening). */
+    /**
+     * "Re-capture" wall (WALLS) or corner (CORNERS) [index]: the next capture replaces it in place, so the
+     * capture order the solver relies on is kept. Calling it for the same index again cancels.
+     */
+    fun startRecapture(index: Int) {
+        val s = mutableState.value
+        if (s.busy || !s.step.isCaptureStep) return
+        val d = s.draft
+        val count = if (d.method == CaptureMethod.CORNERS) d.cornerTaps.size else d.observations.size
+        if (index !in 0 until count) return
+        if (d.recaptureIndex == index) {
+            cancelRecapture()
+            return
+        }
+        mutableState.update { it.copy(draft = it.draft.copy(recaptureIndex = index, baseline = null, offerBaseline = false)) }
+    }
+
+    fun cancelRecapture() {
+        val s = mutableState.value
+        if (s.busy || s.draft.recaptureIndex == null) return
+        mutableState.update { it.copy(draft = it.draft.copy(recaptureIndex = null, baseline = null)) }
+    }
+
+    /** Delete wall (WALLS) or corner (CORNERS) [index]; later ones move up by one. Undo restores it. */
+    fun deleteCapture(index: Int) {
+        val s = mutableState.value
+        if (s.busy || !s.step.isCaptureStep) return
+        val d = s.draft
+        val corners = d.method == CaptureMethod.CORNERS
+        val count = if (corners) d.cornerTaps.size else d.observations.size
+        if (index !in 0 until count) return
+        val noun = if (corners) "Corner" else "Wall"
+        val n = index + 1
+        recordEdit("$noun $n restored.") {
+            if (corners) {
+                it.copy(cornerTaps = it.cornerTaps.removedAt(index), recaptureIndex = null)
+            } else {
+                it.copy(observations = it.observations.removedAt(index), recaptureIndex = null, baseline = null)
+            }
+        }
+        postMessage(if (index == count - 1) "$noun $n deleted." else "$noun $n deleted. The ones after it moved up a number.")
+    }
+
+    /**
+     * Undo, most specific first: the first baseline mark, then a pending re-capture, then the last wall /
+     * corner edit (add, re-capture or delete); in OPENINGS the pending edge, then the last opening, then
+     * reopen the room; in REVIEW, go back to doors & windows.
+     */
     fun undo() {
         val s = mutableState.value
         if (s.busy) return
         val d = s.draft
         when (s.step) {
-            CaptureStep.WALLS -> when {
+            CaptureStep.WALLS, CaptureStep.CORNERS -> when {
                 d.baseline?.firstTap != null ->
                     mutableState.update { it.copy(draft = it.draft.copy(baseline = BaselineCapture())) }
-                d.observations.isNotEmpty() -> {
-                    mutateCapture { it.copy(observations = it.observations.dropLast(1)) }
-                    postMessage("Removed wall ${d.observations.size}.")
+                d.recaptureIndex != null -> cancelRecapture()
+                d.history.isNotEmpty() -> {
+                    val edit = d.history.last()
+                    mutateCapture {
+                        it.copy(
+                            observations = edit.observations,
+                            cornerTaps = edit.cornerTaps,
+                            history = it.history.dropLast(1),
+                            recaptureIndex = null,
+                        )
+                    }
+                    postMessage(edit.undoMessage)
                 }
-            }
-            CaptureStep.CORNERS -> if (d.cornerTaps.isNotEmpty()) {
-                mutateCapture { it.copy(cornerTaps = it.cornerTaps.dropLast(1)) }
-                postMessage("Removed corner ${d.cornerTaps.size}.")
             }
             CaptureStep.OPENINGS -> when {
                 d.pendingOpeningEdge != null ->
                     mutableState.update { it.copy(draft = it.draft.copy(pendingOpeningEdge = null)) }
                 d.openings.isNotEmpty() -> {
+                    val removed = d.openings.last()
                     mutableState.update { it.copy(draft = it.draft.copy(openings = it.draft.openings.dropLast(1))) }
-                    postMessage("Removed the last opening.")
+                    postMessage("${openingLabel(removed.type)} removed.")
                 }
                 else -> reopenRoom()
             }
+            CaptureStep.REVIEW -> backToOpenings()
             else -> Unit
         }
     }
 
-    /** Back from OPENINGS (with no openings yet) to keep capturing walls / corners. */
+    /** "Edit walls" / "Back to walls": reopen the room for capturing, keeping walls, corners and openings. */
+    fun backToWalls() {
+        val s = mutableState.value
+        if (s.busy || (s.step != CaptureStep.OPENINGS && s.step != CaptureStep.REVIEW)) return
+        reopenRoom()
+    }
+
+    /**
+     * Back to WALLS / CORNERS with every capture kept. Openings are parked at their plan position (edge
+     * indices change when walls are edited) and put back on the nearest wall when the room is closed again.
+     */
     private fun reopenRoom() {
-        mutableState.update { s ->
-            val step = if (s.draft.method == CaptureMethod.CORNERS) CaptureStep.CORNERS else CaptureStep.WALLS
-            s.copy(step = step, draft = s.draft.copy(solve = solve(s.draft, s.settings)))
+        val s = mutableState.value
+        val parked = s.draftRoom?.let(::parkOpenings).orEmpty()
+        mutableState.update {
+            val step = if (it.draft.method == CaptureMethod.CORNERS) CaptureStep.CORNERS else CaptureStep.WALLS
+            val draft = it.draft.copy(
+                openings = emptyList(),
+                parkedOpenings = it.draft.parkedOpenings + parked,
+                pendingOpeningEdge = null,
+                recaptureIndex = null,
+            )
+            it.copy(step = step, draft = draft.copy(solve = solveDraft(draft, it)))
         }
-        postMessage("Room reopened. Keep capturing.")
+        val noun = if (s.draft.method == CaptureMethod.CORNERS) "corner" else "wall"
+        postMessage(
+            if (parked.isEmpty()) {
+                "Room reopened. Tap a $noun in the list to fix it, or keep capturing."
+            } else {
+                "Room reopened. Your doors and windows are kept. Tap a $noun to fix it."
+            },
+        )
     }
 
     /** "Close room": needs ≥ 3 captures and a valid solved outline. Moves on to doors & windows. */
@@ -584,29 +904,49 @@ class CaptureViewModel(
         val s = mutableState.value
         if (s.busy || !s.step.isCaptureStep) return
         val d = s.draft
-        val noun = if (d.method == CaptureMethod.CORNERS) "corners" else "walls"
+        val corners = d.method == CaptureMethod.CORNERS
+        val noun = if (corners) "corners" else "walls"
         if (d.captureCount < 3) {
-            postMessage("Capture at least 3 $noun first.")
+            postMessage("Capture at least 3 $noun first (you have ${d.captureCount}).")
             return
         }
         val solved = d.solve
-        if (solved == null) {
-            postMessage("These $noun don't form a closed room yet. Capture the missing ones or undo the last one.")
+        val room = d.copy(openings = emptyList()).toRoom(s.sessionId, s.settings)
+        if (solved == null || room == null) {
+            postMessage(
+                if (corners) {
+                    "These corners don't form a room yet. Mark the missing ones in order, or delete the odd one out."
+                } else {
+                    "These walls don't close into a room yet. Capture the missing walls in order, or delete the odd one out."
+                },
+            )
             return
         }
+        val restored = restoreOpenings(room, d.parkedOpenings)
         mutableState.update {
             it.copy(
                 step = CaptureStep.OPENINGS,
-                draft = it.draft.copy(baseline = null, offerBaseline = false, pendingOpeningEdge = null),
-                hapticPending = true,
+                draft = it.draft.copy(
+                    openings = restored.openings,
+                    parkedOpenings = emptyList(),
+                    baseline = null,
+                    offerBaseline = false,
+                    pendingOpeningEdge = null,
+                    recaptureIndex = null,
+                ),
             )
         }
+        feedback(FeedbackKind.CONFIRMED)
         val warnings = solved.warnings.size
         postMessage(
-            if (warnings == 0) {
-                "Room closed. Mark doors and windows, or tap Done."
-            } else {
-                "Room closed with $warnings ${if (warnings == 1) "warning" else "warnings"}. Check before saving."
+            when {
+                restored.dropped.isNotEmpty() -> {
+                    val n = restored.dropped.size
+                    "Room closed. ${if (n == 1) "1 door or window no longer fits a wall and was" else "$n doors or windows no longer fit a wall and were"} removed. Mark it again if needed."
+                }
+                warnings > 0 -> "Room closed with $warnings ${if (warnings == 1) "warning" else "warnings"}. Check before saving."
+                restored.openings.isNotEmpty() -> "Room closed. Your doors and windows are back in place."
+                else -> "Room closed. Mark doors and windows, or tap Done."
             },
         )
     }
@@ -637,9 +977,9 @@ class CaptureViewModel(
             if (isStale(draftId, CaptureStep.OPENINGS)) return@launchMeasurement
             when (result) {
                 is MeasureResult.Point ->
-                    if (result.world.isFinite()) onOpeningPoint(result.world.toPlan(), type) else postMessage(MSG_POINT_FAILED)
-                is MeasureResult.Failed -> postMessage(result.reason)
-                else -> postMessage(MSG_POINT_FAILED)
+                    if (result.world.isFinite()) onOpeningPoint(result.world.toPlan(), type) else measurementFailed(MSG_POINT_FAILED)
+                is MeasureResult.Failed -> measurementFailed(result.reason)
+                else -> measurementFailed(MSG_POINT_FAILED)
             }
         }
     }
@@ -649,7 +989,8 @@ class CaptureViewModel(
         if (s.draft.openingType != type) return
         val first = s.draft.pendingOpeningEdge
         if (first == null) {
-            mutableState.update { it.copy(draft = it.draft.copy(pendingOpeningEdge = p), hapticPending = true) }
+            mutableState.update { it.copy(draft = it.draft.copy(pendingOpeningEdge = p)) }
+            feedback(FeedbackKind.CAPTURED)
             return
         }
         val room = s.draftRoom ?: return
@@ -664,19 +1005,15 @@ class CaptureViewModel(
             null
         }
         if (opening == null) {
-            postMessage("Couldn't place that on a wall. Mark both edges within 0.5 m of a wall, at least 20 cm apart.")
+            measurementFailed("Couldn't place that on a wall. Mark both edges within 0.5 m (20 in) of a wall, at least 20 cm (8 in) apart.")
             return
         }
         if (overlapsExisting(opening, room.openings)) {
-            postMessage("That overlaps an opening already marked. Undo it first or mark a different spot.")
+            measurementFailed("That overlaps an opening already marked. Undo it first or mark a different spot.")
             return
         }
-        mutableState.update {
-            it.copy(
-                draft = it.draft.copy(openings = it.draft.openings + opening, pendingOpeningEdge = null),
-                hapticPending = true,
-            )
-        }
+        mutableState.update { it.copy(draft = it.draft.copy(openings = it.draft.openings + opening, pendingOpeningEdge = null)) }
+        feedback(FeedbackKind.CAPTURED)
         postMessage("${openingLabel(type)} added (${formatLengthSafe(opening.width, settings)} wide).")
     }
 
@@ -718,6 +1055,13 @@ class CaptureViewModel(
         }
     }
 
+    /** REVIEW → OPENINGS with everything kept (system Back, "Doors & windows"). */
+    fun backToOpenings() {
+        val s = mutableState.value
+        if (s.busy || s.step != CaptureStep.REVIEW) return
+        mutableState.update { it.copy(step = CaptureStep.OPENINGS) }
+    }
+
     /** Discard the captured walls / corners / openings of this room and capture it again. */
     fun redoRoom() {
         val s = mutableState.value
@@ -726,7 +1070,7 @@ class CaptureViewModel(
             val d = it.draft
             it.copy(
                 step = if (d.method == CaptureMethod.CORNERS) CaptureStep.CORNERS else CaptureStep.WALLS,
-                // Same id: the room anchor stays valid; the measured ceiling is kept.
+                // Same id: the room anchor stays valid; the ceiling is kept.
                 draft = RoomDraft(
                     id = d.id,
                     method = d.method,
@@ -739,7 +1083,7 @@ class CaptureViewModel(
                 ),
             )
         }
-        postMessage("Room cleared. Capture it again.")
+        postMessage("Room cleared. Capture it again, starting with wall 1.")
     }
 
     /** "Save & scan next room": save, then start a new room in the same session (floor stays locked). */
@@ -748,23 +1092,39 @@ class CaptureViewModel(
         mutableState.update { it.copy(saving = true) }
         viewModelScope.launch {
             try {
+                var outcome = SaveOutcome(room, null, calibrationFailed = false)
                 val saved = repository.update(projectId) { project ->
-                    project.withFloor(floorId, createIfMissing = true) { FloorOps.upsertRoom(it, room) }
+                    project.withFloor(floorId, createIfMissing = true) { floor ->
+                        outcome = calibrated(floor, room)
+                        FloorOps.upsertRoom(floor, outcome.room)
+                    }
                 }
                 if (saved == null) {
                     postMessage(MSG_PROJECT_MISSING)
                     return@launch
                 }
                 applyProject(saved)
+                val stored = saved.floors.firstOrNull { it.id == floorId }?.rooms?.firstOrNull { it.id == room.id } ?: outcome.room
+                val scale = outcome.scale
                 mutableState.update { s ->
+                    val sameSession = s.sessionId == room.sessionId
+                    val measuredCeiling = stored.ceilingHeight?.takeIf { !stored.ceilingEstimated && it.isFinite() && it > 0.0 }
                     s.copy(
-                        sessionRoomIds = if (s.sessionId == room.sessionId) s.sessionRoomIds + room.id else s.sessionRoomIds,
+                        sessionRoomIds = if (sameSession) s.sessionRoomIds + room.id else s.sessionRoomIds,
+                        sessionRoomScales = if (sameSession && scale != null) s.sessionRoomScales + (room.id to scale) else s.sessionRoomScales,
+                        lastMeasuredCeiling = if (sameSession) measuredCeiling ?: s.lastMeasuredCeiling else s.lastMeasuredCeiling,
                         draft = freshDraft(s.draft.method),
                         step = if (s.floorY != null) CaptureStep.CEILING else CaptureStep.FIND_FLOOR,
-                        hapticPending = true,
                     )
                 }
-                postMessage("${room.name} saved. Walk into the next room.")
+                feedback(FeedbackKind.CONFIRMED)
+                postMessage(
+                    when {
+                        outcome.calibrationFailed -> "${room.name} saved, but the floor's tape calibration couldn't be applied. Check it in the editor."
+                        outcome.scale != null -> "${room.name} saved and scaled to the floor's tape calibration. Walk into the next room."
+                        else -> "${room.name} saved. Walk into the next room with the camera up."
+                    },
+                )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -781,12 +1141,60 @@ class CaptureViewModel(
         finishSession(controller, room)
     }
 
-    /** Leave the capture screen without a room in progress (or after the user confirmed discarding it). */
-    fun exit(controller: ArCaptureController) {
+    /**
+     * X button, system Back outside REVIEW, and Back on the AR host's error screens: leave right away, or ask
+     * first when that would discard the room in progress. [controller] is the live (or last) AR controller,
+     * null when no session ever started.
+     */
+    fun requestExit(controller: ArCaptureController?) {
+        val s = mutableState.value
+        if (s.saving || s.finished) return
+        if (s.loadError == null && s.hasRoomInProgress) {
+            mutableState.update { it.copy(confirmDiscard = true) }
+            return
+        }
+        exit(controller)
+    }
+
+    /**
+     * System Back: first leave whatever transient mode is active (re-capture, wall-base marking, a half-marked
+     * opening) or step back out of REVIEW to doors & windows, none of which loses work; otherwise
+     * [requestExit]. While a measurement runs, Back goes straight to [requestExit].
+     */
+    fun onBack(controller: ArCaptureController?) {
+        val s = mutableState.value
+        if (s.saving || s.finished) return
+        val d = s.draft
+        when {
+            s.busy -> requestExit(controller)
+            s.step == CaptureStep.REVIEW -> backToOpenings()
+            s.step.isCaptureStep && d.recaptureIndex != null -> cancelRecapture()
+            s.step == CaptureStep.WALLS && d.baseline != null -> cancelBaseline()
+            s.step == CaptureStep.OPENINGS && d.pendingOpeningEdge != null ->
+                mutableState.update { it.copy(draft = it.draft.copy(pendingOpeningEdge = null)) }
+            else -> requestExit(controller)
+        }
+    }
+
+    fun dismissDiscard() {
+        mutableState.update { it.copy(confirmDiscard = false) }
+    }
+
+    /** The user confirmed "Discard this room?". */
+    fun discardAndExit(controller: ArCaptureController?) {
+        mutableState.update { it.copy(confirmDiscard = false) }
+        exit(controller)
+    }
+
+    /**
+     * Leave the capture screen without saving the room in progress. Rooms saved in this session still get
+     * their anchor corrections (from [controller], or from the snapshot taken when the session ended).
+     */
+    fun exit(controller: ArCaptureController?) {
         val s = mutableState.value
         if (s.saving || s.finished) return
         if (s.loadError != null) {
-            mutableState.update { it.copy(finished = true) }
+            mutableState.update { it.copy(finished = true, confirmDiscard = false) }
             return
         }
         finishSession(controller, room = null)
@@ -803,34 +1211,61 @@ class CaptureViewModel(
         val name = d.name.trim().ifBlank { defaultRoomName(d.type, s.floorRooms, d.id) }
         val room = d.copy(name = name).toRoom(controller.sessionId, s.settings)
         if (room == null) {
-            postMessage("This room has no valid outline. Tap Redo room.")
+            postMessage("This room has no valid outline. Tap Back to walls to fix it, or Redo room.")
             return null
         }
         return room
     }
 
+    /** A room as it is saved into a floor, with the scale it got from the floor's calibration (if any). */
+    private data class SaveOutcome(val room: Room, val scale: AppliedScale?, val calibrationFailed: Boolean)
+
+    /**
+     * [room] adjusted for [floor]'s tape calibration (FloorOps.applyCalibration). An uncalibrated floor
+     * leaves it unchanged; if applying fails, the room is saved as captured and the caller tells the user.
+     */
+    private fun calibrated(floor: Floor, room: Room): SaveOutcome {
+        val scale = AppliedScale.of(floor.calibration) ?: return SaveOutcome(room, null, calibrationFailed = false)
+        return try {
+            SaveOutcome(calibrateRoom(floor, room), scale, calibrationFailed = false)
+        } catch (e: Exception) {
+            SaveOutcome(room, null, calibrationFailed = true)
+        }
+    }
+
     /**
      * Save [room] (if any) and re-position every room of this session by its anchor's refined pose
-     * (ARCore map corrections) in one atomic update, then mark the flow finished. Without a room to save,
-     * a failure is not worth blocking the exit for: the rooms are already saved, just uncorrected.
+     * (ARCore map corrections) in one atomic update, then mark the flow finished. Corrections are adjusted
+     * for rooms that were scaled by the floor's calibration ([forScaledRoom]). Without a room to save, a
+     * failure is not worth blocking the exit for: the rooms are already saved, just uncorrected.
      */
-    private fun finishSession(controller: ArCaptureController, room: Room?) {
+    private fun finishSession(controller: ArCaptureController?, room: Room?) {
         val s = mutableState.value
         if (s.saving || s.finished) return
         val roomIds = s.sessionRoomIds + listOfNotNull(room?.id)
-        val corrections = safeCorrections(controller).filterKeys { it in roomIds }
-        if (room == null && corrections.isEmpty()) {
-            mutableState.update { it.copy(finished = true) }
+        // A snapshot taken when the session ended beats asking a controller that has been closed since.
+        val orphan = orphanedSession?.takeIf { it.sessionId == s.sessionId }
+        val raw = (orphan?.corrections ?: controller?.takeIf { it.sessionId == s.sessionId }?.let(::safeCorrections).orEmpty())
+            .filterKeys { it in roomIds }
+        if (room == null && raw.isEmpty()) {
+            mutableState.update { it.copy(finished = true, confirmDiscard = false) }
             return
         }
-        mutableState.update { it.copy(saving = true) }
+        mutableState.update { it.copy(saving = true, confirmDiscard = false) }
         viewModelScope.launch {
             var done = false
             try {
                 val saved = repository.update(projectId) { project ->
                     project.withFloor(floorId, createIfMissing = room != null) { floor ->
-                        val withRoom = if (room != null) FloorOps.upsertRoom(floor, room) else floor
-                        applyCorrections(withRoom, corrections)
+                        var scales = s.sessionRoomScales
+                        val withRoom = if (room != null) {
+                            val outcome = calibrated(floor, room)
+                            outcome.scale?.let { scales = scales + (room.id to it) }
+                            FloorOps.upsertRoom(floor, outcome.room)
+                        } else {
+                            floor
+                        }
+                        applyCorrections(withRoom, raw.mapValues { (id, t) -> t.forScaledRoom(scales[id]) })
                     }
                 }
                 if (saved == null && room != null) {
@@ -843,6 +1278,7 @@ class CaptureViewModel(
             } catch (e: Exception) {
                 if (room != null) postMessage(MSG_SAVE_FAILED) else done = true
             } finally {
+                if (done) orphanedSession = null
                 mutableState.update { it.copy(saving = false, finished = it.finished || done) }
             }
         }
@@ -855,8 +1291,20 @@ class CaptureViewModel(
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Messages / haptics
+    // Tips / messages / feedback
     // ---------------------------------------------------------------------------------------------
+
+    /** Show the "How to scan" sheet (help button). */
+    fun openTips() {
+        mutableState.update { it.copy(showTips = true, tipsFromHelp = true) }
+    }
+
+    /** The "How to scan" sheet was closed: it won't open by itself again. */
+    fun dismissTips() {
+        if (!mutableState.value.showTips) return
+        tipsFlag.set()
+        mutableState.update { it.copy(showTips = false, tipsFromHelp = false) }
+    }
 
     /**
      * The UI showed (or replaced) message [id]. Older messages are dropped too: the UI always shows the
@@ -866,8 +1314,19 @@ class CaptureViewModel(
         mutableState.update { s -> s.copy(messages = s.messages.filter { it.id > id }) }
     }
 
-    fun onHapticPlayed() {
-        mutableState.update { it.copy(hapticPending = false) }
+    /** The UI played feedback [id] (haptic + animation); it is not played again, e.g. after rotation. */
+    fun onFeedbackPlayed(id: Long) {
+        mutableState.update { if (id > it.feedbackPlayedId) it.copy(feedbackPlayedId = id) else it }
+    }
+
+    private fun feedback(kind: FeedbackKind) {
+        val f = CaptureFeedback(nextFeedbackId++, kind)
+        mutableState.update { it.copy(feedback = f) }
+    }
+
+    private fun measurementFailed(reason: String) {
+        feedback(FeedbackKind.FAILED)
+        postMessage(reason.ifBlank { MSG_MEASURE_FAILED })
     }
 
     private fun postMessage(text: String) {
@@ -896,7 +1355,7 @@ class CaptureViewModel(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                postMessage(MSG_MEASURE_FAILED)
+                measurementFailed(MSG_MEASURE_FAILED)
             } finally {
                 mutableState.update { it.copy(measuring = false) }
             }
@@ -920,9 +1379,21 @@ class CaptureViewModel(
     private fun mutateCapture(transform: (RoomDraft) -> RoomDraft) {
         mutableState.update { s ->
             val d = transform(s.draft)
-            s.copy(draft = d.copy(solve = solve(d, s.settings)))
+            s.copy(draft = d.copy(solve = solveDraft(d, s)))
         }
     }
+
+    /** [mutateCapture] that can be undone: the walls / corners before it go on the undo history. */
+    private fun recordEdit(undoMessage: String, transform: (RoomDraft) -> RoomDraft) {
+        mutateCapture { d ->
+            val edit = CaptureEdit(d.observations, d.cornerTaps, undoMessage)
+            transform(d).copy(history = (d.history + edit).takeLast(MAX_UNDO_HISTORY))
+        }
+    }
+
+    /** Solve with the squaring axis shared by this session's saved rooms, so neighbours come out parallel. */
+    private fun solveDraft(d: RoomDraft, s: CaptureUiState): SolveResult? =
+        solve(d, s.settings, sessionAxisHint(s.sessionRooms))
 
     private fun freshDraft(method: CaptureMethod) = RoomDraft(id = Ids.newId(), method = method)
 
@@ -930,11 +1401,12 @@ class CaptureViewModel(
         private val repository: ProjectRepository,
         private val projectId: String,
         private val floorId: String,
+        private val tipsFlag: OneTimeFlag = OneTimeFlag.InMemory(),
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             require(modelClass.isAssignableFrom(CaptureViewModel::class.java)) { "Unknown ViewModel $modelClass" }
-            return CaptureViewModel(repository, projectId, floorId) as T
+            return CaptureViewModel(repository, projectId, floorId, tipsFlag) as T
         }
     }
 
@@ -943,11 +1415,21 @@ class CaptureViewModel(
         const val AUTO_LOCK_TOLERANCE = 0.03
         const val AUTO_LOCK_STABLE_NS = 1_000_000_000L
 
+        /**
+         * Auto-lock only takes surfaces at least this far below the phone. A handheld phone is ~1.1–1.6 m
+         * above the floor, while beds, tables and kitchen islands are only ~0.5–0.85 m below it. A crouching
+         * user can still lock manually.
+         */
+        const val AUTO_LOCK_MIN_CAMERA_DROP = 1.0
+
         /** The phone must be at least this far above a floor candidate. */
         const val MIN_CAMERA_ABOVE_FLOOR = 0.3
 
         /** A manual lock this far above a confident floor is a table / bed, not the floor. */
         const val MAX_ABOVE_BEST_FLOOR = 0.2
+
+        /** A manual lock this close to the height rejected with "Re-lock floor" needs a second tap. */
+        const val REJECTED_FLOOR_TOLERANCE = 0.10
 
         const val MIN_CEILING = 1.5
         const val MAX_CEILING = 8.0
@@ -955,6 +1437,7 @@ class CaptureViewModel(
         const val CLOSE_TO_FIRST_CORNER = 0.15
         const val MAX_QUEUED_MESSAGES = 4
         const val MAX_NAME_LENGTH = 60
+        const val MAX_UNDO_HISTORY = 50
 
         /** Openings on the same wall overlapping by more than this are rejected. */
         const val OPENING_OVERLAP_TOLERANCE = 0.02
@@ -968,12 +1451,19 @@ class CaptureViewModel(
     }
 }
 
-private val CaptureStep.isCaptureStep: Boolean
+internal val CaptureStep.isCaptureStep: Boolean
     get() = this == CaptureStep.WALLS || this == CaptureStep.CORNERS
 
-/** Solve the draft's outline from its walls or corners; null with fewer than 3 or when no valid room forms. */
-internal fun solve(draft: RoomDraft, settings: PlanSettings): SolveResult? {
-    val options = SolverOptions(squareAngles = settings.squareAngles, squareToleranceDeg = settings.squareToleranceDeg)
+/**
+ * Solve the draft's outline from its walls or corners; null with fewer than 3 or when no valid room forms.
+ * [axisHint] is the session's shared squaring axis ([sessionAxisHint]), if any.
+ */
+internal fun solve(draft: RoomDraft, settings: PlanSettings, axisHint: Double? = null): SolveResult? {
+    val options = SolverOptions(
+        squareAngles = settings.squareAngles,
+        squareToleranceDeg = settings.squareToleranceDeg,
+        axisHint = axisHint?.takeIf { it.isFinite() },
+    )
     val result = try {
         when (draft.method) {
             CaptureMethod.CORNERS ->
@@ -992,6 +1482,10 @@ private fun WallObservation.isUsable(): Boolean =
     line.point.isFinite() && line.direction.isFinite() && line.direction.length > 0.5 &&
         extentStart.isFinite() && extentEnd.isFinite() && viewer.isFinite()
 
+private fun <T> List<T>.replaced(index: Int, value: T): List<T> = toMutableList().also { it[index] = value }
+
+private fun <T> List<T>.removedAt(index: Int): List<T> = toMutableList().also { it.removeAt(index) }
+
 internal fun openingLabel(type: OpeningType): String = when (type) {
     OpeningType.DOOR -> "Door"
     OpeningType.WINDOW -> "Window"
@@ -1000,7 +1494,7 @@ internal fun openingLabel(type: OpeningType): String = when (type) {
 
 /** True when [opening] overlaps (beyond a small tolerance) an opening already on the same wall edge. */
 internal fun overlapsExisting(opening: Opening, existing: List<Opening>): Boolean = existing.any { o ->
-    o.wallIndex == opening.wallIndex &&
+    o.id != opening.id && o.wallIndex == opening.wallIndex &&
         min(o.offset + o.width, opening.offset + opening.width) - max(o.offset, opening.offset) >
         CaptureViewModel.OPENING_OVERLAP_TOLERANCE
 }

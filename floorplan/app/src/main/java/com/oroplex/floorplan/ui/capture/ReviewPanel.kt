@@ -4,6 +4,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -11,13 +13,21 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.WarningAmber
+import androidx.compose.material.icons.outlined.DoorFront
+import androidx.compose.material.icons.outlined.EditNote
+import androidx.compose.material.icons.outlined.Replay
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
@@ -44,6 +54,7 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
@@ -52,8 +63,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import com.oroplex.floorplan.core.geometry.Polygons
-import com.oroplex.floorplan.core.measure.Measurements
-import com.oroplex.floorplan.core.measure.Units
+import com.oroplex.floorplan.core.model.CaptureMethod
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.Room
 import com.oroplex.floorplan.core.model.RoomType
@@ -62,6 +72,7 @@ import com.oroplex.floorplan.core.render.PlanColors
 import com.oroplex.floorplan.core.render.PlanRenderer
 import com.oroplex.floorplan.core.render.RenderOptions
 import com.oroplex.floorplan.core.render.ViewTransform
+import com.oroplex.floorplan.core.solve.QualityLevel
 import com.oroplex.floorplan.render.PlanPainter
 
 /** Review-step actions. */
@@ -71,42 +82,17 @@ internal interface ReviewActions {
     fun saveAndScanNext()
     fun saveAndFinish()
     fun redoRoom()
-}
-
-/** Formatted room statistics for the review (null fields are not shown). */
-internal data class ReviewStats(
-    val size: String?,
-    val area: String,
-    val perimeter: String,
-    val ceiling: String,
-)
-
-internal fun reviewStats(room: Room, ceilingMeasured: Boolean, settings: PlanSettings): ReviewStats {
-    val system = settings.unitSystem
-    fun len(m: Double) = formatLengthSafe(m, settings)
-    val stats = try {
-        Measurements.room(room)
-    } catch (e: Exception) {
-        null
-    }
-    val area = stats?.area ?: Polygons.area(room.corners)
-    val perimeter = stats?.perimeter ?: Polygons.perimeter(room.corners)
-    val size = stats?.let { "${len(it.length)} × ${len(it.width)}" }
-    val areaText = try {
-        Units.formatArea(area, system)
-    } catch (e: Exception) {
-        String.format(java.util.Locale.US, "%.1f m²", area)
-    }
-    val ceilingHeight = room.ceilingHeight ?: settings.defaultCeilingHeight
-    val ceiling = len(ceilingHeight) + if (ceilingMeasured) "" else " (estimated)"
-    return ReviewStats(size, areaText, len(perimeter), ceiling)
+    fun backToWalls()
+    fun backToOpenings()
 }
 
 /**
- * REVIEW step: a plan preview of the room, its stats and warnings, name and type, and the save actions.
- * Scrolls within ~60 % of the screen height so the camera stays partly visible and the keyboard fits.
+ * REVIEW step: a plan preview of the room, its quality grade and reasons, stats (L × W, area, perimeter,
+ * ceiling, openings) and warnings, name and type, the save actions with what they mean, and the ways back
+ * (walls, doors & windows, redo). Scrolls within ~62 % of the screen height so the camera stays partly
+ * visible and the keyboard fits.
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 internal fun ReviewPanel(
     ui: CaptureUiState,
@@ -118,6 +104,7 @@ internal fun ReviewPanel(
     val enabled = !ui.busy && !ui.finished
     val maxHeight = (LocalConfiguration.current.screenHeightDp * 0.62f).dp
     val focusManager = LocalFocusManager.current
+    val quality = remember(room) { room?.let { reviewQuality(safeAssess(it)) } }
     Surface(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
@@ -132,16 +119,24 @@ internal fun ReviewPanel(
                 .padding(horizontal = 20.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("Review room", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Review room",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                quality?.let { QualityBadge(it) }
+            }
             if (room == null) {
                 Text(
-                    "This room has no valid outline. Tap Redo room to capture it again.",
+                    "This room has no valid outline. Tap Back to walls to fix it, or Redo room.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.error,
                 )
             } else {
                 RoomPreview(room, ui.settings, Modifier.fillMaxWidth().height(170.dp))
-                val stats = remember(room, d.ceilingMeasured, ui.settings) { reviewStats(room, d.ceilingMeasured, ui.settings) }
+                val stats = remember(room, ui.settings) { reviewStats(room, ui.settings) }
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     stats.size?.let { StatRow("Size (L × W)", it) }
                     StatRow("Area", stats.area)
@@ -149,23 +144,21 @@ internal fun ReviewPanel(
                     StatRow("Ceiling height", stats.ceiling)
                     StatRow("Doors & windows", if (room.openings.isEmpty()) "None" else room.openings.size.toString())
                 }
-                if (room.warnings.isNotEmpty()) WarningLines(room.warnings)
+                quality?.takeIf { it.reasons.isNotEmpty() }?.let { q ->
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        q.reasons.forEach { NoteLine(it, isWarning = q.level == QualityLevel.POOR) }
+                    }
+                }
+                // Solver warnings the quality reasons don't already say.
+                val warnings = room.warnings.filter { w -> quality?.reasons?.none { it.contains(w, ignoreCase = true) } != false }
+                if (warnings.isNotEmpty()) WarningLines(warnings)
+            }
+            calibrationNote(ui.floorCalibration)?.let { NoteLine(it) }
+            if (ui.floorCalibration == null && ui.sessionRoomIds.isEmpty()) {
+                NoteLine("Tip: tape-measure one long wall later and calibrate the floor in the editor for the best accuracy.")
             }
             if (ui.otherSessionRoomCount > 0) {
-                Row(verticalAlignment = Alignment.Top) {
-                    Icon(
-                        Icons.Outlined.Info,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(top = 2.dp),
-                    )
-                    Text(
-                        "Rooms from other scan sessions may need to be moved into place in the editor.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(start = 8.dp),
-                    )
-                }
+                NoteLine("Rooms from other scan sessions may need to be moved into place in the editor.")
             }
 
             // Local text state so fast typing never races the ViewModel's async state emissions. The only
@@ -191,7 +184,7 @@ internal fun ReviewPanel(
 
             if (ui.saving) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(Modifier.height(16.dp), strokeWidth = 2.dp)
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
                     Text("Saving…", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(start = 8.dp))
                 }
             }
@@ -206,9 +199,50 @@ internal fun ReviewPanel(
                 enabled = canSave,
                 modifier = Modifier.fillMaxWidth().height(48.dp),
             ) { Text("Save & finish") }
-            TextButton(onClick = actions::redoRoom, enabled = enabled, modifier = Modifier.align(Alignment.CenterHorizontally)) {
-                Text("Redo room")
+            Text(
+                "Scan every room of this floor before you finish: rooms scanned later won't line up automatically.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                val wallsLabel = if (d.method == CaptureMethod.CORNERS) "Back to corners" else "Back to walls"
+                EditButton(wallsLabel, Icons.AutoMirrored.Filled.ArrowBack, enabled, actions::backToWalls)
+                EditButton("Doors & windows", Icons.Outlined.DoorFront, enabled, actions::backToOpenings)
+                EditButton("Redo room", Icons.Outlined.Replay, enabled, actions::redoRoom)
             }
+        }
+    }
+}
+
+@Composable
+private fun EditButton(label: String, icon: ImageVector, enabled: Boolean, onClick: () -> Unit) {
+    TextButton(onClick = onClick, enabled = enabled) {
+        Icon(icon, contentDescription = null, Modifier.size(18.dp))
+        Text(label, Modifier.padding(start = 6.dp))
+    }
+}
+
+/** Colored pill with the room's quality grade ("Good", "Fair", "Needs a check"). */
+@Composable
+private fun QualityBadge(q: ReviewQuality) {
+    val (color, icon) = when (q.level) {
+        QualityLevel.GOOD -> gradeUiColor(CaptureGrade.GOOD) to Icons.Filled.CheckCircle
+        QualityLevel.FAIR -> gradeUiColor(CaptureGrade.FAIR) to Icons.Filled.WarningAmber
+        QualityLevel.POOR -> gradeUiColor(CaptureGrade.POOR) to Icons.Filled.ErrorOutline
+        QualityLevel.MANUAL -> MaterialTheme.colorScheme.secondary to Icons.Outlined.EditNote
+    }
+    Surface(shape = CircleShape, color = color.copy(alpha = 0.12f), contentColor = color) {
+        Row(Modifier.padding(horizontal = 10.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp))
+            Text(
+                q.label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(start = 4.dp),
+            )
         }
     }
 }

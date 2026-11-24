@@ -43,6 +43,7 @@ private const val MAX_AIM_LINE = 8.0
 
 private const val CAMERA_COLOR: Int = 0xFF1A73E8.toInt()
 private const val OBSERVATION_COLOR: Int = 0xFF1A73E8.toInt()
+private const val HIGHLIGHT_COLOR: Int = 0xFFFFB300.toInt()
 
 /**
  * Static part of the mini-map (changes only when the capture state does): the session's rooms and the
@@ -77,6 +78,7 @@ internal data class MiniMapContent(val drawList: DrawList, val focus: Bounds) {
             val ops = ArrayList<DrawOp>()
             rendered?.let { ops += it.ops }
             if (draftRoom == null || rendered == null) ops += rawDraftOps(ui, draftRoom)
+            ops += recaptureOps(draft)
 
             val focusPoints: List<Vec2> = when {
                 draftRoom != null -> draftRoom.corners
@@ -85,6 +87,19 @@ internal data class MiniMapContent(val drawList: DrawList, val focus: Bounds) {
             }.filter { it.isFinite() }
             val focus = if (focusPoints.isNotEmpty()) Bounds.of(focusPoints) else Bounds.EMPTY
             return MiniMapContent(DrawList(ops, rendered?.bounds ?: focus), focus)
+        }
+
+        /** The wall or corner being re-captured, drawn on top in amber so the user sees which one to aim at. */
+        private fun recaptureOps(d: RoomDraft): List<DrawOp> {
+            val i = d.recaptureIndex ?: return emptyList()
+            return if (d.method == CaptureMethod.CORNERS) {
+                val p = d.cornerTaps.getOrNull(i)?.takeIf { it.isFinite() } ?: return emptyList()
+                listOf(DrawOp.Dot(p, radiusPt = 6.0, fillColor = HIGHLIGHT_COLOR, strokeColor = PlanColors.HANDLE_FILL))
+            } else {
+                val o = d.observations.getOrNull(i) ?: return emptyList()
+                if (!o.extentStart.isFinite() || !o.extentEnd.isFinite()) return emptyList()
+                listOf(DrawOp.Polyline(listOf(o.extentStart, o.extentEnd), closed = false, widthPt = 7.0, color = HIGHLIGHT_COLOR))
+            }
         }
 
         /** Unsolved draft (or renderer failure): observation segments with wall numbers, corner taps. */

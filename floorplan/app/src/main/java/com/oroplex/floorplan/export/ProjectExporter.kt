@@ -25,10 +25,18 @@ class ProjectExporter(
 ) {
     private val appContext = context.applicationContext
 
-    /** Throws [ExportException] with a user-facing message for anything the user can fix. */
-    suspend fun export(project: Project, request: ExportRequest, now: Long = System.currentTimeMillis()): ExportedFile {
+    /**
+     * Throws [ExportException] with a user-facing message for anything the user can fix.
+     * [branding] is printed in the header of PDF pages and the PNG image (null = none).
+     */
+    suspend fun export(
+        project: Project,
+        request: ExportRequest,
+        branding: SheetBranding? = null,
+        now: Long = System.currentTimeMillis(),
+    ): ExportedFile {
         val name = fileName(project, request)
-        val payload = withContext(Dispatchers.Default) { prepare(project, request, now) }
+        val payload = withContext(Dispatchers.Default) { prepare(project, request, branding, now) }
         val file = withContext(Dispatchers.IO) { ExportFiles.write(appContext, name) { out -> payload.writeTo(out) } }
         return ExportedFile(file, request.format)
     }
@@ -50,18 +58,18 @@ class ProjectExporter(
         }
     }
 
-    private fun prepare(project: Project, request: ExportRequest, now: Long): Payload {
+    private fun prepare(project: Project, request: ExportRequest, branding: SheetBranding?, now: Long): Payload {
         if (request.format == ExportFormat.JSON) return Payload.Bytes(encodeJson(project).toByteArray(Charsets.UTF_8))
         val floors = floorsFor(project, request)
         if (floors.isEmpty()) throw ExportException("This project has no floors yet. Add a floor in the editor first.")
         val dateText = FloorSheets.dateText(now)
         return when (request.format) {
             ExportFormat.PDF -> {
-                val options = PdfOptions(request.paper, request.showWallLengths, request.showAreas, request.includeRoomSchedule)
-                Payload.Pdf(PdfExporter.prepare(project, floors, options, dateText))
+                val options = PdfOptions(request.paper, request.labels, request.includeRoomSchedule)
+                Payload.Pdf(PdfExporter.prepare(project, floors, options, dateText, branding))
             }
             ExportFormat.PNG -> Payload.Png(
-                FloorSheets.build(project, floors.first(), request.showWallLengths, request.showAreas, dateText),
+                FloorSheets.build(project, floors.first(), request.labels, dateText, branding),
             )
             ExportFormat.SVG -> Payload.Bytes(svgFor(project, requireRooms(floors.first()), request).toByteArray(Charsets.UTF_8))
             ExportFormat.DXF -> {
@@ -83,13 +91,8 @@ class ProjectExporter(
     }
 
     private fun svgFor(project: Project, floor: Floor, request: ExportRequest): String {
-        val drawList = FloorSheets.renderFloor(
-            project,
-            floor,
-            request.showWallLengths,
-            request.showAreas,
-            textScale = 1.0,
-        ) ?: throw ExportException(emptyFloorMessage(floor))
+        val drawList = FloorSheets.renderFloor(project, floor, request.labels, textScale = 1.0)
+            ?: throw ExportException(emptyFloorMessage(floor))
         val b = drawList.bounds
         val aspect = if (b.width > 1e-9) (b.height / b.width).coerceIn(0.25, 4.0) else 0.75
         val heightPt = (SVG_WIDTH_PT - 2 * SVG_MARGIN_PT) * aspect + 2 * SVG_MARGIN_PT + SVG_TITLE_SPACE_PT

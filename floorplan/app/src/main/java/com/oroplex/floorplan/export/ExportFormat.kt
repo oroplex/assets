@@ -77,6 +77,17 @@ data class ExportRequest(
     val showWallLengths: Boolean = true,
     val showAreas: Boolean = true,
     val includeRoomSchedule: Boolean = true,
+    /** Overall width / depth dimension lines around the plan (drawings only; DXF ignores it). */
+    val showOverallDimensions: Boolean = true,
+) {
+    val labels: PlanLabels get() = PlanLabels(showWallLengths, showAreas, showOverallDimensions)
+}
+
+/** Which annotations a drawn plan carries. */
+data class PlanLabels(
+    val showWallLengths: Boolean = true,
+    val showAreas: Boolean = true,
+    val showOverallDimensions: Boolean = true,
 )
 
 /** An export failure whose [message] is written for the user (shown verbatim in a snackbar). */

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark system setting: start on the dark theme background (matches FloorPlanTheme's DarkColors) so
+         the launch window doesn't flash white before Compose draws. -->
+    <style name="Theme.FloorPlan" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/window_background_dark</item>
+    </style>
+
+    <color name="window_background_dark">#FF131314</color>
+</resources>

@@ -3,37 +3,29 @@
 _Last updated 2026-11-24. Branch: `claude/floorplan-generation-app-hlws61`._
 
 ## Where things stand
-* Complete first implementation: AR capture (ARCore, depth-based wall fitting, baseline / corner fallbacks),
-  room solver, plan editor, projects, PDF / PNG / SVG / DXF / JSON export, settings, GitHub Actions APK build.
-* Build: `./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug` passes (293 tests + simulation suite).
-* **Not yet field-ready.** Review round 1 found real defects (see `REVIEW-1.md`). Nothing has run on a phone yet.
+* Round 1 (first implementation) and round 2 (fixes for review round 1 + premium features) are merged.
+  Round 2 added: aim-point wall fitting with a range-adaptive noise model, robust squaring/order handling,
+  calibration provenance (only AR-measured values scale; later rooms get the floor's calibration), floor
+  straighten/rotate, snap-to-neighbour (incl. auto-snap), overlap detection + floor checks, per-room quality
+  grades, overall dimension lines, estimated-ceiling tracking, first-scan coaching, per-wall delete/recapture,
+  company branding on exports, onboarding, dark theme, and a 3D dollhouse view.
+* Build: `./gradlew :core:test :app:testDebugUnitTest :app:assembleDebug` passes — 329 core + 365 app tests, 0 skipped.
+* **Review round 2 is in progress / next** (independent reviewers + adversarial verification). Then fix round 3,
+  then on-device testing on the Galaxy S26 Ultra. Not yet field-tested.
 
-## Accuracy simulation (core pipeline, synthetic data — see `core/build/sim-report.txt` after `:core:test`)
-* With realistic depth-from-motion noise (σ = 5 mm + 1.2 % of range), 10 % outliers and furniture:
-  wall-length error p95 ≈ 8–11 mm, worst ≈ 24 mm (large L-shaped living room); area error < 1 %;
-  squared corners exact. A +2 % AR scale error is removed by one tape calibration.
-* Problems it exposed (fix in round 2):
-  1. Fixed noise gates (`maxRms` 3 cm, inlier band 2.5 cm) reject every capture beyond ~2 m (TOO_NOISY).
-     A range-adaptive band — inlierThreshold = max(2.5 cm, 2σ(d)), maxRms = max(3 cm, 1.5σ(d)) — removed all
-     first-try failures in simulation and also fixed the hallway "wrong wall" case. Adopt it (and re-check the
-     large-room worst case, which grew to ~5 cm at 2.5 m+ — consider sampling more frames at long range).
-  2. Grazing-incidence captures (aiming down a hallway at the end wall) can fit a side wall.
-  3. The re-ordering heuristic breaks the L-shaped room when two walls are swapped or a wall is re-captured
-     non-consecutively (8 corners instead of 6).
-  4. "Corner beyond what was measured" warning fires on most normal rooms (false alarm).
+## Accuracy simulation (core pipeline, synthetic data — `core/build/sim-report.txt` after `:core:test`)
+Realistic depth-from-motion noise (σ = 5 mm + 1.2 % of range), 10 % outliers, the app's aim point, production defaults:
+* 0 first-try capture failures out to 4.5 m; 0 wrong-wall fits; correct room topology in every scenario
+  (clean, furniture, stress furniture, swapped walls, repeated captures, narrow rooms).
+* Wall-length error: p95 ≈ 6 mm, worst ≈ 22 mm (8 m L-shaped room); ≤ 7 mm worst in rooms up to 5 m.
+* +2 % AR scale error → one tape calibration → worst ≈ 10 mm (8 m room), ≤ 7 mm elsewhere.
+* Caveat: the noise model is an assumption; real-device accuracy must be confirmed on the S26 Ultra.
 
-## Round 2 plan (in priority order)
-1. Fix all confirmed findings in `REVIEW-1.md`; re-verify the unverified Product/UX and simulation findings first.
-   Highest impact: floor locking onto beds/tables; adaptive wall-fit gates; skipped ceiling saved as measured;
-   calibration not applied to later rooms; setWallLength skew; squaring dragged by an angled wall;
-   prefer-farther picking a wall through a doorway; activity recreation ending the AR session mid-scan.
-2. Multi-room workflow: snap a room to a neighbour by a shared wall; straighten the whole floor (rotate to the
-   dominant axis); keep calibration for rooms added later; per-room quality badges; pre-export check.
-3. Premium polish: first-run tutorial + scanning coach; exterior overall dimension lines; company name/logo on
-   PDFs; cleaner schedule; optional 3D "dollhouse" preview.
-4. Verification round 2 (independent reviewers + adversarial verify + simulation must stay green; un-ignore the
-   `@Ignore("FINDING …")` tests in `core/src/test/.../sim/ScanSimulationTest.kt` as they are fixed).
-5. On-device testing on the Galaxy S26 Ultra (install via USB/adb, read `adb logcat`).
+## Next steps
+1. Fix confirmed findings from review round 2 (record them in `REVIEW-2.md`).
+2. On-device testing on the Galaxy S26 Ultra (install via USB/adb, read `adb logcat`); tune coaching/floor/ceiling
+   thresholds and the depth noise model from real captures.
+3. Nice-to-haves: per-side exterior dimension chains, depth-image sampling instead of 81 hit-tests per frame.
 
 ## Building on a new machine
 * JDK 17+ (Android Studio's bundled JBR is fine), Android SDK with platform 35 + build-tools 35.

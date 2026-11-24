@@ -85,7 +85,7 @@ class PlanRendererTest {
 
     @Test fun roomLabelsSitInsideTheirRooms() {
         val dl = PlanRenderer.render(sampleRooms, sample.settings)
-        val names = dl.opsOf<DrawOp.Text>().filter { it.bold }
+        val names = dl.opsOf<DrawOp.Text>().filter { it.bold && it.tag == null } // not the overall dimensions
         assertEquals(sampleRooms.size, names.size)
         for (r in sampleRooms) {
             val label = names.single { it.text == r.name }

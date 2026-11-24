@@ -101,6 +101,109 @@ class RoomOpsTest {
         )
     }
 
+    // Core math AR-5: the far side must keep its shape even when it is not exactly perpendicular.
+
+    private fun edgeAngles(c: List<Vec2>) = c.indices.map { (c[(it + 1) % c.size] - c[it]).angle() }
+
+    /** Every edge except [except] keeps its direction. */
+    private fun assertDirectionsKept(before: List<Vec2>, after: List<Vec2>, except: Set<Int> = emptySet()) {
+        val a = edgeAngles(before)
+        val b = edgeAngles(after)
+        for (i in a.indices) {
+            if (i in except) continue
+            assertEquals(0.0, Polygons.normalizeAngle(b[i] - a[i]), 1e-9, "edge $i turned")
+        }
+    }
+
+    @Test fun setWallLengthKeepsADraggedFarWallInShape() {
+        // Review example: corner 2 dragged 1 cm in, then wall 0 typed as 4.5 m.
+        val corners = listOf(v(0.0, 0.0), v(4.0, 0.0), v(3.99, 3.0), v(0.0, 3.0))
+        val r = RoomOps.setWallLength(rect.copy(corners = corners), 0, 4.5)
+        assertPolygonEquals(listOf(v(0.0, 0.0), v(4.5, 0.0), v(4.49, 3.0), v(0.0, 3.0)), r.corners)
+        assertDirectionsKept(corners, r.corners)
+        assertEquals(4.5, r.corners[0].distanceTo(r.corners[1]), 1e-12)
+        // A far corner 2 mm outward behaves the same way (no 1 mm discontinuity any more).
+        val out = listOf(v(0.0, 0.0), v(4.0, 0.0), v(4.002, 3.0), v(0.0, 3.0))
+        assertPolygonEquals(listOf(v(0.0, 0.0), v(4.5, 0.0), v(4.502, 3.0), v(0.0, 3.0)), RoomOps.setWallLength(rect.copy(corners = out), 0, 4.5).corners)
+    }
+
+    @Test fun setWallLengthKeepsAnUnsquaredCornerAngle() {
+        // Squaring off: the far corner is 88.5°, so the right wall leans by 1.5°.
+        val lean = 3.0 * kotlin.math.tan(Math.toRadians(1.5))
+        val corners = listOf(v(0.0, 0.0), v(4.0, 0.0), v(4.0 - lean, 3.0), v(0.0, 3.0))
+        val before = Polygons.interiorAngles(corners)
+        val r = RoomOps.setWallLength(rect.copy(corners = corners), 0, 4.5)
+        assertDirectionsKept(corners, r.corners)
+        Polygons.interiorAngles(r.corners).forEachIndexed { i, a -> assertEquals(before[i], a, 1e-9, "corner $i angle") }
+        assertEquals(4.5 - lean, r.corners[2].distanceTo(r.corners[3]), 1e-9)
+    }
+
+    @Test fun setWallLengthOnTrapezoids() {
+        val trap = listOf(v(0.0, 0.0), v(4.0, 0.0), v(3.0, 3.0), v(1.0, 3.0))
+        val room = rect.copy(corners = trap)
+        // Base: the slanted right side moves out as a whole; the top widens.
+        val base = RoomOps.setWallLength(room, 0, 5.0)
+        assertPolygonEquals(listOf(v(0.0, 0.0), v(5.0, 0.0), v(4.0, 3.0), v(1.0, 3.0)), base.corners)
+        assertDirectionsKept(trap, base.corners)
+        // Top: edge 2 runs (3,3) -> (1,3), so the side beyond its far end (the slanted left side) moves out
+        // as a whole; both slanted sides keep their angle and the base widens.
+        val top = RoomOps.setWallLength(room, 2, 3.0)
+        assertPolygonEquals(listOf(v(-1.0, 0.0), v(4.0, 0.0), v(3.0, 3.0), v(0.0, 3.0)), top.corners)
+        assertDirectionsKept(trap, top.corners)
+        assertEquals(3.0, top.corners[2].distanceTo(top.corners[3]), 1e-12)
+        // Slanted side: it gets the length exactly and keeps its own direction.
+        val side = RoomOps.setWallLength(room, 1, 4.0)
+        assertEquals(4.0, side.corners[1].distanceTo(side.corners[2]), 1e-9)
+        assertDirectionsKept(trap, side.corners, except = setOf(3))
+        assertTrue(Polygons.isSimple(side.corners) && Polygons.isCounterClockwise(side.corners))
+    }
+
+    @Test fun setWallLengthGrowsAChamferInPlace() {
+        // Review example: (0,0),(4,0),(4,3),(3,4),(0,4); the 45° wall set from 1.41 m to 2.0 m.
+        val chamfer = listOf(v(0.0, 0.0), v(4.0, 0.0), v(4.0, 3.0), v(3.0, 4.0), v(0.0, 4.0))
+        val r = RoomOps.setWallLength(rect.copy(corners = chamfer), 2, 2.0)
+        assertEquals(2.0, r.corners[2].distanceTo(r.corners[3]), 1e-9)
+        // Every wall keeps its direction: the left wall stays vertical, the top horizontal.
+        assertDirectionsKept(chamfer, r.corners)
+        val s = 2.0 / kotlin.math.sqrt(2.0) - 1.0
+        assertPolygonEquals(listOf(v(0.0, 0.0), v(4.0, 0.0), v(4.0, 3.0 - s), v(3.0 - s, 4.0), v(0.0, 4.0)), r.corners, 1e-9)
+        // And back.
+        assertPolygonEquals(chamfer, RoomOps.setWallLength(r, 2, kotlin.math.sqrt(2.0)).corners, 1e-9)
+    }
+
+    @Test fun setWallLengthAroundReflexCorners() {
+        // The notch wall of the L: the part beyond its far end (the whole west side) moves.
+        val shorter = RoomOps.setWallLength(lRoom, 2, 2.5)
+        assertPolygonEquals(
+            listOf(v(0.5, 0.0), v(6.0, 0.0), v(6.0, 3.0), v(3.5, 3.0), v(3.5, 5.0), v(0.5, 5.0)),
+            shorter.corners,
+        )
+        assertDirectionsKept(Shapes.lShape, shorter.corners)
+        // The inner wall of the notch (reflex corner at its start).
+        val inner = RoomOps.setWallLength(lRoom, 3, 1.5)
+        assertPolygonEquals(
+            listOf(v(0.0, 0.0), v(6.0, 0.0), v(6.0, 3.0), v(3.0, 3.0), v(3.0, 4.5), v(0.0, 4.5)),
+            inner.corners,
+        )
+        // U-shape: stretching the base moves only the arm at its far end; the gap between the arms is kept.
+        val u = listOf(v(0.0, 0.0), v(6.0, 0.0), v(6.0, 4.0), v(4.0, 4.0), v(4.0, 2.0), v(2.0, 2.0), v(2.0, 4.0), v(0.0, 4.0))
+        val wider = RoomOps.setWallLength(rect.copy(corners = u), 0, 7.0)
+        assertEquals(7.0, wider.corners[0].distanceTo(wider.corners[1]), 1e-12)
+        assertDirectionsKept(u, wider.corners)
+        assertEquals(2.0, wider.corners[4].distanceTo(wider.corners[5]), 1e-12, "gap between the arms")
+        assertTrue(Polygons.isSimple(wider.corners))
+    }
+
+    @Test fun setWallLengthNeverCreatesTinyWalls() {
+        // Shortening the L's base to 3.02 m would leave a 2 cm wall whichever side moves: rejected.
+        assertSame(lRoom, RoomOps.setWallLength(lRoom, 0, 3.02))
+        // Same length: nothing to do.
+        assertSame(rect, RoomOps.setWallLength(rect, 0, 4.0))
+        // A room with a broken corner is left alone.
+        val broken = rect.copy(corners = listOf(v(0.0, 0.0), v(4.0, 0.0), v(Double.NaN, 3.0), v(0.0, 3.0)))
+        assertSame(broken, RoomOps.setWallLength(broken, 0, 5.0))
+    }
+
     @Test fun setWallLengthRejectsInvalidInput() {
         for (len in listOf(0.05, 0.0, -1.0, Double.NaN, Double.POSITIVE_INFINITY)) {
             assertSame(rect, RoomOps.setWallLength(rect, 0, len), "length $len")
@@ -384,9 +487,11 @@ class RoomOpsTest {
 
     // ---------------------------------------------------------------- FloorOps
 
+    /** Two scanned rooms (calibration only applies to AR-measured rooms; see FloorOpsTest for the rules). */
     private fun floor(): Floor {
-        val a = rect.copy(id = "a")
-        val b = Room(id = "b", name = "Bath", corners = listOf(v(4.1, 0.0), v(6.1, 0.0), v(6.1, 2.0), v(4.1, 2.0)))
+        val a = rect.copy(id = "a", captureMethod = CaptureMethod.WALLS, observations = wallsOf(Shapes.rect))
+        val bCorners = listOf(v(4.1, 0.0), v(6.1, 0.0), v(6.1, 2.0), v(4.1, 2.0))
+        val b = Room(id = "b", name = "Bath", corners = bCorners, captureMethod = CaptureMethod.CORNERS, cornerTaps = bCorners)
         return Floor(id = "f", name = "Ground", rooms = listOf(a, b))
     }
 
@@ -405,6 +510,7 @@ class RoomOpsTest {
         assertVecEquals(center + (f.rooms[0].corners[0] - center) * factor, a.corners[0], 1e-12)
         assertEquals(2.4 * factor, assertNotNull(a.ceilingHeight), 1e-12)
         val cal = assertNotNull(c.calibration)
+        assertVecEquals(center, cal.origin, 1e-12)
         assertEquals(factor, cal.factor, 1e-12)
         assertEquals(4.0, cal.measuredLength, 1e-12)
         assertEquals(4.1, cal.trueLength, 1e-12)

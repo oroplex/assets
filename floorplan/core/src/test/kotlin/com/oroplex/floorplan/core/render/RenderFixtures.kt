@@ -11,7 +11,12 @@ import kotlin.test.assertTrue
 
 /** Shared builders for renderer / exporter tests. All outlines CCW, meters. */
 internal object Fixtures {
-    val settings = PlanSettings()
+    /**
+     * Default settings without the overall dimension lines, so tests about walls, openings and labels see only
+     * those ops; [withDimensions] is the true default for the dimension tests.
+     */
+    val settings = PlanSettings(showOverallDimensions = false)
+    val withDimensions = PlanSettings()
     val t: Double = settings.wallThickness
 
     fun rect(x0: Double, y0: Double, x1: Double, y1: Double) =

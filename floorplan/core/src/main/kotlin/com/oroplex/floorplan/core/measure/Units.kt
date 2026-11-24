@@ -30,17 +30,20 @@ object Units {
         }
     }
 
-    /** "152 sq ft" (rounded to whole sq ft) or "14.1 m²" (1 decimal). Non-finite input gives [INVALID]. */
+    /**
+     * "152 sq ft" (rounded to whole sq ft) or "14.1 m²" (1 decimal), with comma thousands separators
+     * ("2,150 sq ft", "1,250.0 m²") regardless of the device locale. Non-finite input gives [INVALID].
+     */
     fun formatArea(squareMeters: Double, system: UnitSystem): String {
         if (!squareMeters.isFinite()) return INVALID
         return when (system) {
             UnitSystem.IMPERIAL -> {
                 val sqft = Math.round(abs(squareMeters) * SQFT_PER_SQM)
-                "${sign(squareMeters, sqft)}$sqft sq ft"
+                "${sign(squareMeters, sqft)}${grouped(sqft)} sq ft"
             }
             UnitSystem.METRIC -> {
                 val tenths = Math.round(abs(squareMeters) * 10)
-                "${sign(squareMeters, tenths)}${tenths / 10}.${tenths % 10} m²"
+                "${sign(squareMeters, tenths)}${grouped(tenths / 10)}.${tenths % 10} m²"
             }
         }
     }
@@ -62,6 +65,17 @@ object Units {
     // ---------------------------------------------------------------------------------------------
 
     private fun sign(value: Double, roundedMagnitude: Long) = if (value < 0 && roundedMagnitude != 0L) "-" else ""
+
+    /** Non-negative [value] with a comma every three digits: 2150 -> "2,150". */
+    private fun grouped(value: Long): String {
+        val digits = value.toString()
+        val sb = StringBuilder(digits.length + digits.length / 3)
+        digits.forEachIndexed { i, ch ->
+            if (i > 0 && (digits.length - i) % 3 == 0) sb.append(',')
+            sb.append(ch)
+        }
+        return sb.toString()
+    }
 
     private fun formatImperial(meters: Double, denominator: Int): String {
         val units = Math.round(abs(meters) / METERS_PER_INCH * denominator)

@@ -1,0 +1,50 @@
+name: FloorPlan Scan (Android)
+
+on:
+  push:
+    paths:
+      - "floorplan/**"
+      - ".github/workflows/floorplan-android.yml"
+  pull_request:
+    paths:
+      - "floorplan/**"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: floorplan
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Point Gradle at the runner's Android SDK
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Unit tests (core geometry, solver, exporters)
+        run: ./gradlew :core:test --console=plain
+
+      - name: Build APK
+        run: ./gradlew :app:assembleDebug --console=plain
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FloorPlanScan-apk
+          path: floorplan/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload core test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-report
+          path: floorplan/core/build/reports/tests/

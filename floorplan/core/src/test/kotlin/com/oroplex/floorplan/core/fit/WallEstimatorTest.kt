@@ -5,6 +5,13 @@ import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.geometry.Vec3
 import com.oroplex.floorplan.core.model.WallObservation
 import com.oroplex.floorplan.core.model.WallSource
+import com.oroplex.floorplan.core.sim.CAMERA_HEIGHT
+import com.oroplex.floorplan.core.sim.FurnitureBox
+import com.oroplex.floorplan.core.sim.RayHit
+import com.oroplex.floorplan.core.sim.SIM_CEILING_Y
+import com.oroplex.floorplan.core.sim.SIM_FLOOR_Y
+import com.oroplex.floorplan.core.sim.ScanSimulator
+import com.oroplex.floorplan.core.sim.SimRoom
 import java.util.Random
 import kotlin.math.abs
 import kotlin.math.asin
@@ -147,9 +154,10 @@ class WallEstimatorTest {
         val back = assertNotNull(WallEstimator.fromPoints(pts, floorY, null, Vec3.fromPlan(otherViewerPlan, 0.0)).observation)
         assertOrientedViewerLeft(back, otherViewerPlan)
         assertTrue((front.line.direction dot back.line.direction) < -0.999)
-        // Same observed span either way, just reversed.
-        assertTrue(front.extentStart.approxEquals(back.extentEnd, 1e-6))
-        assertTrue(front.extentEnd.approxEquals(back.extentStart, 1e-6))
+        // Same observed span either way, just reversed (the along-ray fit depends on where the viewer is, so
+        // the two fits differ by a fraction of the noise).
+        assertTrue(front.extentStart.distanceTo(back.extentEnd) < 0.02, "${front.extentStart} vs ${back.extentEnd}")
+        assertTrue(front.extentEnd.distanceTo(back.extentStart) < 0.02, "${front.extentEnd} vs ${back.extentStart}")
     }
 
     @Test fun nearWallIsKeptWhenFartherLineIsWeak() {
@@ -310,6 +318,153 @@ class WallEstimatorTest {
         val awful = c(ratio = 0.1, noise = 0.029, n = 25, len = 0.12, dist = 5.9)
         assertTrue(awful in 0.0..0.25, "awful $awful")
         assertTrue(c(noise = Double.NaN) in 0.0..1.0)
+    }
+
+    // ---------------------------------------------------------------- range-adaptive noise model
+
+    @Test fun noiseModelDefaultsAndBands() {
+        val c = WallEstimatorConfig()
+        assertEquals(0.005, c.noiseSigmaBase)
+        assertEquals(0.012, c.noiseSigmaPerMeter)
+        assertEquals(0.005 + 0.012 * 3.0, c.expectedSigma(3.0), 1e-12)
+        // Close range: the fixed minimums apply; far: 2σ band and 1.5σ noise limit.
+        assertEquals(0.025, c.inlierThresholdAt(0.5), 1e-12)
+        assertEquals(0.03, c.noiseLimitAt(0.5), 1e-12)
+        assertEquals(2 * (0.005 + 0.012 * 4.0), c.inlierThresholdAt(4.0), 1e-12)
+        assertEquals(1.5 * (0.005 + 0.012 * 4.0), c.noiseLimitAt(4.0), 1e-12)
+        // Bad input never yields NaN bands.
+        assertEquals(0.025, c.inlierThresholdAt(Double.NaN), 1e-12)
+        assertEquals(0.025, c.inlierThresholdAt(-3.0), 1e-12)
+        assertEquals(0.0, WallEstimatorConfig(noiseSigmaBase = Double.NaN).expectedSigma(2.0))
+        assertTrue(c.maxRange >= 4.0, "TOO_FAR must not fire before the ~4 m the message asks for")
+    }
+
+    /** A synthetic capture from the scan simulation (15 frames x 9x9 rays, range noise 5 mm + 1.2 %, 10 % outliers). */
+    private fun capture(room: SimRoom, station: Vec2, aim: Vec2, aimHeight: Double, seed: Long, useAim: Boolean = true) =
+        ScanSimulator.capture(room, Vec3.fromPlan(station, CAMERA_HEIGHT), Vec3.fromPlan(aim, aimHeight), Random(seed), useAim = useAim)
+
+    private val bigRoom = SimRoom("8x8", listOf(Vec2(0.0, 0.0), Vec2(8.0, 0.0), Vec2(8.0, 8.0), Vec2(0.0, 8.0)))
+
+    @Test fun headOnWallsUpTo4mAreAcceptedAndAccurate() {
+        // Review round 1 (simulation SIM-3): with a fixed 3 cm noise gate every capture beyond ~2.2 m failed.
+        val truth = Line2(Vec2(0.0, 0.0), Vec2(1.0, 0.0))
+        for (d in listOf(1.0, 2.5, 3.5, 4.0)) {
+            for (k in 0 until 5) {
+                val fit = capture(bigRoom, Vec2(4.0, d), Vec2(4.0 + 0.3 * k - 0.6, 0.0), 1.4, 1000L + k).fit
+                val o = assertNotNull(fit.observation, "$d m, trial $k: ${fit.failure}")
+                assertTrue(truth.distance(Vec2.lerp(o.extentStart, o.extentEnd, 0.5)) < 0.01, "$d m offset")
+                assertTrue(angleDeg(o.line.direction, truth.direction) < 1.0, "$d m angle")
+                assertOrientedViewerLeft(o, Vec2(4.0, d).let { v -> o.viewer.takeIf { it.distanceTo(v) < 0.05 } ?: v })
+            }
+        }
+    }
+
+    /** The hallway of the sample house: 5.37 x 1.07 m. */
+    private val hallway = SimRoom("Hall", listOf(Vec2(0.0, 0.0), Vec2(5.37, 0.0), Vec2(5.37, 1.07), Vec2(0.0, 1.07)))
+
+    @Test fun aimPointKeepsTheEndWallAgainstAGrazingSideWall() {
+        // Review round 1 (simulation SIM-1): aiming down a hallway at its end wall fitted a side wall.
+        val station = Vec2(2.685, 0.535)
+        for (across in listOf(0.1, 0.5, 0.9)) {
+            for (k in 0 until 5) {
+                val aim = hallway.pointOn(3, across)
+                val cap = capture(hallway, station, aim, 1.4, 2000L + k)
+                val o = assertNotNull(cap.fit.observation, "$across/$k: ${cap.fit.failure}")
+                val endWall = Line2.through(hallway.start(3), hallway.end(3))
+                assertTrue(angleDeg(o.line.direction, endWall.direction) < 2.0, "$across/$k fitted a side wall")
+                assertTrue(endWall.distance(Vec2.lerp(o.extentStart, o.extentEnd, 0.5)) < 0.02, "$across/$k offset")
+            }
+        }
+    }
+
+    @Test fun cornerPointsOfTheSideWallsDoNotTiltTheEndWall() {
+        // Head-on at 2.7 m with both corners in view: the side walls' points near the corners lie inside the
+        // band on the room side only. Unbiased: mean signed error ~0, spread at the statistical level.
+        val station = Vec2(2.685, 0.535)
+        val endWall = Line2.through(hallway.start(3), hallway.end(3))
+        val angles = ArrayList<Double>()
+        val offsets = ArrayList<Double>()
+        for (k in 0 until 24) {
+            val o = assertNotNull(capture(hallway, station, hallway.pointOn(3, 0.3 + 0.017 * k), 1.4, 3000L + k).fit.observation)
+            val d = if ((o.line.direction dot endWall.direction) < 0) -o.line.direction else o.line.direction
+            angles += Math.toDegrees(Math.asin((endWall.direction cross d).coerceIn(-1.0, 1.0)))
+            offsets += endWall.signedDistance(Vec2.lerp(o.extentStart, o.extentEnd, 0.5))
+        }
+        val rms = kotlin.math.sqrt(angles.map { it * it }.average())
+        assertTrue(rms < 0.5, "direction rms $rms deg")
+        assertTrue(abs(offsets.average()) < 0.002, "offset bias ${offsets.average()} m")
+    }
+
+    /** Main wall y = 0 with a 0.9 m doorway at x 3.0..3.9 into a 1.2 m deep space (its back wall parallel). */
+    private val doorwayRoom = SimRoom(
+        "Doorway",
+        listOf(
+            Vec2(0.0, 0.0), Vec2(3.0, 0.0), Vec2(3.0, -1.2), Vec2(3.9, -1.2), Vec2(3.9, 0.0),
+            Vec2(8.0, 0.0), Vec2(8.0, 6.0), Vec2(0.0, 6.0),
+        ),
+    )
+
+    @Test fun wallBesideADoorwayIsNotReplacedByTheWallBehindIt() {
+        // Review round 1 (Core math AR-2): with the doorway covering ~40 % of the patch, "prefer farther" took
+        // the wall 1.2 m behind the opening. The overlap / height test keeps the near wall, with or without aim.
+        val station = Vec2(2.9, 3.0)
+        val aim = Vec2(2.9, 0.0)
+        val mainWall = Line2(Vec2(0.0, 0.0), Vec2(1.0, 0.0))
+        for (useAim in listOf(true, false)) {
+            for (k in 0 until 6) {
+                val cap = capture(doorwayRoom, station, aim, 1.3, 4000L + k, useAim)
+                assertTrue(cap.fraction(2) > 0.25, "scene: the opening must cover a large part of the patch")
+                val o = assertNotNull(cap.fit.observation, "aim=$useAim/$k: ${cap.fit.failure}")
+                assertTrue(mainWall.distance(Vec2.lerp(o.extentStart, o.extentEnd, 0.5)) < 0.02, "aim=$useAim/$k took the wall behind")
+            }
+        }
+    }
+
+    private val furnishedRoom = SimRoom("Sofa", listOf(Vec2(0.0, 0.0), Vec2(6.0, 0.0), Vec2(6.0, 6.0), Vec2(0.0, 6.0))).withFurniture(
+        listOf(FurnitureBox(0, Vec2(0.0, 0.0), Vec2(1.0, 0.0), Vec2(0.0, 1.0), 1.5, 4.5, 0.8, 0.85)),
+    )
+
+    @Test fun wallBehindFurnitureWithAndWithoutAimPoint() {
+        val wall = Line2(Vec2(0.0, 0.0), Vec2(1.0, 0.0))
+        val station = Vec2(3.0, 2.6)
+        for (k in 0 until 4) {
+            // Aimed just above the sofa back: the wall. Without an aim point "prefer farther" finds it too.
+            for (useAim in listOf(true, false)) {
+                val cap = capture(furnishedRoom, station, Vec2(3.0, 0.0), 1.0, 5000L + k, useAim)
+                assertTrue(cap.fraction(RayHit.FURNITURE) > 0.2, "scene: the sofa must fill a good part of the patch")
+                val o = assertNotNull(cap.fit.observation, "aim=$useAim/$k: ${cap.fit.failure}")
+                assertTrue(wall.distance(Vec2.lerp(o.extentStart, o.extentEnd, 0.5)) < 0.02, "aim=$useAim/$k fitted the sofa")
+            }
+            // Aimed at the sofa itself, from where the wall above it is in view too: never return the sofa as
+            // a wall; ask to aim above it.
+            val onSofa = capture(furnishedRoom, Vec2(3.0, 3.6), Vec2(3.0, 0.8), 0.7, 5100L + k).fit
+            assertNull(onSofa.observation)
+            assertEquals(WallFitFailure.NO_DOMINANT_PLANE, onSofa.failure)
+            assertTrue("above furniture" in onSofa.failure!!.message)
+        }
+    }
+
+    @Test fun aimPointOnNothingFailsAndBadAimPointsAreIgnored() {
+        val cap = capture(bigRoom, Vec2(4.0, 2.0), Vec2(4.0, 0.0), 1.4, 6000L)
+        val viewer = cap.viewer
+        // An aim point 1 m in front of the wall (a lamp, a person): the crosshair is not on this wall.
+        val lamp = WallEstimator.fromPoints(cap.points, SIM_FLOOR_Y, SIM_CEILING_Y, viewer, aimPoint = Vec3.fromPlan(Vec2(4.0, 1.0), 1.4))
+        assertEquals(WallFitFailure.NO_DOMINANT_PLANE, lamp.failure)
+        // A non-finite aim point is ignored (same as none).
+        val nan = WallEstimator.fromPoints(cap.points, SIM_FLOOR_Y, SIM_CEILING_Y, viewer, aimPoint = Vec3(Double.NaN, 0.0, 0.0))
+        val none = WallEstimator.fromPoints(cap.points, SIM_FLOOR_Y, SIM_CEILING_Y, viewer)
+        assertEquals(none, nan)
+        assertNotNull(none.observation)
+        // A slightly noisy aim point (2 cm off the wall) still matches it.
+        val near = WallEstimator.fromPoints(cap.points, SIM_FLOOR_Y, SIM_CEILING_Y, viewer, aimPoint = Vec3.fromPlan(Vec2(4.0, 0.02), 1.4))
+        assertNotNull(near.observation)
+    }
+
+    @Test fun lineAnchorIsInsideTheObservedExtent() {
+        // RoomSolver rotates squared walls about the anchor: it must be the samples' centroid, inside the extent.
+        val o = assertNotNull(capture(bigRoom, Vec2(2.0, 2.5), Vec2(4.0, 0.0), 1.4, 7000L).fit.observation)
+        val t = o.line.param(o.line.point)
+        assertTrue(t > o.line.param(o.extentStart) && t < o.line.param(o.extentEnd), "anchor outside the extent")
     }
 
     // ---------------------------------------------------------------- fromPlane

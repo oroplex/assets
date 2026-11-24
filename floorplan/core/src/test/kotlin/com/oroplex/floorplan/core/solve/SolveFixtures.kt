@@ -47,6 +47,25 @@ internal fun wallsOf(corners: List<Vec2>, fraction: Double = 0.6, viewerDistance
     }
 }
 
+/**
+ * One observation per edge of the CCW [corners], each covering only [length] meters (capped at 80 % of
+ * the edge) around the point at [at] (0..1) along the edge: what a capture aimed there actually sees.
+ */
+internal fun patchWallsOf(
+    corners: List<Vec2>,
+    length: Double = 0.4,
+    at: Double = 0.5,
+    viewerDistance: Double = 1.0,
+): List<WallObservation> = corners.indices.map { i -> patchObs(corners[i], corners[(i + 1) % corners.size], length, at, viewerDistance) }
+
+/** A [length]-meter observed patch around the point at [at] (0..1) of the wall [a] -> [b] (interior on the left). */
+internal fun patchObs(a: Vec2, b: Vec2, length: Double = 0.4, at: Double = 0.5, viewerDistance: Double = 1.0): WallObservation {
+    val edge = a.distanceTo(b)
+    val half = minOf(length, 0.8 * edge) / 2 / edge
+    val c = at.coerceIn(half, 1 - half)
+    return wallObs(Vec2.lerp(a, b, c - half), Vec2.lerp(a, b, c + half), viewerDistance = viewerDistance)
+}
+
 /** Rotate an observation's line and extent about the extent midpoint by [deg] degrees (viewer unchanged). */
 internal fun perturb(o: WallObservation, deg: Double): WallObservation {
     val mid = Vec2.lerp(o.extentStart, o.extentEnd, 0.5)
@@ -61,6 +80,14 @@ internal fun assertVecEquals(expected: Vec2, actual: Vec2, eps: Double = 1e-9, m
 internal fun assertPolygonEquals(expected: List<Vec2>, actual: List<Vec2>, eps: Double = 1e-9) {
     assertEquals(expected.size, actual.size, "corner count of $actual")
     expected.indices.forEach { assertVecEquals(expected[it], actual[it], eps, "corner $it:") }
+}
+
+/** Same closed outline up to which corner it starts at (same orientation). */
+internal fun assertSameOutline(expected: List<Vec2>, actual: List<Vec2>, eps: Double = 1e-9) {
+    assertEquals(expected.size, actual.size, "corner count of $actual")
+    val shift = actual.indices.firstOrNull { actual[it].approxEquals(expected[0], eps) }
+    assertTrue(shift != null, "corner ${expected[0]} missing from $actual")
+    expected.indices.forEach { assertVecEquals(expected[it], actual[(it + shift) % actual.size], eps, "corner $it:") }
 }
 
 /** Shortest distance between two angles modulo [period]. */

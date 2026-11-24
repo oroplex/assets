@@ -1,5 +1,6 @@
 package com.oroplex.floorplan.core.sim
 
+import com.oroplex.floorplan.core.fit.RobustStats
 import com.oroplex.floorplan.core.fit.WallEstimator
 import com.oroplex.floorplan.core.fit.WallEstimatorConfig
 import com.oroplex.floorplan.core.fit.WallFit
@@ -55,7 +56,15 @@ internal data class ArDistortion(val scale: Double = 1.0, val origin: Vec3 = Vec
  * One simulated capture. [surfaceHits] counts the rays by the surface they hit first (wall index, or
  * [RayHit.FLOOR] / [RayHit.CEILING] / [RayHit.FURNITURE]).
  */
-internal class SimCapture(val fit: WallFit, val points: List<Vec3>, val viewer: Vec3, val surfaceHits: Map<Int, Int>) {
+internal class SimCapture(
+    val fit: WallFit,
+    val points: List<Vec3>,
+    val viewer: Vec3,
+    val surfaceHits: Map<Int, Int>,
+    val aimPoint: Vec3?,
+    /** First surface hit by the ray of each point in [points] (same order). */
+    val pointSurfaces: List<Int> = emptyList(),
+) {
     val rays: Int get() = surfaceHits.values.sum()
 
     fun fraction(surface: Int): Double = if (rays == 0) 0.0 else (surfaceHits[surface] ?: 0).toDouble() / rays
@@ -72,6 +81,8 @@ internal object ScanSimulator {
         rig: CaptureRig = CaptureRig(),
         distortion: ArDistortion = ArDistortion(),
         config: WallEstimatorConfig = WallEstimatorConfig(),
+        /** Pass the reticle hit (median of the center-ray hits) like the app does; false = legacy, no aim point. */
+        useAim: Boolean = true,
     ): SimCapture {
         val g = rig.gridSize
         val points = ArrayList<Vec3>(rig.frames * g * g)
@@ -82,6 +93,9 @@ internal object ScanSimulator {
         val half = (g - 1) / 2.0
         val tanShake = { tan(Math.toRadians(rng.nextGaussian() * rig.handAngleSigmaDeg)) }
         val surfaces = HashMap<Int, Int>()
+        val pointSurfaces = ArrayList<Int>(rig.frames * g * g)
+        val centerHits = ArrayList<Vec3>(rig.frames)
+        val centerIndex = if (g % 2 == 1) g / 2 else -1
         for (frame in 0 until rig.frames) {
             val cam = station + Vec3(
                 rng.nextGaussian() * rig.handPositionSigma,
@@ -106,7 +120,10 @@ internal object ScanSimulator {
                         t + rng.nextGaussian() * noise.sigma(t)
                     }
                     if (measured <= 0.05) continue
-                    points += distortion.apply(cam + d * measured)
+                    val p = distortion.apply(cam + d * measured)
+                    points += p
+                    pointSurfaces += hit.surface
+                    if (row == centerIndex && col == centerIndex) centerHits += p
                 }
             }
             val c = distortion.apply(cam)
@@ -115,8 +132,22 @@ internal object ScanSimulator {
             vz += c.z
         }
         val viewer = Vec3(vx / rig.frames, vy / rig.frames, vz / rig.frames)
-        val fit = WallEstimator.fromPoints(points, SIM_FLOOR_Y, SIM_CEILING_Y, viewer, config)
-        return SimCapture(fit, points, viewer, surfaces)
+        val aimPoint = if (useAim) aimPointOf(centerHits) else null
+        val fit = WallEstimator.fromPoints(points, SIM_FLOOR_Y, SIM_CEILING_Y, viewer, config, aimPoint)
+        return SimCapture(fit, points, viewer, surfaces, aimPoint, pointSurfaces)
+    }
+
+    /**
+     * The reticle hit the AR layer hands to the estimator: component-wise median of the center-ray depth
+     * hits over the sampling frames (robust to the occasional outlier), null when the center ray never hit.
+     */
+    fun aimPointOf(centerHits: List<Vec3>): Vec3? {
+        if (centerHits.isEmpty()) return null
+        return Vec3(
+            RobustStats.median(centerHits.map { it.x }),
+            RobustStats.median(centerHits.map { it.y }),
+            RobustStats.median(centerHits.map { it.z }),
+        )
     }
 
     /** Camera right / up vectors for a forward direction (world +Y up). */
@@ -166,8 +197,6 @@ internal class SimUser(
     val rig: CaptureRig = CaptureRig(),
     val distortion: ArDistortion = ArDistortion(),
     val config: WallEstimatorConfig = WallEstimatorConfig(),
-    /** When set, overrides [config] per attempt from the camera-to-aim distance (what-if experiments). */
-    val configForDistance: ((Double) -> WallEstimatorConfig)? = null,
     val maxAttempts: Int = 4,
     /** Height range (m) of the point on the wall the user aims at. */
     val aimHeight: ClosedFloatingPointRange<Double> = 1.0..1.8,
@@ -230,7 +259,7 @@ internal class SimUser(
                 noise = noise,
                 rig = rig,
                 distortion = distortion,
-                config = configForDistance?.invoke(station.distanceTo(aim.plan)) ?: config,
+                config = config,
             )
             lastHits = cap.surfaceHits
             val obs = cap.fit.observation
@@ -284,15 +313,6 @@ internal class SimUser(
         }
         return best
     }
-}
-
-/**
- * What-if estimator settings scaled with the expected depth noise σ(d) = 5 mm + 1.2 % · d at the capture
- * distance: inlier band max(2.5 cm, 2σ), noise gate max(3 cm, 1.5σ). Not a production default.
- */
-internal fun rangeAdaptiveConfig(distance: Double, noise: DepthNoise = DepthNoise()): WallEstimatorConfig {
-    val sigma = noise.sigma(distance)
-    return WallEstimatorConfig(inlierThreshold = max(0.025, 2.0 * sigma), maxRms = max(0.03, 1.5 * sigma))
 }
 
 /** Deterministic seed mixing (SplitMix64 finalizer over the key parts). */

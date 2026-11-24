@@ -1,7 +1,6 @@
 package com.oroplex.floorplan.core.sim
 
 import com.oroplex.floorplan.core.fit.RobustStats
-import com.oroplex.floorplan.core.fit.WallEstimatorConfig
 import com.oroplex.floorplan.core.fit.WallFitFailure
 import com.oroplex.floorplan.core.geometry.Bounds
 import com.oroplex.floorplan.core.geometry.Line2
@@ -47,15 +46,11 @@ internal class CalibrationOutcome(
 internal class SweepRow(
     val distance: Double,
     val trials: Int,
-    /** Failures with the default estimator config. */
+    /** Failures of the production estimator (with aim point). */
     val failures: Map<WallFitFailure, Int>,
-    val defaultOffsets: List<Double>,
-    /** |offset| of the fitted line at the aim point and |angle| error, TOO_NOISY gate relaxed (maxRms 0.10). */
-    val relaxedOffsets: List<Double>,
-    val relaxedAngles: List<Double>,
-    /** Same, with the range-adaptive config ([rangeAdaptiveConfig]). */
-    val wideOffsets: List<Double>,
-    val wideAngles: List<Double>,
+    /** |offset| of the fitted line at the aim point (m) and |angle| error (deg), accepted captures. */
+    val offsets: List<Double>,
+    val angles: List<Double>,
 ) {
     val successRate: Double get() = 1.0 - failures.values.sum().toDouble() / trials
 }
@@ -177,31 +172,18 @@ internal object SimScenarios {
     /** (c) +2 % AR scale on every hit and pose, then FloorOps.calibrate from one tape-measured wall. */
     val calibration: List<CalibrationOutcome> by lazy { SEED_SETS.map { runCalibration(it) } }
 
-    /**
-     * What-if (NOT the production defaults): (a) and (c) re-run with the same seeds and a noise-sized
-     * inlier band + relaxed noise gate ([WIDE_BAND]), to quantify how much of the residual error is due to
-     * the estimator's fixed 2.5 cm band / 3 cm gate.
-     */
-    val cleanAdaptive: List<RoomScan> by lazy {
-        scanAll(base = 1, userOf = { SimUser(it, configForDistance = { d -> rangeAdaptiveConfig(d) }) })
-    }
-    val calibrationAdaptive: List<CalibrationOutcome> by lazy { SEED_SETS.map { runCalibration(it, adaptive = true) } }
-
-    private fun floorScan(seedSet: Int, scale: Double, adaptive: Boolean): List<RoomScan> {
+    private fun floorScan(seedSet: Int, scale: Double): List<RoomScan> {
         val distortion = ArDistortion(scale = scale, origin = Vec3.ZERO)
         return truthRooms.mapIndexed { i, room ->
             val home = stations(room, i, seedSet).first()
-            val user = SimUser(
-                room, distortion = distortion,
-                configForDistance = if (adaptive) ({ d -> rangeAdaptiveConfig(d) }) else null,
-            )
+            val user = SimUser(room, distortion = distortion)
             scanRoom(user, i, 0, "s$seedSet/${home.first}", home.second, (0 until room.size).toList(), 300L + seedSet)
         }
     }
 
-    private fun runCalibration(seedSet: Int, adaptive: Boolean = false): CalibrationOutcome {
-        val raw = floorScan(seedSet, 1.02, adaptive)
-        val control = floorScan(seedSet, 1.0, adaptive)
+    private fun runCalibration(seedSet: Int): CalibrationOutcome {
+        val raw = floorScan(seedSet, 1.02)
+        val control = floorScan(seedSet, 1.0)
         val rooms = raw.mapIndexed { i, s ->
             Room(
                 id = "sim-room-$i",
@@ -270,22 +252,20 @@ internal object SimScenarios {
     }
 
     private val sweepRoom = SimRoom("Sweep 8x8", listOf(Vec2(0.0, 0.0), Vec2(8.0, 0.0), Vec2(8.0, 8.0), Vec2(0.0, 8.0)))
-    val RELAXED = WallEstimatorConfig(maxRms = 0.10)
-    val WIDE_BAND = WallEstimatorConfig(inlierThreshold = 0.06, maxRms = 0.10)
+
+    /** Distances of the sweep (m). */
+    val SWEEP_DISTANCES = listOf(0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5)
 
     /**
-     * Distance sweep: one flat wall (an 8 × 8 m room) seen head-on from 0.5–4 m, 30 captures each, with
-     * the default estimator config, with the TOO_NOISY gate relaxed and with a noise-sized inlier band.
+     * Distance sweep: one flat wall (an 8 x 8 m room) seen head-on from 0.5-4.5 m, 30 captures each, with
+     * the production estimator (range-adaptive band and noise gate, aim point).
      */
     val sweep: List<SweepRow> by lazy {
         val truth = Line2(Vec2(0.0, 0.0), Vec2(1.0, 0.0))
-        listOf(0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0).map { d ->
+        SWEEP_DISTANCES.map { d ->
             val failures = HashMap<WallFitFailure, Int>()
-            val def = ArrayList<Double>()
-            val relO = ArrayList<Double>()
-            val relA = ArrayList<Double>()
-            val wideO = ArrayList<Double>()
-            val wideA = ArrayList<Double>()
+            val offsets = ArrayList<Double>()
+            val angles = ArrayList<Double>()
             val trials = 30
             for (k in 0 until trials) {
                 val rng = Random(seedOf(91L, k.toLong()))
@@ -293,45 +273,38 @@ internal object SimScenarios {
                 val aim = Vec3.fromPlan(Vec2(aimX, 0.0), 1.0 + 0.8 * rng.nextDouble())
                 val station = Vec3.fromPlan(Vec2(aimX, d), CAMERA_HEIGHT)
                 val seed = seedOf(93L, (d * 1000).toLong(), k.toLong())
-                fun run(config: WallEstimatorConfig) = ScanSimulator.capture(sweepRoom, station, aim, Random(seed), config = config).fit
-                val p = Vec2(aimX, 0.0)
-                val fd = run(WallEstimatorConfig())
-                fd.failure?.let { failures.merge(it, 1, Int::plus) }
-                fd.observation?.let { def += abs(it.line.signedDistance(p)) }
-                run(RELAXED).observation?.let { o ->
-                    relO += abs(o.line.signedDistance(p))
-                    relA += Math.toDegrees(Math.asin(o.line.sinAngleTo(truth).coerceIn(0.0, 1.0)))
-                }
-                run(rangeAdaptiveConfig(d)).observation?.let { o ->
-                    wideO += abs(o.line.signedDistance(p))
-                    wideA += Math.toDegrees(Math.asin(o.line.sinAngleTo(truth).coerceIn(0.0, 1.0)))
+                val fit = ScanSimulator.capture(sweepRoom, station, aim, Random(seed)).fit
+                fit.failure?.let { failures.merge(it, 1, Int::plus) }
+                fit.observation?.let { o ->
+                    offsets += abs(o.line.signedDistance(Vec2(aimX, 0.0)))
+                    angles += Math.toDegrees(Math.asin(o.line.sinAngleTo(truth).coerceIn(0.0, 1.0)))
                 }
             }
-            SweepRow(d, trials, failures, def, relO, relA, wideO, wideA)
+            SweepRow(d, trials, failures, offsets, angles)
         }
     }
 
     /**
      * Grazing-incidence experiment: from the middle of the hallway (its pole of inaccessibility, 2.7 m from
      * the end walls) aim at the west end wall (wall 4) at several positions across it, 1.4 m high, 20
-     * captures each; does the fit land on the end wall or on a side wall seen at grazing incidence?
+     * captures each; does the fit land on the end wall or on a side wall seen at grazing incidence? Run with
+     * the aim point (production) and without it (the estimator's fallback heuristics alone).
      */
     val grazing: List<GrazingRow> by lazy {
         val hall = truthRooms.first { it.name == "Hallway" }
         val edge = 3
         val station = Vec3.fromPlan(hall.pole, CAMERA_HEIGHT)
         val user = SimUser(hall)
-        listOf(0.2, 0.35, 0.5, 0.65, 0.8).flatMap { s ->
-            val d = hall.pole.distanceTo(hall.pointOn(edge, 0.5))
-            listOf(
-                "default" to WallEstimatorConfig(), "relaxed" to RELAXED, "wide6cm" to WIDE_BAND, "adaptive" to rangeAdaptiveConfig(d),
-            ).map { (name, cfg) ->
+        listOf(0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9).flatMap { s ->
+            listOf("aim" to true, "no aim" to false).map { (name, useAim) ->
                 var on = 0
                 var wrong = 0
                 var failed = 0
                 for (k in 0 until 20) {
                     val aim = Vec3.fromPlan(hall.pointOn(edge, s), 1.4)
-                    val fit = ScanSimulator.capture(hall, station, aim, Random(seedOf(97L, (s * 100).toLong(), k.toLong())), config = cfg).fit
+                    val fit = ScanSimulator.capture(
+                        hall, station, aim, Random(seedOf(97L, (s * 100).toLong(), k.toLong())), useAim = useAim,
+                    ).fit
                     val o = fit.observation
                     when {
                         o == null -> failed++
@@ -371,8 +344,9 @@ internal object SimScenarios {
         appendLine(
             "Ground truth: SampleProjects.demo (8 rooms). Camera 1.4 m high; per wall 15 frames x 81 rays (9x9 grid, " +
                 "+-12 deg) aimed at a random point of the middle 60 % of the edge, 1.0-1.8 m high; first surface hit; " +
-                "depth noise sigma = 5 mm + 1.2 % of range along the ray; 10 % outliers; floorY 0, ceilingY 2.44; " +
-                "default SolverOptions. ${SEED_SETS.count()} seed sets x 2 stations per room unless noted. On TOO_NOISY/TOO_FAR " +
+                "depth noise sigma = 5 mm + 1.2 % of range along the ray; 10 % outliers; floorY 0, ceilingY 2.44; the " +
+                "AR layer passes the aim point (median of the center-ray hits) like the app; production WallEstimatorConfig " +
+                "and default SolverOptions. ${SEED_SETS.count()} seed sets x 2 stations per room unless noted. On TOO_NOISY/TOO_FAR " +
                 "the simulated user steps closer (to 60 %), on NO_DOMINANT_PLANE/TOO_FEW_POINTS re-aims (max 4 tries).",
         )
         appendLine(
@@ -410,14 +384,6 @@ internal object SimScenarios {
         append(sweepSection())
         appendLine()
         append(grazingSection())
-        appendLine()
-        appendLine(
-            "######## WHAT-IF (not production defaults): range-adaptive estimator config per capture, inlierThreshold = " +
-                "max(2.5 cm, 2 sigma(d)), maxRms = max(3 cm, 1.5 sigma(d)); same seeds as (a) / (c)",
-        )
-        append(SimReport.section("(a') clean walls, range-adaptive band", cleanAdaptive))
-        appendLine()
-        append(calibrationSection("(c')", calibrationAdaptive))
     }
 
     private fun furnitureStats(scans: List<RoomScan>): List<String> {
@@ -473,19 +439,16 @@ internal object SimScenarios {
 
     private fun sweepSection(): String = buildString {
         appendLine("== distance sweep: flat wall head-on, 30 captures per distance (|off| = fitted line offset at the aim point)")
-        appendLine("  dist  ok%  default failures | default |off| med/max mm | gate relaxed |off| med/max mm, |ang| p95/max deg | range-adaptive |off| med/max, |ang| p95/max")
+        appendLine("  dist  ok%  failures         | |off| med / max mm | |ang| p95 / max deg")
         for (row in sweep) {
             val fails = row.failures.entries.sortedBy { it.key.name }.joinToString(",") { "${it.key.name}x${it.value}" }
             appendLine(
                 String.format(
                     Locale.ROOT,
-                    "  %4.1f  %3.0f  %-16s | %5s / %5s | %5s / %5s, %4s / %4s | %5s / %5s, %4s / %4s",
+                    "  %4.1f  %3.0f  %-16s | %6s / %6s     | %5s / %5s",
                     row.distance, 100 * row.successRate, fails.ifEmpty { "-" },
-                    q(row.defaultOffsets, 0.5, true), q(row.defaultOffsets, 1.0, true),
-                    q(row.relaxedOffsets, 0.5, true), q(row.relaxedOffsets, 1.0, true),
-                    q(row.relaxedAngles, 0.95, false), q(row.relaxedAngles, 1.0, false),
-                    q(row.wideOffsets, 0.5, true), q(row.wideOffsets, 1.0, true),
-                    q(row.wideAngles, 0.95, false), q(row.wideAngles, 1.0, false),
+                    q(row.offsets, 0.5, true), q(row.offsets, 1.0, true),
+                    q(row.angles, 0.95, false), q(row.angles, 1.0, false),
                 ),
             )
         }

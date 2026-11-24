@@ -78,6 +78,7 @@ import com.oroplex.floorplan.data.appContainer
 import com.oroplex.floorplan.ui.common.ConfirmDialog
 import com.oroplex.floorplan.ui.common.PlanThumbnail
 import com.oroplex.floorplan.ui.common.ProjectDetailsDialog
+import kotlinx.coroutines.launch
 
 /** Dialogs of the projects screen. */
 private sealed interface ListDialog {
@@ -113,12 +114,23 @@ fun ProjectListScreen(onOpenProject: (projectId: String) -> Unit, onOpenSettings
     LaunchedEffect(viewModel) {
         viewModel.events.collect { event ->
             when (event) {
-                is ProjectListEvent.Open -> openProject(event.projectId)
-                is ProjectListEvent.Message -> {
+                is ProjectListEvent.Open -> {
+                    // A request that waited while this screen was away (e.g. the user left right after tapping
+                    // Create) must not push the editor out of the blue later.
+                    if (!event.isStale(System.currentTimeMillis())) {
+                        snackbar.currentSnackbarData?.dismiss()
+                        openProject(event.projectId)
+                    }
+                }
+                // Shown in its own coroutine: showSnackbar suspends until the snackbar is gone (up to 10 s), and
+                // the collector must stay free to open a newly created project right away. SnackbarHostState
+                // still shows the messages one after another.
+                is ProjectListEvent.Message -> launch {
                     val undo = event.undo
                     val result = snackbar.showSnackbar(
                         message = event.text,
                         actionLabel = if (undo != null) "Undo" else null,
+                        withDismissAction = undo != null,
                         duration = if (undo != null) SnackbarDuration.Long else SnackbarDuration.Short,
                     )
                     if (result == SnackbarResult.ActionPerformed && undo != null) viewModel.restore(undo)

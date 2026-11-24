@@ -157,8 +157,13 @@ fun CeilingHeightDialog(room: Room, settings: PlanSettings, onConfirm: (Double?)
         text = {
             Column {
                 Text(
-                    if (room.ceilingHeight == null) "Not measured yet. Enter the floor-to-ceiling height of ${room.name}."
-                    else "Floor-to-ceiling height of ${room.name}.",
+                    when {
+                        room.ceilingHeight == null -> "Not measured yet. Enter the floor-to-ceiling height of ${room.name}."
+                        room.ceilingEstimated ->
+                            "This is the default height, not a measurement. Enter the real floor-to-ceiling height of " +
+                                "${room.name}, or tap Save to confirm it."
+                        else -> "Floor-to-ceiling height of ${room.name}."
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Spacer(Modifier.padding(4.dp))
@@ -507,21 +512,37 @@ fun ProjectSettingsDialog(settings: PlanSettings, onConfirm: (PlanSettings) -> U
     var toleranceText by rememberSaveable { mutableStateOf(formatNumber(settings.squareToleranceDeg)) }
     var showLengths by rememberSaveable { mutableStateOf(settings.showWallLengths) }
     var showAreas by rememberSaveable { mutableStateOf(settings.showRoomAreas) }
-    // The thickness field follows the unit choice made in this dialog.
+    var showOverall by rememberSaveable { mutableStateOf(settings.showOverallDimensions) }
+    // The length fields follow the unit choice made in this dialog.
     val fieldSettings = settings.copy(unitSystem = units, imperialDenominator = if (units == UnitSystem.IMPERIAL) denominator else settings.imperialDenominator)
-    // Last valid thickness; seeds the field again when a unit change recreates it.
+    // Last valid values; they seed the fields again when a unit change recreates them.
     var thickness by rememberSaveable { mutableStateOf(settings.wallThickness) }
+    var doorWidth by rememberSaveable { mutableStateOf(settings.defaultDoorWidth) }
+    var windowWidth by rememberSaveable { mutableStateOf(settings.defaultWindowWidth) }
     val thicknessField = rememberLengthFieldState(thickness, fieldSettings, smallUnits = true)
-    val keepThickness = { thicknessField.value?.takeIf { it in THICKNESS_RANGE }?.let { thickness = it } }
+    val doorField = rememberLengthFieldState(doorWidth, fieldSettings, smallUnits = true)
+    val windowField = rememberLengthFieldState(windowWidth, fieldSettings, smallUnits = true)
+    val keepLengths = {
+        thicknessField.value?.takeIf { it in THICKNESS_RANGE }?.let { thickness = it }
+        doorField.value?.takeIf { it in DOOR_WIDTH_RANGE }?.let { doorWidth = it }
+        windowField.value?.takeIf { it in WINDOW_WIDTH_RANGE }?.let { windowWidth = it }
+    }
     val thicknessValue = thicknessField.value
     val thicknessError = rangeError(thicknessValue, THICKNESS_RANGE, fieldSettings)
+    val doorValue = doorField.value
+    val doorError = rangeError(doorValue, DOOR_WIDTH_RANGE, fieldSettings)
+    val windowValue = windowField.value
+    val windowError = rangeError(windowValue, WINDOW_WIDTH_RANGE, fieldSettings)
     val tolerance = toleranceText.trim().replace(',', '.').toDoubleOrNull()
     val toleranceError = if (tolerance == null || tolerance !in TOLERANCE_RANGE) {
         "Between ${formatDegrees(TOLERANCE_RANGE.start)} and ${formatDegrees(TOLERANCE_RANGE.endInclusive)}"
     } else {
         null
     }
-    val valid = thicknessValue != null && thicknessError == null && (!square || toleranceError == null)
+    val valid = thicknessValue != null && thicknessError == null &&
+        doorValue != null && doorError == null &&
+        windowValue != null && windowError == null &&
+        (!square || toleranceError == null)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -534,7 +555,7 @@ fun ProjectSettingsDialog(settings: PlanSettings, onConfirm: (PlanSettings) -> U
                     selected = units,
                     label = { if (it == UnitSystem.IMPERIAL) "Feet & inches" else "Metric" },
                     onSelect = {
-                        keepThickness()
+                        keepLengths()
                         units = it
                     },
                 )
@@ -545,12 +566,16 @@ fun ProjectSettingsDialog(settings: PlanSettings, onConfirm: (PlanSettings) -> U
                         selected = denominator,
                         label = { if (it == 1) "1\"" else "1/$it\"" },
                         onSelect = {
-                            keepThickness()
+                            keepLengths()
                             denominator = it
                         },
                     )
                 }
-                LengthField(thicknessField, label = "Wall thickness", error = thicknessError, modifier = Modifier.fillMaxWidth())
+                LengthField(thicknessField, label = "Wall thickness", error = thicknessError, imeAction = ImeAction.Next, modifier = Modifier.fillMaxWidth())
+                HorizontalDivider()
+                Text("New doors & windows", style = MaterialTheme.typography.labelLarge)
+                LengthField(doorField, label = "Door width", error = doorError, imeAction = ImeAction.Next, modifier = Modifier.fillMaxWidth())
+                LengthField(windowField, label = "Window width", error = windowError, modifier = Modifier.fillMaxWidth())
                 HorizontalDivider()
                 SwitchRow(
                     title = "Square corners",
@@ -573,13 +598,19 @@ fun ProjectSettingsDialog(settings: PlanSettings, onConfirm: (PlanSettings) -> U
                 HorizontalDivider()
                 SwitchRow("Show wall lengths", null, showLengths) { showLengths = it }
                 SwitchRow("Show room areas", null, showAreas) { showAreas = it }
+                SwitchRow(
+                    title = "Show overall dimensions",
+                    subtitle = "Total width and depth of the floor, drawn around the plan.",
+                    checked = showOverall,
+                    onCheckedChange = { showOverall = it },
+                )
             }
         },
         confirmButton = {
             TextButton(
                 enabled = valid,
                 onClick = {
-                    if (thicknessValue != null) {
+                    if (thicknessValue != null && doorValue != null && windowValue != null) {
                         onConfirm(
                             settings.copy(
                                 unitSystem = units,
@@ -589,6 +620,9 @@ fun ProjectSettingsDialog(settings: PlanSettings, onConfirm: (PlanSettings) -> U
                                 squareToleranceDeg = if (square && tolerance != null) tolerance else settings.squareToleranceDeg,
                                 showWallLengths = showLengths,
                                 showRoomAreas = showAreas,
+                                showOverallDimensions = showOverall,
+                                defaultDoorWidth = doorValue,
+                                defaultWindowWidth = windowValue,
                             ),
                         )
                         onDismiss()
@@ -648,3 +682,7 @@ private val OPENING_HEIGHT_RANGE = 0.1..5.0
 private const val SILL_MAX = 3.0
 private val THICKNESS_RANGE = 0.02..0.6
 private val TOLERANCE_RANGE = 0.5..15.0
+// Same ranges as PlanSettings.sanitized(), so a stored default can always be saved back unchanged
+// (garage doors are up to ~5 m wide).
+private val DOOR_WIDTH_RANGE = 0.2..5.0
+private val WINDOW_WIDTH_RANGE = 0.1..6.0

@@ -17,6 +17,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.AlignHorizontalLeft
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AddCircleOutline
@@ -24,14 +25,17 @@ import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DoorFront
+import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.OpenWith
 import androidx.compose.material.icons.filled.Rotate90DegreesCcw
 import androidx.compose.material.icons.filled.Rotate90DegreesCw
 import androidx.compose.material.icons.filled.SquareFoot
 import androidx.compose.material.icons.filled.Straighten
+import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Window
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.SensorDoor
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -46,7 +50,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -61,6 +67,8 @@ import com.oroplex.floorplan.core.model.Opening
 import com.oroplex.floorplan.core.model.OpeningType
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.Room
+import com.oroplex.floorplan.core.solve.QualityLevel
+import com.oroplex.floorplan.core.solve.RoomQualityReport
 import com.oroplex.floorplan.ui.common.formatArea
 import com.oroplex.floorplan.ui.common.formatLength
 import java.util.Locale
@@ -91,14 +99,26 @@ class RoomPanelActions(
     val onEditCeiling: () -> Unit,
     val onOpenOpening: (Opening) -> Unit,
     val onToggleMove: () -> Unit,
+    val onSnap: () -> Unit,
     val onRotate: (degrees: Double) -> Unit,
     val onResolve: () -> Unit,
     val onDelete: () -> Unit,
     val onClose: () -> Unit,
 )
 
+/**
+ * Details and actions of the selected room. [quality] is its trust grade (null when it could not be graded);
+ * [snapTarget] names the room a move in progress would snap to.
+ */
 @Composable
-fun RoomPanel(room: Room, settings: PlanSettings, moveMode: Boolean, actions: RoomPanelActions) {
+fun RoomPanel(
+    room: Room,
+    settings: PlanSettings,
+    moveMode: Boolean,
+    actions: RoomPanelActions,
+    quality: RoomQualityReport? = null,
+    snapTarget: String? = null,
+) {
     val stats = remember(room) { safeStats(room) }
     PanelHeader(
         title = room.name,
@@ -119,21 +139,35 @@ fun RoomPanel(room: Room, settings: PlanSettings, moveMode: Boolean, actions: Ro
             IconButton(onClick = actions.onEditDetails) { Icon(Icons.Filled.Edit, contentDescription = "Rename room") }
         },
     )
-    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         StatCell("Size", stats?.let { "${settings.formatLength(it.length)} × ${settings.formatLength(it.width)}" } ?: "—")
         StatCell("Area", stats?.let { settings.formatArea(it.area) } ?: "—")
         StatCell(
             label = "Ceiling",
-            value = room.ceilingHeight?.let { settings.formatLength(it) } ?: "Not set",
-            modifier = Modifier.clickable(onClickLabel = "Edit ceiling height", onClick = actions.onEditCeiling),
+            value = ceilingText(room, settings),
+            modifier = Modifier
+                .heightIn(min = 48.dp)
+                .clickable(onClickLabel = "Edit ceiling height", role = Role.Button, onClick = actions.onEditCeiling),
             editable = true,
         )
     }
+    // Drawn rooms have no scan evidence to grade (the subtitle already says "drawn").
+    if (quality != null && quality.level != QualityLevel.MANUAL) QualitySummary(quality, room.warnings)
     if (moveMode) {
+        // Two lines either way, so the panel (and with it the plan) does not change height mid-drag.
         Text(
-            "Drag anywhere on the plan to move this room. Two fingers still zoom and pan.",
+            if (snapTarget != null) {
+                "Let go to snap to $snapTarget.\nThe dashed outline shows where it lands."
+            } else {
+                "Drag anywhere on the plan to move this room. Let go next to another room and it snaps into place."
+            },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.primary,
+            minLines = 2,
             modifier = Modifier.padding(vertical = 4.dp),
         )
     }
@@ -145,6 +179,7 @@ fun RoomPanel(room: Room, settings: PlanSettings, moveMode: Boolean, actions: Ro
             label = { Text("Move") },
             leadingIcon = { Icon(Icons.Filled.OpenWith, contentDescription = null, Modifier.size(18.dp)) },
         )
+        ActionChip("Snap to neighbour", Icons.AutoMirrored.Filled.AlignHorizontalLeft, null, onClick = actions.onSnap)
         ActionChip("90°", Icons.Filled.Rotate90DegreesCw, "Rotate 90° clockwise") { actions.onRotate(-90.0) }
         ActionChip("1°", null, "Rotate 1° clockwise", prefix = "−") { actions.onRotate(-1.0) }
         ActionChip("1°", null, "Rotate 1° counter-clockwise", prefix = "+") { actions.onRotate(1.0) }
@@ -245,7 +280,7 @@ fun CornerPanel(room: Room, cornerIndex: Int, onDelete: () -> Unit, onBackToRoom
         Text("Interior angle ${"%.1f".format(Locale.US, angle)}°", style = MaterialTheme.typography.bodyLarge)
     }
     Text(
-        "Drag the blue handle to move this corner. It snaps square to its neighbours.",
+        "Drag the blue handle to move this corner. It clicks into square corners and lines up with the other corners.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(vertical = 4.dp),
@@ -284,7 +319,7 @@ private fun PanelHeader(
 
 @Composable
 private fun StatCell(label: String, value: String, modifier: Modifier = Modifier, editable: Boolean = false) {
-    Column(modifier) {
+    Column(modifier, verticalArrangement = Arrangement.Center) {
         Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(value, style = MaterialTheme.typography.titleMedium)
@@ -321,6 +356,82 @@ private fun Warnings(warnings: List<String>) {
             }
         }
     }
+}
+
+/**
+ * Scan quality badge plus the reasons behind a grade below "good" (reasons that repeat a solver warning shown
+ * right below are left out).
+ */
+@Composable
+private fun QualitySummary(report: RoomQualityReport, warnings: List<String>) {
+    val style = qualityStyle(report.level)
+    Column(Modifier.padding(vertical = 4.dp)) {
+        Surface(
+            shape = RoundedCornerShape(50),
+            color = style.container,
+            modifier = Modifier.semantics(mergeDescendants = true) { contentDescription = "Scan quality: ${style.label}" },
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)) {
+                Icon(style.icon, contentDescription = null, tint = style.content, modifier = Modifier.size(16.dp))
+                Text(
+                    style.label,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = style.content,
+                    modifier = Modifier.padding(start = 6.dp),
+                )
+            }
+        }
+        if (report.level != QualityLevel.GOOD) {
+            report.reasons.filter { it.isNotBlank() && it !in warnings }.forEach { reason ->
+                Row(verticalAlignment = Alignment.Top, modifier = Modifier.padding(top = 4.dp)) {
+                    Icon(
+                        Icons.Outlined.Info,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp).padding(top = 2.dp),
+                    )
+                    Text(
+                        reason,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 6.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private class QualityStyle(val label: String, val icon: ImageVector, val container: Color, val content: Color)
+
+@Composable
+private fun qualityStyle(level: QualityLevel): QualityStyle = when (level) {
+    QualityLevel.GOOD -> QualityStyle("Good scan", Icons.Filled.Verified, GoodContainer, GoodContent)
+    QualityLevel.FAIR -> QualityStyle("Fair scan: worth a quick check", Icons.Outlined.Info, FairContainer, FairContent)
+    QualityLevel.POOR -> QualityStyle(
+        "Check this room",
+        Icons.Filled.Warning,
+        MaterialTheme.colorScheme.errorContainer,
+        MaterialTheme.colorScheme.onErrorContainer,
+    )
+    QualityLevel.MANUAL -> QualityStyle(
+        "Drawn by hand",
+        Icons.Filled.Draw,
+        MaterialTheme.colorScheme.surfaceVariant,
+        MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+private val GoodContainer = Color(0xFFE6F4EA)
+private val GoodContent = Color(0xFF0D652D)
+private val FairContainer = Color(0xFFFEF7E0)
+private val FairContent = Color(0xFF7A4F01)
+
+/** "8' 0\"", "8' 0\" (est.)" for an assumed default, or "Not set". */
+internal fun ceilingText(room: Room, settings: PlanSettings): String {
+    val height = room.ceilingHeight?.takeIf { it.isFinite() && it > 0 } ?: return "Not set"
+    val text = settings.formatLength(height)
+    return if (room.ceilingEstimated) "$text (est.)" else text
 }
 
 @Composable

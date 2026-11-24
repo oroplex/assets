@@ -3,6 +3,11 @@
 package com.oroplex.floorplan.ui.editor
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -15,13 +20,22 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.Undo
+import androidx.compose.material.icons.automirrored.outlined.FactCheck
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.IosShare
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.ViewInAr
+import androidx.compose.material.icons.filled._3dRotation
+import androidx.compose.material.icons.outlined.CropRotate
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.Rotate90DegreesCw
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.SquareFoot
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -34,8 +48,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ScrollableTabRow
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
@@ -48,6 +64,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -61,6 +80,7 @@ import com.oroplex.floorplan.ui.common.ConfirmDialog
 import com.oroplex.floorplan.ui.common.ProjectDetailsDialog
 import com.oroplex.floorplan.ui.common.TextInputDialog
 import com.oroplex.floorplan.ui.common.formatArea
+import kotlinx.coroutines.launch
 
 @Composable
 fun PlanEditorScreen(
@@ -79,15 +99,32 @@ fun PlanEditorScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     var dialog by remember { mutableStateOf<EditorDialog?>(null) }
+    var showFloorCheck by remember { mutableStateOf(false) }
+    // The overlap set the user hid the banner for; it comes back when the overlaps change.
+    var dismissedOverlaps by remember { mutableStateOf<List<Pair<String, String>>?>(null) }
 
     LaunchedEffect(viewModel) {
-        viewModel.messages.collect { snackbar.showSnackbar(it) }
+        viewModel.messages.collect { message ->
+            // Each snackbar runs in its own coroutine so the collector never waits for one to time out, and a
+            // newer message replaces the one on screen instead of queueing behind it.
+            snackbar.currentSnackbarData?.dismiss()
+            launch {
+                val undo = message.undoRevision
+                val result = snackbar.showSnackbar(
+                    message = message.text,
+                    actionLabel = if (undo != null) "Undo" else null,
+                    duration = if (undo != null) SnackbarDuration.Long else SnackbarDuration.Short,
+                )
+                if (result == SnackbarResult.ActionPerformed && undo != null) viewModel.undoRevision(undo)
+            }
+        }
     }
     BackHandler(enabled = state.selection != null) { viewModel.clearSelection() }
 
     val project = state.project
     val floor = state.floor
     val settings = state.settings
+    val open3d: (() -> Unit)? = floor?.takeIf { it.rooms.isNotEmpty() }?.let { f -> { onOpen3d(projectId, f.id) } }
 
     Scaffold(
         topBar = {
@@ -101,6 +138,7 @@ fun PlanEditorScreen(
                 onUndo = viewModel::undo,
                 onRedo = viewModel::redo,
                 onExport = { onExport(projectId) },
+                onOpen3d = open3d,
                 onProjectSettings = { dialog = EditorDialog.ProjectSettings },
                 onRenameProject = { dialog = EditorDialog.RenameProject },
             )
@@ -139,8 +177,13 @@ fun PlanEditorScreen(
                         FloorTabs(
                             floors = project.floors,
                             selectedFloorId = floor?.id,
+                            hasRooms = floor?.rooms?.isNotEmpty() == true,
+                            attentionCount = state.insights.attentionCount,
                             onSelect = viewModel::selectFloor,
                             onAdd = { dialog = EditorDialog.AddFloor },
+                            onCheck = { showFloorCheck = true },
+                            onStraighten = viewModel::straightenFloor,
+                            onRotate = { viewModel.rotateFloor(clockwise = true) },
                             onRename = { id -> dialog = EditorDialog.RenameFloor(id) },
                             onDelete = { id -> dialog = EditorDialog.DeleteFloor(id) },
                         )
@@ -153,9 +196,39 @@ fun PlanEditorScreen(
                                     settings = settings,
                                     selection = state.selection,
                                     moveMode = state.moveMode,
+                                    highlightRoomIds = state.highlightRoomIds,
+                                    guides = state.dragGuides,
                                     modifier = Modifier.fillMaxSize(),
                                 )
-                                if (floor.rooms.isEmpty()) EmptyFloor(Modifier.align(Alignment.Center))
+                                if (floor.rooms.isEmpty()) {
+                                    EmptyFloor(Modifier.align(Alignment.Center))
+                                }
+                                Column(
+                                    Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    val overlaps = state.insights.overlaps
+                                    AnimatedVisibility(
+                                        visible = overlaps.isNotEmpty() && overlaps != dismissedOverlaps && state.preview == null,
+                                        enter = fadeIn() + slideInVertically(),
+                                        exit = fadeOut() + slideOutVertically(),
+                                    ) {
+                                        OverlapBanner(
+                                            floor = floor,
+                                            overlaps = overlaps,
+                                            onShow = viewModel::focusRoom,
+                                            onDetails = { showFloorCheck = true },
+                                            onDismiss = { dismissedOverlaps = overlaps },
+                                        )
+                                    }
+                                    if (floor.rooms.isNotEmpty()) {
+                                        CanvasControls(
+                                            onFit = { viewModel.requestFit(floor.id) },
+                                            on3d = open3d,
+                                            modifier = Modifier.align(Alignment.End),
+                                        )
+                                    }
+                                }
                             } else {
                                 NoFloors(onAdd = { dialog = EditorDialog.AddFloor }, modifier = Modifier.align(Alignment.Center))
                             }
@@ -163,6 +236,20 @@ fun PlanEditorScreen(
                     }
                 }
             }
+        }
+    }
+
+    if (showFloorCheck) {
+        val checked = floor
+        if (checked == null) {
+            LaunchedEffect(Unit) { showFloorCheck = false }
+        } else {
+            FloorCheckSheet(
+                floor = checked,
+                issues = state.insights.issues,
+                onSelectRoom = viewModel::focusRoom,
+                onDismiss = { showFloorCheck = false },
+            )
         }
     }
 
@@ -185,6 +272,7 @@ private fun EditorTopBar(
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onExport: () -> Unit,
+    onOpen3d: (() -> Unit)?,
     onProjectSettings: () -> Unit,
     onRenameProject: () -> Unit,
 ) {
@@ -216,14 +304,18 @@ private fun EditorTopBar(
                     Icon(Icons.Filled.MoreVert, contentDescription = "More options")
                 }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                    DropdownMenuItem(text = { Text("Project settings") }, onClick = {
+                    MenuItem("3D view", Icons.Filled._3dRotation, enabled = onOpen3d != null) {
+                        menuOpen = false
+                        onOpen3d?.invoke()
+                    }
+                    MenuItem("Project settings", Icons.Outlined.Settings) {
                         menuOpen = false
                         onProjectSettings()
-                    })
-                    DropdownMenuItem(text = { Text("Rename project") }, onClick = {
+                    }
+                    MenuItem("Rename project", Icons.Outlined.DriveFileRenameOutline) {
                         menuOpen = false
                         onRenameProject()
-                    })
+                    }
                 }
             }
         },
@@ -234,8 +326,13 @@ private fun EditorTopBar(
 private fun FloorTabs(
     floors: List<Floor>,
     selectedFloorId: String?,
+    hasRooms: Boolean,
+    attentionCount: Int,
     onSelect: (String) -> Unit,
     onAdd: () -> Unit,
+    onCheck: () -> Unit,
+    onStraighten: () -> Unit,
+    onRotate: () -> Unit,
     onRename: (String) -> Unit,
     onDelete: (String) -> Unit,
 ) {
@@ -262,30 +359,70 @@ private fun FloorTabs(
                 } else {
                     Box(Modifier.weight(1f))
                 }
+                val checkDescription = when (attentionCount) {
+                    0 -> "Floor check"
+                    1 -> "Floor check, 1 item to review"
+                    else -> "Floor check, $attentionCount items to review"
+                }
+                IconButton(
+                    onClick = onCheck,
+                    enabled = selectedFloorId != null,
+                    modifier = Modifier.semantics { contentDescription = checkDescription },
+                ) {
+                    BadgedBox(badge = { if (attentionCount > 0) Badge { Text(if (attentionCount > 9) "9+" else "$attentionCount") } }) {
+                        Icon(Icons.AutoMirrored.Outlined.FactCheck, contentDescription = null)
+                    }
+                }
                 IconButton(onClick = onAdd) { Icon(Icons.Filled.Add, contentDescription = "Add floor") }
                 Box {
                     IconButton(onClick = { menuOpen = true }, enabled = selectedFloorId != null) {
                         Icon(Icons.Outlined.Edit, contentDescription = "Floor options")
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        DropdownMenuItem(text = { Text("Rename floor") }, onClick = {
+                        MenuItem("Floor check", Icons.AutoMirrored.Outlined.FactCheck) {
+                            menuOpen = false
+                            onCheck()
+                        }
+                        MenuItem("Straighten floor", Icons.Outlined.CropRotate, enabled = hasRooms) {
+                            menuOpen = false
+                            onStraighten()
+                        }
+                        MenuItem("Rotate floor 90°", Icons.Outlined.Rotate90DegreesCw, enabled = hasRooms) {
+                            menuOpen = false
+                            onRotate()
+                        }
+                        MenuItem("Rename floor", Icons.Outlined.DriveFileRenameOutline) {
                             menuOpen = false
                             selectedFloorId?.let(onRename)
-                        })
-                        DropdownMenuItem(
-                            text = { Text("Delete floor") },
-                            enabled = floors.size > 1,
-                            onClick = {
-                                menuOpen = false
-                                selectedFloorId?.let(onDelete)
-                            },
-                        )
+                        }
+                        HorizontalDivider()
+                        MenuItem("Delete floor", Icons.Outlined.Delete, enabled = floors.size > 1, destructive = true) {
+                            menuOpen = false
+                            selectedFloorId?.let(onDelete)
+                        }
                     }
                 }
             }
             HorizontalDivider()
         }
     }
+}
+
+@Composable
+private fun MenuItem(
+    label: String,
+    icon: ImageVector,
+    enabled: Boolean = true,
+    destructive: Boolean = false,
+    onClick: () -> Unit,
+) {
+    val color = if (destructive && enabled) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+    DropdownMenuItem(
+        text = { Text(label, color = if (enabled) color else color.copy(alpha = 0.38f)) },
+        leadingIcon = { Icon(icon, contentDescription = null, tint = if (enabled) color else color.copy(alpha = 0.38f)) },
+        enabled = enabled,
+        onClick = onClick,
+    )
 }
 
 /** Bottom panel for the current selection (nothing when no room is selected). */
@@ -296,21 +433,29 @@ private fun SelectionPanel(state: EditorUiState, viewModel: PlanEditorViewModel,
     val settings = state.settings
     EditorPanelSurface {
         when (selection) {
-            is Selection.Room -> RoomPanel(
-                room = room,
-                settings = settings,
-                moveMode = state.moveMode,
-                actions = RoomPanelActions(
-                    onEditDetails = { openDialog(EditorDialog.RoomDetails(room.id)) },
-                    onEditCeiling = { openDialog(EditorDialog.CeilingHeight(room.id)) },
-                    onOpenOpening = { openDialog(EditorDialog.EditOpening(room.id, it.id)) },
-                    onToggleMove = viewModel::toggleMoveMode,
-                    onRotate = { viewModel.rotateRoom(room.id, it) },
-                    onResolve = { openDialog(EditorDialog.Resolve(room.id)) },
-                    onDelete = { openDialog(EditorDialog.DeleteRoom(room.id)) },
-                    onClose = viewModel::clearSelection,
-                ),
-            )
+            is Selection.Room -> {
+                // Graded from the committed room, so a drag does not re-grade it on every frame.
+                val committed = state.floor?.rooms?.firstOrNull { it.id == room.id } ?: room
+                val quality = remember(committed) { viewModel.quality(committed) }
+                RoomPanel(
+                    room = room,
+                    settings = settings,
+                    moveMode = state.moveMode,
+                    quality = quality,
+                    snapTarget = state.dragGuides?.snapTargetName,
+                    actions = RoomPanelActions(
+                        onEditDetails = { openDialog(EditorDialog.RoomDetails(room.id)) },
+                        onEditCeiling = { openDialog(EditorDialog.CeilingHeight(room.id)) },
+                        onOpenOpening = { openDialog(EditorDialog.EditOpening(room.id, it.id)) },
+                        onToggleMove = viewModel::toggleMoveMode,
+                        onSnap = { viewModel.snapToNeighbour(room.id) },
+                        onRotate = { viewModel.rotateRoom(room.id, it) },
+                        onResolve = { openDialog(EditorDialog.Resolve(room.id)) },
+                        onDelete = { openDialog(EditorDialog.DeleteRoom(room.id)) },
+                        onClose = viewModel::clearSelection,
+                    ),
+                )
+            }
             is Selection.Wall -> WallPanel(
                 room = room,
                 wallIndex = selection.wallIndex,
@@ -479,15 +624,25 @@ private fun EmptyFloor(modifier: Modifier = Modifier) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Icon(
-            Icons.Outlined.SquareFoot,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(48.dp),
-        )
-        Text("No rooms on this floor yet", style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+        Surface(shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(80.dp)) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.Outlined.SquareFoot,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.size(40.dp),
+                )
+            }
+        }
         Text(
-            "Tap Scan room to measure a room with your camera, or Draw room to type in its dimensions.",
+            "No rooms on this floor yet",
+            style = MaterialTheme.typography.titleMedium,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+        Text(
+            "Tap Scan room to measure a room with your camera, or Draw room to type in its size. " +
+                "Scan the whole floor in one go and the rooms line up by themselves.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
@@ -498,7 +653,13 @@ private fun EmptyFloor(modifier: Modifier = Modifier) {
 @Composable
 private fun NoFloors(onAdd: () -> Unit, modifier: Modifier = Modifier) {
     Column(modifier.padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("This project has no floors.", style = MaterialTheme.typography.titleMedium)
+        Text("This project has no floors yet", style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+        Text(
+            "Add a floor to start scanning or drawing rooms.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
         Button(onClick = onAdd) { Text("Add a floor") }
     }
 }

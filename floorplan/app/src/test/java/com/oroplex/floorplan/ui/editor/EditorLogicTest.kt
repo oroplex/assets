@@ -232,4 +232,15 @@ class EditorLogicTest {
         assertEquals(d.squareToleranceDeg, fixed.squareToleranceDeg, 0.0)
         assertEquals(d.defaultCeilingHeight, fixed.defaultCeilingHeight, 0.0)
     }
+
+    @Test
+    fun sanitizedRepairsDefaultOpeningWidths() {
+        val custom = PlanSettings(defaultDoorWidth = 0.9144, defaultWindowWidth = 1.2192)
+        assertEquals(custom, custom.sanitized())
+        val d = PlanSettings()
+        val fixed = PlanSettings(defaultDoorWidth = -1.0, defaultWindowWidth = Double.POSITIVE_INFINITY).sanitized()
+        assertEquals(d.defaultDoorWidth, fixed.defaultDoorWidth, 0.0)
+        assertEquals(d.defaultWindowWidth, fixed.defaultWindowWidth, 0.0)
+        assertEquals(d.defaultWindowWidth, PlanSettings(defaultWindowWidth = 0.0).sanitized().defaultWindowWidth, 0.0)
+    }
 }

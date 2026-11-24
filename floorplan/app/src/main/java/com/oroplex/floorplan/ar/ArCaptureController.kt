@@ -37,7 +37,10 @@ data class ReticleHit(
 data class ArFrameState(
     val tracking: TrackingStatus = TrackingStatus.NOT_STARTED,
     val problem: TrackingProblem = TrackingProblem.INITIALIZING,
-    /** Current best floor height (world Y) from the largest upward plane well below the camera; null until found. */
+    /**
+     * Current best floor height (world Y): the LOWEST large (≥ 0.5 m²) upward plane 0.8–2.2 m below the
+     * camera, so beds, tables and islands above it never count; kept while no plane qualifies; null until found.
+     */
     val floorY: Double? = null,
     /** Area (m²) of the plane backing [floorY]; > ~1 m² means a confident floor. */
     val floorArea: Double = 0.0,
@@ -60,12 +63,17 @@ data class ArFrameState(
 }
 
 sealed interface MeasureRequest {
-    /** Lock the floor height: plane under the reticle if it is an upward plane, else the current best floor. */
+    /**
+     * Lock the floor height: plane under the reticle if it is an upward plane, else the current best floor,
+     * else (no floor plane detected) the median of depth / feature hits at the reticle over several frames
+     * while the phone points down at least 30°, when those readings agree.
+     */
     data object LockFloor : MeasureRequest
 
     /**
-     * Sample the wall under the reticle over [frames] frames (hit-test grid around screen center), then fit
-     * with WallEstimator (prefers a detected vertical plane under the reticle when it agrees with the points).
+     * Sample the wall under the reticle over [frames] frames (hit-test grid around screen center; more frames,
+     * up to 25, when the reticle is beyond 2.5 m), then fit with WallEstimator using the median reticle hit
+     * as the aim point. Falls back to a detected vertical plane under the reticle when the depth fit fails.
      */
     data class Wall(val floorY: Double, val ceilingY: Double?, val frames: Int = 15) : MeasureRequest
 
@@ -75,7 +83,10 @@ sealed interface MeasureRequest {
     /** Reticle hit on any surface (depth/plane/feature), median over [frames] frames. */
     data class SurfacePoint(val frames: Int = 8) : MeasureRequest
 
-    /** Ceiling height above [floorY]: reticle hits on downward planes / depth points, median over [frames]. */
+    /**
+     * Ceiling height above [floorY]: reticle hits on downward planes, or depth / feature hits on horizontal
+     * surfaces while aiming steeply up, more than 1.8 m above the floor; median of the upper cluster over [frames].
+     */
     data class CeilingHeight(val floorY: Double, val frames: Int = 15) : MeasureRequest
 }
 

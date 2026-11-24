@@ -49,13 +49,14 @@ internal class BackgroundRenderer {
             texCoordAttrib = GLES20.glGetAttribLocation(program, "a_TexCoord")
             textureUniform = GLES20.glGetUniformLocation(program, "u_Texture")
         }
-        // Until ARCore reports the display geometry, sample the texture unrotated.
-        quadTexCoords.put(IDENTITY_UV).position(0)
+        // quadTexCoords is a Java buffer, not a GL object: it survives a context loss and keeps the last
+        // computed (still correct) mapping. The renderer also forces a recompute on the next frame.
     }
 
     /**
      * Recomputes how the camera texture maps onto the screen quad. Call whenever
-     * [Frame.hasDisplayGeometryChanged] (rotation, viewport size, first frame).
+     * [Frame.hasDisplayGeometryChanged] (rotation, viewport size, first frame) and after the GL context or
+     * surface was recreated.
      */
     fun updateDisplayGeometry(frame: Frame) {
         frame.transformCoordinates2d(

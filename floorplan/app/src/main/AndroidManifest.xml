@@ -17,11 +17,20 @@
 
         <meta-data android:name="com.google.ar.core" android:value="required" />
 
+        <!--
+            configChanges: a recreated Activity tears down the ARCore session and its coordinate frame,
+            which would split a multi-room scan. The UI is Compose-only and re-reads Configuration on
+            onConfigurationChanged, so every change that can plausibly happen mid-scan on a Samsung phone
+            is handled in place: dark mode / Bedtime mode (uiMode), screen zoom or resolution (density),
+            pop-up view and split screen (smallestScreenSize, screenLayout, screenSize), font size and bold
+            text (fontScale, fontWeightAdjustment), a Bluetooth keyboard or HID laser meter (keyboard,
+            keyboardHidden, navigation), language (locale, layoutDirection) and display color mode.
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:screenOrientation="portrait"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|fontWeightAdjustment|locale|layoutDirection|colorMode"
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.FloorPlan">
             <intent-filter>

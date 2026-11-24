@@ -57,8 +57,8 @@ internal enum class ArSetupError(val title: String, val message: String, val act
     ),
     CAMERA_UNAVAILABLE(
         title = "Camera unavailable",
-        message = "The camera couldn't be opened. Another app may be using it. Close other camera apps and " +
-            "try again.",
+        message = "The camera couldn't be opened. Close other apps that use the camera, check that camera " +
+            "access is on in Quick settings, then try again.",
         action = ArSetupAction.RETRY,
     ),
     SESSION_FAILED(

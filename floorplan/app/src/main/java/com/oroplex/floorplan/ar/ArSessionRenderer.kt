@@ -45,6 +45,14 @@ internal class ArSessionRenderer(
     private var cameraLostReported = false
     private var seenResumeCount = -1
 
+    /**
+     * The camera UVs must be recomputed on the next frame even if ARCore reports no display-geometry
+     * change: after the EGL context is recreated (or the surface changes) the geometry ARCore knows is
+     * unchanged, so [com.google.ar.core.Frame.hasDisplayGeometryChanged] can stay false (AR layer AR-3).
+     * Cleared once a frame with a camera image was mapped.
+     */
+    private var uvUpdatePending = true
+
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         try {
@@ -52,14 +60,17 @@ internal class ArSessionRenderer(
         } catch (e: Exception) {
             Log.e(TAG, "Creating the camera background failed", e)
         }
-        // A new EGL context invalidates the old texture name: re-bind before the next update().
+        // A new EGL context invalidates the old texture name: re-bind before the next update(), and
+        // re-map the camera image onto the screen quad on the next frame.
         textureBound = false
+        uvUpdatePending = true
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         GLES20.glViewport(0, 0, width, height)
         viewportWidth = width
         viewportHeight = height
+        uvUpdatePending = true
         // The GL thread can run before Session.resume() returned on the main thread; ARCore calls are only
         // made while running. Otherwise the geometry is applied before the first update() instead.
         if (!controller.isRunning || controller.isClosed) {
@@ -105,9 +116,13 @@ internal class ArSessionRenderer(
             cameraFailingSinceNs = NOT_FAILING
             cameraLostReported = false
 
-            if (frame.hasDisplayGeometryChanged()) background.updateDisplayGeometry(frame)
             // Timestamp 0: the camera has not produced its first image yet; nothing valid to draw.
-            if (frame.timestamp == 0L) return
+            val hasImage = frame.timestamp != 0L
+            if (frame.hasDisplayGeometryChanged() || uvUpdatePending) {
+                background.updateDisplayGeometry(frame)
+                if (hasImage) uvUpdatePending = false
+            }
+            if (!hasImage) return
 
             background.draw()
             controller.onFrame(session, frame, viewportWidth, viewportHeight)

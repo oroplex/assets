@@ -1,7 +1,6 @@
 package com.oroplex.floorplan.ar
 
 import android.opengl.Matrix
-import android.util.Log
 import com.google.ar.core.Anchor
 import com.google.ar.core.Camera
 import com.google.ar.core.Frame
@@ -66,6 +65,13 @@ internal class ArCoreCaptureController(
     var resumeCount: Int = 0
         private set
 
+    /**
+     * The floor height the capture flow locked ([setReferenceFloor]); written on the main thread, read on
+     * the GL thread. Only used for the reticle; the floor tracker stays an independent estimate.
+     */
+    @Volatile
+    private var referenceFloorY: Double? = null
+
     // ---- GL-thread state ----
     private val engine = MeasurementEngine(incomingMeasurements)
     private val floorTracker = FloorTracker()
@@ -73,7 +79,23 @@ internal class ArCoreCaptureController(
     private val projectionMatrix = FloatArray(16)
     private var lastFrameTimestamp = Long.MIN_VALUE
     private var lastTracking = false
-    private val anchorErrors = ThrottledLog(TAG)
+    private val anchorErrors = ThrottledLog()
+    private val trackingChanges = ChangeLog(TRACKING_LOG_INTERVAL_NS)
+    private var loggedResumeCount = -1
+
+    override fun setReferenceFloor(y: Double?) {
+        val value = y?.takeIf { it.isFinite() }
+        if (value == referenceFloorY) return
+        referenceFloorY = value
+        // Called every frame by the capture flow; only a change is logged (a lock, a re-lock, a new session).
+        val tracked = mutableFrameState.value
+        ArLog.i(
+            "locked floor: " + (value?.let { "y=${it.fmt(3)}" } ?: "none") +
+                " (tracker: local ${tracked.localFloorY?.let { "y=${it.fmt(3)}" } ?: "none"}, " +
+                "global ${tracked.floorY?.let { "y=${it.fmt(3)}" } ?: "none"}, " +
+                "auto-lock ${if (tracked.floorAutoLockable) "allowed" else "not allowed"})",
+        )
+    }
 
     override suspend fun measure(request: MeasureRequest): MeasureResult {
         invalidRequestReason(request)?.let { return MeasureResult.Failed(it) }
@@ -101,7 +123,7 @@ internal class ArCoreCaptureController(
     override fun createRoomAnchor(roomId: String, position: Vec3) {
         if (isClosed) return
         if (!position.isFinite()) {
-            Log.w(TAG, "Ignoring room anchor with non-finite position for $roomId")
+            ArLog.w("ignoring a room anchor with a non-finite position")
             return
         }
         pendingAnchors += AnchorRequest(roomId, position)
@@ -124,13 +146,15 @@ internal class ArCoreCaptureController(
         if (isClosed) return
         resumeCount++
         isRunning = true
+        ArLog.i("session resumed (resume #$resumeCount, session ${sessionId.take(8)})")
     }
 
     /** The GL thread is paused and Session.pause() returned: fail everything in flight. */
     fun onSessionPaused() {
         isRunning = false
-        failOutstanding(MSG_PAUSED)
+        val failed = failOutstanding(MSG_PAUSED)
         publishWithoutPose(TrackingStatus.PAUSED, mutableFrameState.value.problem)
+        ArLog.i("session paused" + if (failed > 0) " ($failed measurement(s) interrupted)" else "")
     }
 
     /**
@@ -144,13 +168,21 @@ internal class ArCoreCaptureController(
         failOutstanding(MSG_CLOSED)
         incomingMeasurements.clear()
         pendingAnchors.clear()
+        val anchorCount = anchors.size
         for (anchor in anchors.values) detachQuietly(anchor)
         anchors.clear()
         publishWithoutPose(TrackingStatus.STOPPED, mutableFrameState.value.problem)
+        ArLog.i("session closed ($anchorCount room anchor(s), ${anchorPoses.values.count { it.tracking }} still tracking)")
     }
 
-    private fun failOutstanding(reason: String) {
-        for (job in outstandingMeasurements) job.complete(MeasureResult.Failed(reason))
+    /** Fails every measurement in flight with [reason]; returns how many there were. */
+    private fun failOutstanding(reason: String): Int {
+        var count = 0
+        for (job in outstandingMeasurements) {
+            if (!job.isDone) count++
+            job.complete(MeasureResult.Failed(reason))
+        }
+        return count
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -175,13 +207,18 @@ internal class ArCoreCaptureController(
 
         val camera = frame.camera
         val trackingState = camera.trackingState
+        val failureReason = camera.trackingFailureReason
         val tracking = trackingState == TrackingState.TRACKING
+        logSessionProgress(nowNs, camera, trackingState, failureReason, viewportWidth, viewportHeight)
 
         var cameraPosition: Vec3? = null
+        var cameraForward: Vec3? = null
         var viewProjection: FloatArray? = null
         var invViewProjection: FloatArray? = null
         if (tracking) {
-            cameraPosition = camera.pose.position().takeIf { it.isFinite() }
+            val pose = camera.pose
+            cameraPosition = pose.position().takeIf { it.isFinite() }
+            cameraForward = pose.forward()
             viewProjection = computeViewProjection(camera)
             invViewProjection = viewProjection?.let { vp ->
                 FloatArray(16).takeIf { Matrix.invertM(it, 0, vp, 0) }
@@ -203,14 +240,20 @@ internal class ArCoreCaptureController(
         val floorLikeHitY = cameraPosition?.takeIf { poseValid && centerHits.isNotEmpty() }?.let {
             HitTesting.floorFallbackSample(centerHits, it).world?.y
         }
+        val lockedFloorY = referenceFloorY
         val floor = floorTracker.update(
             session.getAllTrackables(Plane::class.java),
-            cameraPosition?.takeIf { poseValid }?.y,
+            cameraPosition?.takeIf { poseValid },
             floorLikeHitY,
             nowNs,
+            floorLocked = lockedFloorY != null,
         )
+        // The reticle follows the floor the capture flow LOCKED, so it agrees with FloorPoint measurements
+        // and still works on a featureless floor after a depth-fallback lock (ARX-4). Before a lock it uses
+        // the tracker: the floor under the user, else the session-wide estimate.
+        val reticleFloorY = lockedFloorY ?: floor.local?.y ?: floor.global?.y
         val reticle = cameraPosition?.takeIf { poseValid }?.let {
-            HitTesting.resolveReticle(centerHits, it, floor?.y, invViewProjection, viewportWidth, viewportHeight)
+            HitTesting.resolveReticle(centerHits, it, reticleFloorY, invViewProjection, viewportWidth, viewportHeight)
         }
 
         engine.onFrame(
@@ -224,7 +267,8 @@ internal class ArCoreCaptureController(
                 invViewProjection = invViewProjection,
                 centerHits = centerHits,
                 reticle = reticle,
-                floor = floor,
+                localFloor = floor.local,
+                depthEnabled = depthEnabled,
             ),
         )
 
@@ -232,9 +276,9 @@ internal class ArCoreCaptureController(
 
         mutableFrameState.value = ArFrameState(
             tracking = trackingState.toStatus(),
-            problem = problemFor(trackingState, camera.trackingFailureReason),
-            floorY = floor?.y,
-            floorArea = floor?.area ?: 0.0,
+            problem = problemFor(trackingState, failureReason),
+            floorY = floor.global?.y,
+            floorArea = floor.global?.area ?: 0.0,
             reticle = reticle?.hit,
             cameraPosition = cameraPosition,
             viewProjection = viewProjection,
@@ -245,7 +289,48 @@ internal class ArCoreCaptureController(
             horizontalPlanes = floorTracker.horizontalPlanes,
             verticalPlanes = floorTracker.verticalPlanes,
             timestampNs = timestamp,
+            localFloorY = floor.local?.y,
+            floorAutoLockable = poseValid && floor.autoLockable,
+            cameraForward = cameraForward?.takeIf { poseValid },
         )
+    }
+
+    /**
+     * Diagnostics for things that are checked every frame but logged only when they change: the first
+     * camera image after each resume (with the viewport and the camera intrinsics ARCore reports, which
+     * must stay the same from session to session now that focus is fixed) and the tracking state with its
+     * failure reason.
+     */
+    private fun logSessionProgress(
+        nowNs: Long,
+        camera: Camera,
+        state: TrackingState?,
+        reason: TrackingFailureReason?,
+        viewportWidth: Int,
+        viewportHeight: Int,
+    ) {
+        try {
+            if (loggedResumeCount != resumeCount) {
+                loggedResumeCount = resumeCount
+                val intrinsics = try {
+                    val i = camera.imageIntrinsics
+                    val focal = i.focalLength
+                    val center = i.principalPoint
+                    val size = i.imageDimensions
+                    "image ${size[0]}x${size[1]}, focal length ${focal[0].toDouble().fmt(1)} x " +
+                        "${focal[1].toDouble().fmt(1)} px, principal point ${center[0].toDouble().fmt(1)}, " +
+                        center[1].toDouble().fmt(1)
+                } catch (e: Exception) {
+                    "intrinsics unavailable"
+                }
+                ArLog.i("first camera image after resume #$resumeCount, viewport ${viewportWidth}x$viewportHeight, $intrinsics")
+            }
+            trackingChanges.offer(nowNs, state to reason) {
+                "tracking: ${state ?: "unknown"}" + if (state == TrackingState.TRACKING || reason == null) "" else " ($reason)"
+            }?.let { ArLog.i(it) }
+        } catch (e: Exception) {
+            // Diagnostics only.
+        }
     }
 
     /**
@@ -281,7 +366,7 @@ internal class ArCoreCaptureController(
                 pendingAnchors += request // tracking dropped this very frame; retry on a later one
                 break
             } catch (e: Exception) {
-                Log.w(TAG, "Could not create the anchor for room ${request.roomId}", e)
+                ArLog.w("could not create a room anchor", e)
                 continue
             }
             val initial = try {
@@ -292,12 +377,17 @@ internal class ArCoreCaptureController(
             if (initial == null) {
                 // A glitched pose would poison anchorCorrections(); try again on a later frame (bounded).
                 detachQuietly(anchor)
-                if (request.attempts < MAX_ANCHOR_ATTEMPTS) pendingAnchors += request.retried()
+                if (request.attempts < MAX_ANCHOR_ATTEMPTS) {
+                    pendingAnchors += request.retried()
+                } else {
+                    ArLog.w("gave up on a room anchor: its pose stayed unusable for $MAX_ANCHOR_ATTEMPTS frames")
+                }
                 break
             }
             anchors.put(request.roomId, anchor)?.let { replaced -> detachQuietly(replaced) }
             anchorPoses[request.roomId] =
                 AnchorPoses(initial, initial, tracking = anchor.trackingState == TrackingState.TRACKING)
+            ArLog.i("room anchor created (${anchors.size} in this session)")
         }
     }
 
@@ -305,7 +395,7 @@ internal class ArCoreCaptureController(
         try {
             anchor.detach()
         } catch (e: Exception) {
-            Log.w(TAG, "Anchor.detach failed", e)
+            ArLog.w("Anchor.detach failed", e)
         }
     }
 
@@ -321,7 +411,7 @@ internal class ArCoreCaptureController(
             val current = try {
                 if (anchor.trackingState == TrackingState.TRACKING) anchor.pose.toPlanTransform() else null
             } catch (e: Exception) {
-                anchorErrors.warn("Reading the anchor pose for room $roomId failed", e)
+                anchorErrors.warn("reading a room anchor's pose failed", e)
                 null
             }
             anchorPoses[roomId] = if (current != null && current.isFinite()) {
@@ -332,6 +422,11 @@ internal class ArCoreCaptureController(
         }
     }
 
+    /**
+     * Publishes a state without anything that needs a camera pose: overlays hide, and the floor under the
+     * user is unknown (so nothing auto-locks) until a tracking frame says otherwise. The session-wide floor
+     * estimate is kept.
+     */
     private fun publishWithoutPose(tracking: TrackingStatus, problem: TrackingProblem) {
         mutableFrameState.value = mutableFrameState.value.copy(
             tracking = tracking,
@@ -339,6 +434,9 @@ internal class ArCoreCaptureController(
             reticle = null,
             cameraPosition = null,
             viewProjection = null,
+            localFloorY = null,
+            floorAutoLockable = false,
+            cameraForward = null,
         )
     }
 
@@ -356,9 +454,11 @@ internal class ArCoreCaptureController(
     )
 
     companion object {
-        private const val TAG = "ArCaptureController"
         const val NEAR_PLANE = 0.05f
         const val FAR_PLANE = 100f
+
+        /** Tracking-state changes are logged at most this often (a flapping state is summarized). */
+        private const val TRACKING_LOG_INTERVAL_NS = 250_000_000L
 
         /** A room anchor whose pose keeps coming back unusable is given up after this many frames. */
         private const val MAX_ANCHOR_ATTEMPTS = 30
@@ -399,15 +499,5 @@ internal class ArCoreCaptureController(
                 else -> TrackingProblem.INITIALIZING
             }
         }
-    }
-}
-
-/** Rate-limited warning log for errors that can repeat every frame. Not thread-safe (GL thread). */
-internal class ThrottledLog(private val tag: String, private val every: Int = 300) {
-    private var count = 0
-
-    fun warn(message: String, error: Throwable) {
-        if (count % every == 0) Log.w(tag, "$message (occurrence ${count + 1})", error)
-        count++
     }
 }

@@ -2,6 +2,8 @@ package com.oroplex.floorplan.ar
 
 import com.oroplex.floorplan.core.fit.RobustStats
 import com.oroplex.floorplan.core.fit.WallEstimatorConfig
+import com.oroplex.floorplan.core.geometry.Line2
+import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.geometry.Vec3
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -169,8 +171,9 @@ internal object FloorLockFallback {
 }
 
 /**
- * Wall sampling policy: how many frames to sample and which point the user aimed at.
- * Depth-from-motion noise grows with range (≈ 5 mm + 1.2 % of the distance), so far walls get more frames.
+ * Wall sampling policy: how many frames to sample, the height band wall points must lie in, and which point
+ * the user aimed at. Depth-from-motion noise grows with range (≈ 5 mm + 1.2 % of the distance), so far walls
+ * get more frames.
  */
 internal object WallSampling {
     /** Beyond this crosshair distance (m) the sampler collects [LONG_RANGE_FRAMES] frames. */
@@ -194,6 +197,9 @@ internal object WallSampling {
             baseFrames
         }
 
+    /** The most frames a wall capture requested with [baseFrames] can ever collect (the long-range count). */
+    fun maxFrames(baseFrames: Int): Int = max(baseFrames, LONG_RANGE_FRAMES)
+
     /**
      * Whether sampling is done after [frames] frames: never before [baseFrames]; then once the range-based
      * target is reached, or when [elapsedNs] since the first sampled frame exceeds [LONG_RANGE_BUDGET_NS].
@@ -205,9 +211,25 @@ internal object WallSampling {
     }
 
     /**
-     * Height band in which wall points are used, matching [WallEstimatorConfig] defaults: from
-     * floorY + minHeightAboveFloor up to the measured ceiling (or the assumed height when it is missing
-     * or leaves no band) minus minDistanceBelowCeiling.
+     * THE completion rule of a wall capture (the sampler calls nothing else, ARX-3): done after [baseFrames]
+     * frames for a wall within [LONG_RANGE_DISTANCE], after [LONG_RANGE_FRAMES] for a farther one (so far
+     * walls really get the extra frames), earlier than that only when the time budget ran out, and in any
+     * case at the hard cap [maxFrames]. [aimDistance] is the median crosshair distance so far (null =
+     * unknown).
+     */
+    fun isDone(frames: Int, baseFrames: Int, aimDistance: Double?, elapsedNs: Long): Boolean =
+        frames >= maxFrames(baseFrames) || isComplete(frames, baseFrames, aimDistance, elapsedNs)
+
+    /**
+     * Height band (world Y) in which wall points are used, from a [MeasureRequest.Wall]'s floorY / ceilingY.
+     * [ceilingY] is the band TOP the capture flow chose (a measured ceiling, or a generous assumed top when
+     * the ceiling was not measured); the band runs from floorY + minHeightAboveFloor up to
+     * ceilingY − minDistanceBelowCeiling. Without a usable [ceilingY] (null, non-finite, or leaving no
+     * band) the top is floorY + assumedCeilingHeight − minDistanceBelowCeiling.
+     *
+     * This is the same band [com.oroplex.floorplan.core.fit.WallEstimator.fromPoints] filters with for the
+     * same floorY / ceilingY (a unit test holds the two together), so the aim point, the fit and the
+     * diagnostics always agree on what counts as "on the wall" (CAPX-8).
      */
     fun wallBand(floorY: Double, ceilingY: Double?, config: WallEstimatorConfig = WallEstimatorConfig()): ClosedFloatingPointRange<Double> {
         val low = floorY + config.minHeightAboveFloor
@@ -230,4 +252,192 @@ internal object WallSampling {
         if (inBand.size < max(MIN_AIM_SAMPLES, (frames + 2) / 3)) return null
         return MeasurementMath.componentMedian(inBand).takeIf { it.isFinite() }
     }
+}
+
+/** What a wall sample was measured from. */
+internal enum class WallSampleKind { DEPTH, PLANE, FEATURE }
+
+/** One wall sample: a world point and the kind of ARCore hit it came from. */
+internal class WallSample(val world: Vec3, val kind: WallSampleKind)
+
+/**
+ * Which hit along one ray becomes the wall sample (MATH-5).
+ *
+ * ARCore sorts a ray's hits nearest first, and with depth enabled a ray that crosses a detected wall plane
+ * yields BOTH a DepthPoint and a plane hit. Taking the first usable hit therefore returns
+ * min(depth, plane): depth errors toward the viewer are kept, errors away from it are replaced by the plane
+ * point. That one-sided censoring pulls every fitted wall toward the camera (about 0.5–1.7 cm at 1.5–3.5 m,
+ * on both of two opposite walls, so rooms come out small). So the choice must not depend on which hit is
+ * nearer:
+ * - a DepthPoint always wins: it is the measurement, with unbiased noise the estimator models, and it is
+ *   what is really along the ray (ARCore plane polygons are convex hulls and span doorways);
+ * - without one, a VERTICAL plane hit (front side, inside the polygon) is used;
+ * - feature points are only used when depth is disabled for the session, and then after a plane hit.
+ */
+internal object WallSampleRule {
+    /**
+     * [depth], [plane], [feature]: the first usable hit of each kind along the ray (nearest of its kind),
+     * or null. [depthEnabled] is whether the session runs the Depth API.
+     */
+    fun choose(depth: Vec3?, plane: Vec3?, feature: Vec3?, depthEnabled: Boolean): WallSample? = when {
+        depth != null -> WallSample(depth, WallSampleKind.DEPTH)
+        plane != null -> WallSample(plane, WallSampleKind.PLANE)
+        feature != null && !depthEnabled -> WallSample(feature, WallSampleKind.FEATURE)
+        else -> null
+    }
+}
+
+/**
+ * Keeps wall sampling inside the frame budget (pure; GL thread only).
+ *
+ * A wall capture hit-tests a grid around the crosshair on every camera frame: 80 ARCore hit tests for the
+ * full 9 × 9 grid. How long one hit test takes is only known on the device, and a frame that takes longer
+ * than a camera frame (33 ms at 30 fps) drops images and stretches the capture. The governor measures the
+ * cost per hit test (smoothed over frames, remembered across captures) and picks the densest grid of
+ * [WallSampleGrid.SIZES] whose predicted cost fits [budgetNs]; it never goes below the smallest grid.
+ */
+internal class WallGridGovernor(private val budgetNs: Long = DEFAULT_BUDGET_NS) {
+    /** Smoothed cost of one hit test in nanoseconds; 0 until the first frame was measured. */
+    var costPerHitNs: Double = 0.0
+        private set
+
+    private var current = WallSampleGrid.SIZES.first()
+
+    /** Grid size (points per side) to use for the next sampled frame. */
+    fun gridSize(): Int {
+        val cost = costPerHitNs
+        if (cost <= 0.0) return current
+        var chosen = WallSampleGrid.SIZES.last()
+        for (size in WallSampleGrid.SIZES) {
+            // Growing back needs headroom, so the grid does not flip between two sizes on every frame.
+            val limit = if (size > current) budgetNs * GROW_HEADROOM else budgetNs.toDouble()
+            if (cost * (size * size - 1) <= limit) {
+                chosen = size
+                break
+            }
+        }
+        current = chosen
+        return chosen
+    }
+
+    /** Records that [hitTests] hit tests of one frame took [elapsedNs]. */
+    fun onFrameSampled(hitTests: Int, elapsedNs: Long) {
+        if (hitTests <= 0 || elapsedNs < 0) return
+        val sample = elapsedNs.toDouble() / hitTests
+        costPerHitNs = if (costPerHitNs <= 0.0) sample else costPerHitNs * (1 - SMOOTHING) + sample * SMOOTHING
+    }
+
+    companion object {
+        /**
+         * Time one frame's grid may take. A 30 fps camera frame is 33 ms; Session.update() and drawing the
+         * camera image take roughly a third of that on a current phone, the rest is headroom.
+         */
+        const val DEFAULT_BUDGET_NS = 12_000_000L
+        private const val SMOOTHING = 0.3
+        private const val GROW_HEADROOM = 0.8
+    }
+}
+
+/**
+ * The one-line-per-measurement device log (pure formatting, plain ASCII; see [ArLog]). A wall capture reads:
+ *
+ *     measure wall ok 612 ms frames=15 | samples 1198 of 1215 rays (depth 1102, plane 96, feature 0) grid 9
+ *       sampling 6.8 ms/frame | aim 2.41 m | band y=-1.21..1.19 | fit DEPTH_FIT angle 91.32 deg offset
+ *       2.4130 m viewer 2.4130 m length 1.84 m used 987 conf 0.82 rms 6.1 mm | sigma 11.2 mm (expected
+ *       33.9 mm, limit 50.9 mm) | plane angle 90.95 deg offset 2.4212 m viewer 2.4210 m length 2.10 m
+ *       (plane - fit: +8.0 mm, -0.37 deg)
+ *
+ * "samples" counts the rays that produced a wall sample, by the kind of ARCore hit ([WallSampleRule]);
+ * "grid" is the smallest grid used (below 9 means the phone could not afford the full grid in a frame).
+ * Reading a wall line against a tape measure: "viewer" is the perpendicular distance from the phone to the
+ * wall; "offset" is the signed distance of the world origin from the wall line (positive on the room side),
+ * so the distance between two opposite, parallel walls is the SUM of their offsets, wherever they were
+ * captured from; "angle" is the direction of the wall line in the plan (degrees, 0–360). "sigma" is the
+ * robust per-sample noise seen on this wall, next to what the estimator expects at that range and the limit
+ * above which it rejects the capture. "plane - fit" compares ARCore's detected wall plane under the
+ * crosshair with the fitted wall: positive means the plane lies farther from the phone.
+ */
+internal object MeasurementReport {
+    fun kind(request: MeasureRequest): String = when (request) {
+        MeasureRequest.LockFloor -> "floor-lock"
+        is MeasureRequest.Wall -> "wall"
+        is MeasureRequest.FloorPoint -> "floor-point"
+        is MeasureRequest.SurfacePoint -> "surface-point"
+        is MeasureRequest.CeilingHeight -> "ceiling"
+    }
+
+    /**
+     * The whole line. [result] is null when the request ended without a result from the engine (the caller
+     * cancelled it, or the session paused). [frames] counts the tracking frames the sampler saw; [detail]
+     * is the sampler's own description and may be empty.
+     */
+    fun line(request: MeasureRequest, result: MeasureResult?, durationNs: Long, frames: Int, detail: String): String {
+        val sb = StringBuilder(240)
+        sb.append("measure ").append(kind(request)).append(' ').append(outcome(result))
+        sb.append(' ').append((durationNs / 1e6).fmt(0)).append(" ms frames=").append(frames)
+        if (detail.isNotEmpty()) sb.append(" | ").append(detail)
+        return sb.toString()
+    }
+
+    private fun outcome(result: MeasureResult?): String = when (result) {
+        null -> "DROPPED (cancelled or session paused)"
+        is MeasureResult.FloorLocked -> "ok y=${result.floorY.fmt(3)}"
+        is MeasureResult.WallMeasured -> {
+            val failure = result.fit.failure
+            if (result.fit.observation != null && failure == null) "ok" else "FAILED (${failure?.name ?: "no wall"})"
+        }
+        is MeasureResult.Point ->
+            "ok at (${result.world.x.fmt(3)}, ${result.world.y.fmt(3)}, ${result.world.z.fmt(3)}) " +
+                "samples=${result.samples} spread=${result.spread.fmtMm()}"
+        is MeasureResult.Height ->
+            "ok height=${result.height.fmt(3)} m samples=${result.samples} spread=${result.spread.fmtMm()}"
+        is MeasureResult.Failed -> "FAILED (${result.reason})"
+    }
+
+    /** Direction angle (degrees, 0–360), signed origin offset and viewer distance of a wall line. */
+    fun wallLine(line: Line2, viewer: Vec2): String {
+        var degrees = Math.toDegrees(line.angle()) % 360.0
+        if (degrees < 0) degrees += 360.0
+        return "angle ${degrees.fmt(2)} deg offset ${line.signedDistance(Vec2.ZERO).fmt(4)} m " +
+            "viewer ${line.signedDistance(viewer).fmt(4)} m"
+    }
+
+    /**
+     * "(plane - fit: +8.0 mm, -0.37 deg)": how far ARCore's [plane] line lies behind the fitted [fit] line as
+     * seen from the room side, measured at [at] (a point on or near the fitted wall), and the angle between
+     * the two. Both lines must be oriented room-left, as every WallObservation is.
+     */
+    fun planeVersusFit(fit: Line2, plane: Line2, at: Vec2): String {
+        val behind = plane.signedDistance(fit.project(at))
+        var turn = Math.toDegrees(plane.angle() - fit.angle()) % 360.0
+        if (turn > 180.0) turn -= 360.0
+        if (turn <= -180.0) turn += 360.0
+        return "(plane - fit: ${signed(behind * 1000.0, 1)} mm, ${signed(turn, 2)} deg)"
+    }
+
+    /**
+     * Robust spread (1.4826 × MAD, meters) of the plan distances from [line] of the [points] inside [band]
+     * that lie within [window] of the line: the per-sample noise actually seen on this wall, to hold against
+     * the estimator's expected sigma. NaN with fewer than [MIN_SIGMA_POINTS] such points.
+     */
+    fun robustSigma(points: List<Vec3>, band: ClosedFloatingPointRange<Double>, line: Line2, window: Double): Double {
+        val residuals = ArrayList<Double>(points.size)
+        for (p in points) {
+            if (!p.isFinite() || p.y !in band) continue
+            val d = line.signedDistance(p.toPlan())
+            if (abs(d) <= window) residuals += d
+        }
+        if (residuals.size < MIN_SIGMA_POINTS) return Double.NaN
+        return RobustStats.MAD_TO_SIGMA * RobustStats.mad(residuals)
+    }
+
+    /** "+8.0" / "-0.37"; a value that rounds to zero is "+0.0", never "-0.0". */
+    private fun signed(value: Double, decimals: Int): String {
+        if (!value.isFinite()) return "n/a"
+        val magnitude = abs(value).fmt(decimals)
+        val roundsToZero = magnitude.all { it == '0' || it == '.' }
+        return (if (value >= 0 || roundsToZero) "+" else "-") + magnitude
+    }
+
+    const val MIN_SIGMA_POINTS = 10
 }

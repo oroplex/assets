@@ -1,13 +1,15 @@
 package com.oroplex.floorplan.ar
 
-import android.util.Log
 import com.google.ar.core.Frame
 import com.google.ar.core.HitResult
 import com.google.ar.core.Plane
 import com.oroplex.floorplan.core.fit.RobustStats
 import com.oroplex.floorplan.core.fit.WallEstimator
+import com.oroplex.floorplan.core.fit.WallEstimatorConfig
 import com.oroplex.floorplan.core.fit.WallFit
+import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.geometry.Vec3
+import com.oroplex.floorplan.core.model.WallObservation
 import kotlinx.coroutines.CompletableDeferred
 import java.util.Queue
 import kotlin.math.min
@@ -58,28 +60,40 @@ internal class MeasurementDeadline(
     }
 }
 
-/** The 9 × 9 hit-test grid used to sample a wall: a centered square, ~25 % of the shorter view side. */
+/**
+ * The hit-test grid used to sample a wall: a centered square, ~25 % of the shorter view side, normally
+ * 9 × 9 points. On a phone where that many hit tests per frame do not fit the frame budget, the same square
+ * is sampled with fewer points ([SIZES], chosen by [WallGridGovernor]).
+ */
 internal object WallSampleGrid {
+    /** Points per side of the full grid. */
     const val SIZE = 9
     const val COUNT = SIZE * SIZE
     const val SIDE_FRACTION = 0.25f
 
-    /** Index of the middle sample, which is exactly the view center (the crosshair). */
+    /** Index of the middle sample of the full grid, which is exactly the view center (the crosshair). */
     const val CENTER_INDEX = COUNT / 2
 
+    /** Allowed points per side, densest first. All odd, so the middle sample is always the crosshair. */
+    val SIZES = intArrayOf(SIZE, 7, 5)
+
+    /** Index of the middle sample (the crosshair) of a [size] × [size] grid. */
+    fun centerIndex(size: Int): Int = size * size / 2
+
     /**
-     * Writes [COUNT] (x, y) view-pixel pairs into [out] (length >= 2 * COUNT), row by row from the top-left.
-     * The middle sample ([CENTER_INDEX]) is exactly the view center.
+     * Writes [size] × [size] (x, y) view-pixel pairs into [out] (length >= 2 · size²), row by row from the
+     * top-left. For an odd [size] the middle sample ([centerIndex]) is exactly the view center.
      */
-    fun positions(viewportWidth: Int, viewportHeight: Int, out: FloatArray) {
-        require(out.size >= 2 * COUNT) { "out needs ${2 * COUNT} floats" }
+    fun positions(viewportWidth: Int, viewportHeight: Int, out: FloatArray, size: Int = SIZE) {
+        require(size >= 2) { "grid size must be at least 2" }
+        require(out.size >= 2 * size * size) { "out needs ${2 * size * size} floats" }
         val side = min(viewportWidth, viewportHeight) * SIDE_FRACTION
-        val step = side / (SIZE - 1)
+        val step = side / (size - 1)
         val x0 = viewportWidth / 2f - side / 2f
         val y0 = viewportHeight / 2f - side / 2f
         var k = 0
-        for (row in 0 until SIZE) {
-            for (col in 0 until SIZE) {
+        for (row in 0 until size) {
+            for (col in 0 until size) {
                 out[k++] = x0 + col * step
                 out[k++] = y0 + row * step
             }
@@ -130,30 +144,41 @@ internal class FrameInputs(
     val invViewProjection: FloatArray?,
     val centerHits: List<HitResult>,
     val reticle: ReticleResolution?,
-    val floor: FloorEstimate?,
+    /** The floor under the user ([FloorState.local]): the only tracked floor a lock may take unseen. */
+    val localFloor: FloorEstimate?,
+    /** The session runs the Depth API (decides which hits become wall samples, see [WallSampleRule]). */
+    val depthEnabled: Boolean,
 )
 
 /**
  * Runs all in-flight measurements on the GL thread. Measurements are independent and sampled in
- * parallel from the same frames, so a slow request never delays another one.
+ * parallel from the same frames, so a slow request never delays another one. Every measurement that ends
+ * here writes one diagnostics line ([MeasurementReport]).
  */
 internal class MeasurementEngine(private val incoming: Queue<PendingMeasurement>) {
-    private class Active(val job: PendingMeasurement, val sampler: Sampler, val deadline: MeasurementDeadline)
+    private class Active(val job: PendingMeasurement, val sampler: Sampler, val deadline: MeasurementDeadline) {
+        /** Tracking frames handed to the sampler. */
+        var frames = 0
+    }
 
     private val active = ArrayList<Active>(4)
+
+    /** Shared by all wall captures of the session, so the per-hit cost learned in one carries to the next. */
+    private val gridGovernor = WallGridGovernor()
 
     /** A new camera frame: admit queued requests, enforce deadlines, sample tracking frames. */
     fun onFrame(input: FrameInputs) {
         while (true) {
             val job = incoming.poll() ?: break
             if (job.isDone) continue
-            active += Active(job, Sampler.forRequest(job.request), MeasurementDeadline(job.createdAtNs))
+            active += Active(job, Sampler.forRequest(job.request, gridGovernor), MeasurementDeadline(job.createdAtNs))
         }
         if (active.isEmpty()) return
         val iterator = active.iterator()
         while (iterator.hasNext()) {
             val a = iterator.next()
             if (a.job.isDone) {
+                report(a, null, input.nowNs)
                 iterator.remove()
                 continue
             }
@@ -161,10 +186,14 @@ internal class MeasurementEngine(private val incoming: Queue<PendingMeasurement>
             val result = when {
                 expiry != null -> expiryResult(a.sampler, expiry)
                 !input.tracking -> null
-                else -> sample(a.sampler, input)
+                else -> {
+                    a.frames++
+                    sample(a.sampler, input)
+                }
             }
             if (result != null) {
                 a.job.complete(result)
+                report(a, result, input.nowNs)
                 iterator.remove()
             }
         }
@@ -180,11 +209,14 @@ internal class MeasurementEngine(private val incoming: Queue<PendingMeasurement>
         while (iterator.hasNext()) {
             val a = iterator.next()
             if (a.job.isDone) {
+                report(a, null, nowNs)
                 iterator.remove()
                 continue
             }
             val expiry = a.deadline.check(nowNs, tracking) ?: continue
-            a.job.complete(expiryResult(a.sampler, expiry))
+            val result = expiryResult(a.sampler, expiry)
+            a.job.complete(result)
+            report(a, result, nowNs)
             iterator.remove()
         }
     }
@@ -193,7 +225,7 @@ internal class MeasurementEngine(private val incoming: Queue<PendingMeasurement>
         sampler.onTrackingFrame(input)
     } catch (e: Exception) {
         // ARCore can throw on a frame it just invalidated; never take the GL thread down for it.
-        Log.w(TAG, "Measurement sampling failed", e)
+        ArLog.w("measurement sampling failed", e)
         MeasureResult.Failed("Measurement failed. Hold the phone steady and try again.")
     }
 
@@ -202,8 +234,17 @@ internal class MeasurementEngine(private val incoming: Queue<PendingMeasurement>
         MeasurementExpiry.TRACKING_LOST -> MeasureResult.Failed(TRACKING_LOST_MESSAGE)
     }
 
+    /** One diagnostics line per finished measurement; [result] null = it was completed elsewhere. */
+    private fun report(a: Active, result: MeasureResult?, nowNs: Long) {
+        try {
+            val detail = a.sampler.describe()
+            ArLog.i(MeasurementReport.line(a.job.request, result, nowNs - a.job.createdAtNs, a.frames, detail))
+        } catch (e: Exception) {
+            // Diagnostics must never cost a measurement or a frame.
+        }
+    }
+
     companion object {
-        private const val TAG = "MeasurementEngine"
         const val TRACKING_LOST_MESSAGE =
             "Tracking was lost during the measurement. Move the phone slowly over a textured area and try again."
     }
@@ -217,13 +258,19 @@ private sealed class Sampler {
     abstract val timeoutMessage: String
     abstract fun onTrackingFrame(input: FrameInputs): MeasureResult?
 
+    /**
+     * What this sampler collected, for the measurement's diagnostics line ([MeasurementReport.line]).
+     * Called once the measurement ended, successfully or not; plain numbers only.
+     */
+    abstract fun describe(): String
+
     companion object {
         /** Upper bound on requested frame counts (the 4 s timeout would end longer requests anyway). */
         const val MAX_FRAMES = 90
 
-        fun forRequest(request: MeasureRequest): Sampler = when (request) {
+        fun forRequest(request: MeasureRequest, gridGovernor: WallGridGovernor): Sampler = when (request) {
             MeasureRequest.LockFloor -> LockFloorSampler()
-            is MeasureRequest.Wall -> WallSampler(request)
+            is MeasureRequest.Wall -> WallSampler(request, gridGovernor)
             is MeasureRequest.FloorPoint -> FloorPointSampler(request)
             is MeasureRequest.SurfacePoint -> SurfacePointSampler(request)
             is MeasureRequest.CeilingHeight -> CeilingSampler(request)
@@ -235,10 +282,12 @@ private sealed class Sampler {
 
 /**
  * Locks the floor height, in order of preference, on every tracking frame:
- * 1. an upward plane under the crosshair (its height; CaptureViewModel rejects raised surfaces);
- * 2. the tracked floor ([FloorTracker], the lowest large upward plane), unless it is only a little below
- *    the phone and the crosshair sees floor clearly below it ([FloorLockFallback.contradictsTrackedFloor]);
- * 3. fallback when ARCore has detected no floor plane at all (glossy tile, polished concrete): the
+ * 1. an upward plane under the crosshair (its height; CaptureViewModel questions raised surfaces);
+ * 2. the floor under the user ([FloorState.local]: the lowest large, never-vetoed upward plane near the
+ *    phone's ground point), unless it is only a little below the phone and the crosshair sees floor clearly
+ *    below it ([FloorLockFallback.contradictsTrackedFloor]). A floor that is tracked somewhere else but
+ *    not under the user is NOT taken: it may be another level seen through a doorway (ARX-1);
+ * 3. otherwise (no floor plane here: glossy tile, polished concrete, or only another level in view): the
  *    median height of DepthPoint / feature hits at the crosshair over [FloorLockFallback.TARGET_SAMPLES]
  *    frames, taken only while the phone points down ≥ 30°, and only if the readings agree
  *    ([FloorLockFallback.MAX_MAD]). Gives up with a specific hint when no usable hit shows up.
@@ -250,15 +299,20 @@ private class LockFloorSampler : Sampler() {
     private val samples = ArrayList<Double>(FloorLockFallback.TARGET_SAMPLES)
     private var frames = 0
     private var framesNotPointingDown = 0
+    private var path = "none"
+    private var lastMad = Double.NaN
 
-    /** Set once the crosshair showed floor clearly below the tracked (ambiguous) floor during this request. */
-    private var trackedFloorRejected = false
+    /** Set once the crosshair showed floor clearly below the local (ambiguous) floor during this request. */
+    private var localFloorRejected = false
 
     override fun onTrackingFrame(input: FrameInputs): MeasureResult? {
         val plane = input.reticle?.plane
         if (plane != null && plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING) {
             val y = plane.centerPose.ty().toDouble()
-            if (y.isFinite()) return MeasureResult.FloorLocked(y)
+            if (y.isFinite()) {
+                path = "plane under crosshair"
+                return MeasureResult.FloorLocked(y)
+            }
         }
         val camera = input.cameraPosition ?: return null
 
@@ -269,13 +323,14 @@ private class LockFloorSampler : Sampler() {
         val sample = if (pointingDown) HitTesting.floorFallbackSample(input.centerHits, camera) else null
         val hitY = sample?.world?.y
 
-        val tracked = input.floor
-        if (tracked != null && tracked.y.isFinite() && !trackedFloorRejected) {
-            if (hitY == null || !FloorLockFallback.contradictsTrackedFloor(tracked.y, camera.y, hitY)) {
-                return MeasureResult.FloorLocked(tracked.y)
+        val local = input.localFloor
+        if (local != null && local.y.isFinite() && !localFloorRejected) {
+            if (hitY == null || !FloorLockFallback.contradictsTrackedFloor(local.y, camera.y, hitY)) {
+                path = "floor under the user"
+                return MeasureResult.FloorLocked(local.y)
             }
             // The user aims at floor well below a plane that may be a bed or table: measure it instead.
-            trackedFloorRejected = true
+            localFloorRejected = true
         }
 
         frames++
@@ -287,6 +342,8 @@ private class LockFloorSampler : Sampler() {
 
         if (samples.size >= FloorLockFallback.TARGET_SAMPLES) {
             val evaluation = FloorLockFallback.evaluate(samples)
+            path = "depth / feature hits at the crosshair"
+            lastMad = evaluation.mad
             return evaluation.floorY?.let { MeasureResult.FloorLocked(it) } ?: MeasureResult.Failed(MSG_UNSTEADY)
         }
         val gaveUp = (samples.isEmpty() && frames >= FloorLockFallback.FRAMES_WITHOUT_SAMPLE_LIMIT) ||
@@ -301,9 +358,20 @@ private class LockFloorSampler : Sampler() {
         )
     }
 
+    override fun describe(): String {
+        val sb = StringBuilder("path: ").append(path)
+        if (frames > 0) {
+            sb.append(", fallback samples ").append(samples.size).append(" of ").append(frames).append(" frames")
+            sb.append(" (").append(framesNotPointingDown).append(" not pointing down)")
+        }
+        if (lastMad.isFinite()) sb.append(", MAD ").append(lastMad.fmtMm())
+        if (localFloorRejected) sb.append(", crosshair saw floor below the local plane")
+        return sb.toString()
+    }
+
     private companion object {
         const val MSG_NO_FLOOR =
-            "No floor found yet. Aim at a textured patch of floor near your feet, move the phone slowly, " +
+            "No floor found here yet. Aim at a textured patch of floor near your feet, move the phone slowly, " +
                 "then tap Lock floor again."
         const val MSG_TILT_DOWN = "Tilt the phone down toward the floor near your feet, then tap Lock floor."
         const val MSG_UNSTEADY =
@@ -312,79 +380,185 @@ private class LockFloorSampler : Sampler() {
 }
 
 /**
- * Accumulates wall points from the 9 × 9 grid over N frames, then fits them with
- * [WallEstimator.fromPoints]. The crosshair hit of every frame is also kept: their median is passed as
- * the `aimPoint`, so the fit locks onto the surface the user aimed at (not furniture in front of it, a
- * wall behind a doorway, or a side wall seen at a grazing angle). Far walls (crosshair beyond
- * [WallSampling.LONG_RANGE_DISTANCE]) are sampled over more frames to average depth noise.
+ * Accumulates wall points from the hit-test grid ([WallSampleGrid], 9 × 9 unless the phone is too slow for
+ * it, see [WallGridGovernor]) over N frames, then fits them with [WallEstimator.fromPoints]. Every ray
+ * contributes the sample [WallSampleRule] picks (the DepthPoint when depth is on, never simply the nearest
+ * hit). The crosshair sample of every frame is also kept: their median is passed as the `aimPoint`, so the
+ * fit locks onto the surface the user aimed at (not furniture in front of it, a wall behind a doorway, or a
+ * side wall seen at a grazing angle). Far walls (crosshair beyond [WallSampling.LONG_RANGE_DISTANCE]) are
+ * sampled over more frames to average depth noise ([WallSampling.isDone]).
  *
- * The depth fit wins whenever it succeeds; otherwise a VERTICAL plane seen under the crosshair during
- * sampling is used ([WallEstimator.fromPlane]); otherwise the failed depth fit is returned so the UI can
- * show its [WallFit.failure] message.
+ * The fit of the samples wins whenever it succeeds; otherwise a VERTICAL plane seen under the crosshair
+ * during sampling is used ([WallEstimator.fromPlane]); otherwise the failed fit is returned so the UI can
+ * show its [WallFit.failure] message. The diagnostics line reports both the fit and the plane.
  */
-private class WallSampler(private val request: MeasureRequest.Wall) : Sampler() {
+private class WallSampler(
+    private val request: MeasureRequest.Wall,
+    private val governor: WallGridGovernor,
+) : Sampler() {
     override val timeoutMessage = "Wall measurement timed out. Hold the phone steady while it samples."
 
     private val baseFrames = frameTarget(request.frames)
-    private val maxFrames = frameTarget(WallSampling.targetFrames(baseFrames, Double.POSITIVE_INFINITY))
+    private val maxFrames = WallSampling.maxFrames(baseFrames)
     private val points = ArrayList<Vec3>(maxFrames * WallSampleGrid.COUNT)
     private val centerPoints = ArrayList<Vec3>(maxFrames)
     private val aimDistances = ArrayList<Double>(maxFrames)
     private val grid = FloatArray(WallSampleGrid.COUNT * 2)
+    private val kindCounts = IntArray(WallSampleKind.entries.size)
     private var frames = 0
     private var firstFrameNs = 0L
+    private var samplingNs = 0L
+
+    /** Rays cast so far (grid + crosshair); rays without a usable hit are the gap to the sample count. */
+    private var rays = 0
+    private var smallestGrid = WallSampleGrid.SIZE
     private var viewerX = 0.0
     private var viewerY = 0.0
     private var viewerZ = 0.0
     private var centerPlane: Plane? = null
+    private var summary = ""
 
     override fun onTrackingFrame(input: FrameInputs): MeasureResult? {
         val camera = input.cameraPosition ?: return null
         if (input.viewportWidth <= 0 || input.viewportHeight <= 0) return null
         if (frames == 0) firstFrameNs = input.nowNs
-        WallSampleGrid.positions(input.viewportWidth, input.viewportHeight, grid)
-        for (i in 0 until WallSampleGrid.COUNT) {
+
+        val size = governor.gridSize()
+        if (size < smallestGrid) smallestGrid = size
+        WallSampleGrid.positions(input.viewportWidth, input.viewportHeight, grid, size)
+        val centerIndex = WallSampleGrid.centerIndex(size)
+        val startNs = System.nanoTime()
+        for (i in 0 until size * size) {
             // The grid's middle sample is the crosshair, which the frame already hit-tested.
-            if (i == WallSampleGrid.CENTER_INDEX) continue
+            if (i == centerIndex) continue
             val hits = input.frame.hitTest(grid[2 * i], grid[2 * i + 1])
-            HitTesting.firstWallSample(hits, camera)?.let { points += it }
+            HitTesting.wallSample(hits, camera, input.depthEnabled)?.let { add(it) }
         }
-        val center = HitTesting.firstWallSample(input.centerHits, camera)
+        val elapsedNs = System.nanoTime() - startNs
+        samplingNs += elapsedNs
+        rays += size * size
+        governor.onFrameSampled(size * size - 1, elapsedNs)
+
+        // The crosshair sample follows the same rule as the grid, so the aim point is not min(depth, plane).
+        val center = HitTesting.wallSample(input.centerHits, camera, input.depthEnabled)
         if (center != null) {
-            points += center
-            centerPoints += center
-            aimDistances += center.distanceTo(camera)
+            add(center)
+            centerPoints += center.world
+            aimDistances += center.world.distanceTo(camera)
         } else {
             input.reticle?.hit?.distance?.takeIf { it.isFinite() }?.let { aimDistances += it }
         }
+        // Plane evidence is kept apart from the samples: it backs the fallback and the diagnostics.
         HitTesting.firstVerticalPlane(input.centerHits, camera)?.let { centerPlane = it }
         viewerX += camera.x
         viewerY += camera.y
         viewerZ += camera.z
         frames++
         val aimDistance = if (aimDistances.isEmpty()) null else RobustStats.median(aimDistances)
-        val done = frames >= maxFrames ||
-            WallSampling.isComplete(frames, baseFrames, aimDistance, input.nowNs - firstFrameNs)
-        return if (done) finish() else null
+        val done = WallSampling.isDone(frames, baseFrames, aimDistance, input.nowNs - firstFrameNs)
+        return if (done) finish(aimDistance) else null
     }
 
-    private fun finish(): MeasureResult {
+    private fun add(sample: WallSample) {
+        points += sample.world
+        kindCounts[sample.kind.ordinal]++
+    }
+
+    private fun finish(aimDistance: Double?): MeasureResult {
         // The phone moves a little while sampling; the mean pose is the most representative viewer.
         val viewer = Vec3(viewerX / frames, viewerY / frames, viewerZ / frames)
+        // One band for the aim point and the fit: both come from the request's floorY / ceilingY (CAPX-8).
         val band = WallSampling.wallBand(request.floorY, request.ceilingY)
         val aimPoint = WallSampling.aimPoint(centerPoints, frames, band)
-        val depthFit = WallEstimator.fromPoints(points, request.floorY, request.ceilingY, viewer, aimPoint = aimPoint)
-        if (depthFit.failure == null && depthFit.observation != null) return MeasureResult.WallMeasured(depthFit)
-        val planeObservation = centerPlane?.let { HitTesting.wallFromPlane(it, viewer) }
-            ?: return MeasureResult.WallMeasured(depthFit)
-        return MeasureResult.WallMeasured(
-            WallFit(
+        val sampleFit = WallEstimator.fromPoints(points, request.floorY, request.ceilingY, viewer, aimPoint = aimPoint)
+        val planeObservation = centerPlane?.let { plane ->
+            try {
+                HitTesting.wallFromPlane(plane, viewer)
+            } catch (e: Exception) {
+                null // a plane ARCore dropped meanwhile must not cost a successful fit
+            }
+        }
+        val fitted = sampleFit.observation?.takeIf { sampleFit.failure == null }
+        val result = when {
+            fitted != null -> sampleFit
+            planeObservation != null -> WallFit(
                 observation = planeObservation,
                 failure = null,
                 usedPoints = planeObservation.pointCount,
                 totalPoints = points.size,
-            ),
-        )
+            )
+            else -> sampleFit
+        }
+        summary = try {
+            summarize(aimDistance, aimPoint, band, sampleFit, planeObservation, viewer)
+        } catch (e: Exception) {
+            "" // diagnostics only
+        }
+        return MeasureResult.WallMeasured(result)
+    }
+
+    private fun summarize(
+        aimDistance: Double?,
+        aimPoint: Vec3?,
+        band: ClosedFloatingPointRange<Double>,
+        sampleFit: WallFit,
+        plane: WallObservation?,
+        viewer: Vec3,
+    ): String {
+        val config = WallEstimatorConfig()
+        val viewerPlan = viewer.toPlan()
+        val sb = StringBuilder(320)
+        sb.append(sampleCounts())
+        sb.append(" | aim ").append(aimDistance.fmtOrNa(2)).append(" m")
+        if (aimPoint == null) sb.append(" (no aim point: ").append(centerPoints.size).append(" crosshair hits)")
+        sb.append(" | band y=").append(band.start.fmt(2)).append("..").append(band.endInclusive.fmt(2))
+        val fit = sampleFit.observation
+        if (fit != null && sampleFit.failure == null) {
+            sb.append(" | fit ").append(fit.source.name).append(' ').append(MeasurementReport.wallLine(fit.line, viewerPlan))
+            sb.append(" length ").append(fit.extentStart.distanceTo(fit.extentEnd).fmt(2)).append(" m")
+            sb.append(" used ").append(sampleFit.usedPoints).append(" conf ").append(fit.confidence.fmt(2))
+            sb.append(" rms ").append(fit.rmsResidual.fmtMm())
+            val range = fit.line.signedDistance(viewerPlan)
+            val sigma = MeasurementReport.robustSigma(points, band, fit.line, SIGMA_WINDOW_FACTOR * config.inlierThresholdAt(range))
+            sb.append(" | sigma ").append(sigma.fmtMm())
+            sb.append(" (expected ").append(config.expectedSigma(range).fmtMm())
+            sb.append(", limit ").append(config.noiseLimitAt(range).fmtMm()).append(')')
+        } else {
+            sb.append(" | fit FAILED ").append(sampleFit.failure?.name ?: "no wall")
+            sb.append(" usable ").append(sampleFit.usedPoints)
+        }
+        if (plane != null) {
+            sb.append(" | plane ").append(MeasurementReport.wallLine(plane.line, viewerPlan))
+            sb.append(" length ").append(plane.extentStart.distanceTo(plane.extentEnd).fmt(2)).append(" m")
+            if (fit != null && sampleFit.failure == null) {
+                val at = aimPoint?.toPlan() ?: Vec2.lerp(fit.extentStart, fit.extentEnd, 0.5)
+                sb.append(' ').append(MeasurementReport.planeVersusFit(fit.line, plane.line, at))
+            } else {
+                sb.append(" (used as the result)")
+            }
+        } else {
+            sb.append(" | no wall plane under the crosshair")
+        }
+        return sb.toString()
+    }
+
+    private fun sampleCounts(): String {
+        val sb = StringBuilder(96)
+        sb.append("samples ").append(points.size).append(" of ").append(rays).append(" rays")
+        sb.append(" (depth ").append(kindCounts[WallSampleKind.DEPTH.ordinal])
+        sb.append(", plane ").append(kindCounts[WallSampleKind.PLANE.ordinal])
+        sb.append(", feature ").append(kindCounts[WallSampleKind.FEATURE.ordinal]).append(')')
+        sb.append(" grid ").append(smallestGrid)
+        if (frames > 0) sb.append(" sampling ").append((samplingNs / frames).nsToMs()).append(" ms/frame")
+        return sb.toString()
+    }
+
+    /** After a result: the full summary. After a timeout or lost tracking: what was collected so far. */
+    override fun describe(): String = summary.ifEmpty { sampleCounts() }
+
+    private companion object {
+        /** Samples within this many inlier bands of the fitted line count toward the logged robust sigma. */
+        const val SIGMA_WINDOW_FACTOR = 4.0
     }
 }
 
@@ -394,6 +568,7 @@ private class FloorPointSampler(private val request: MeasureRequest.FloorPoint) 
 
     private val target = frameTarget(request.frames)
     private val samples = ArrayList<Vec3>(target)
+    private var range = Double.NaN
 
     override fun onTrackingFrame(input: FrameInputs): MeasureResult? {
         val camera = input.cameraPosition ?: return null
@@ -401,10 +576,14 @@ private class FloorPointSampler(private val request: MeasureRequest.FloorPoint) 
         val p = HitTesting.floorRayHit(inv, input.viewportWidth, input.viewportHeight, request.floorY, camera)
             ?: return null
         samples += p
+        range = p.distanceTo(camera)
         if (samples.size < target) return null
         val mean = MeasurementMath.mean(samples)
         return MeasureResult.Point(mean, samples.size, MeasurementMath.medianDistance(samples, mean))
     }
+
+    override fun describe(): String =
+        "ray on floor y=${request.floorY.fmt(3)}, samples ${samples.size} of $target, range ${range.fmt(2)} m"
 }
 
 /**
@@ -418,13 +597,23 @@ private class SurfacePointSampler(request: MeasureRequest.SurfacePoint) : Sample
 
     private val target = frameTarget(request.frames)
     private val samples = ArrayList<Vec3>(target)
+    private val kindCounts = IntArray(SurfaceKind.entries.size)
+    private var range = Double.NaN
 
     override fun onTrackingFrame(input: FrameInputs): MeasureResult? {
         val reticle = input.reticle?.takeIf { it.fromHitTest } ?: return null
         samples += reticle.hit.world
+        kindCounts[reticle.hit.surface.ordinal]++
+        range = reticle.hit.distance
         if (samples.size < target) return null
         val median = MeasurementMath.componentMedian(samples)
         return MeasureResult.Point(median, samples.size, MeasurementMath.medianDistance(samples, median))
+    }
+
+    override fun describe(): String {
+        val kinds = SurfaceKind.entries.filter { kindCounts[it.ordinal] > 0 }
+            .joinToString(", ") { "${it.name} ${kindCounts[it.ordinal]}" }
+        return "samples ${samples.size} of $target (${kinds.ifEmpty { "no hits" }}), range ${range.fmt(2)} m"
     }
 }
 
@@ -441,6 +630,7 @@ private class CeilingSampler(private val request: MeasureRequest.CeilingHeight) 
 
     private val target = frameTarget(request.frames)
     private val heights = ArrayList<Double>(target)
+    private var clusterSize = -1
 
     override fun onTrackingFrame(input: FrameInputs): MeasureResult? {
         val camera = input.cameraPosition ?: return null
@@ -448,9 +638,21 @@ private class CeilingSampler(private val request: MeasureRequest.CeilingHeight) 
         heights += y
         if (heights.size < target) return null
         val cluster = CeilingSampling.upperCluster(heights)
+        clusterSize = cluster.size
         if (cluster.isEmpty()) return MeasureResult.Failed(MSG_INCONSISTENT)
         val median = RobustStats.median(cluster)
         return MeasureResult.Height(median - request.floorY, cluster.size, RobustStats.mad(cluster))
+    }
+
+    override fun describe(): String {
+        val sb = StringBuilder("above floor y=").append(request.floorY.fmt(3))
+        sb.append(", ceiling-like hits ").append(heights.size).append(" of ").append(target)
+        if (heights.isNotEmpty()) {
+            sb.append(", heights ").append((heights.min() - request.floorY).fmt(2))
+            sb.append("..").append((heights.max() - request.floorY).fmt(2)).append(" m")
+        }
+        if (clusterSize >= 0) sb.append(", upper cluster ").append(clusterSize)
+        return sb.toString()
     }
 
     private companion object {

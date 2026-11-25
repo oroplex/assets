@@ -40,6 +40,8 @@ data class ArFrameState(
     /**
      * Current best floor height (world Y): the LOWEST large (≥ 0.5 m²) upward plane 0.8–2.2 m below the
      * camera, so beds, tables and islands above it never count; kept while no plane qualifies; null until found.
+     * Session-wide (any plane in view), except that while a floor under the user exists ([localFloorY]) it
+     * stays at that level instead of following a lower level seen elsewhere. Prefer [localFloorY].
      */
     val floorY: Double? = null,
     /** Area (m²) of the plane backing [floorY]; > ~1 m² means a confident floor. */
@@ -62,12 +64,19 @@ data class ArFrameState(
      * Unlike [floorY] (global, any plane in view), another level seen through a doorway (sunken living room,
      * step-down garage) never wins here. null when no such plane is tracked. Use it for auto-lock and for
      * raised-surface / wrong-level checks.
+     *
+     * (A furniture veto is only ever lifted when the phone stays above a plane at that height for a second,
+     * i.e. the user stands on it: an upper level first seen from a lower one. Such a floor is reported here
+     * again, but [floorAutoLockable] stays false for it.)
      */
     val localFloorY: Double? = null,
     /**
      * True when the AR layer is confident enough in [localFloorY] to lock it without the user: large enough,
      * under the user, never vetoed, and not contradicted by floor-like hits below it. Auto-lock only when true;
      * a manual Lock floor is always possible.
+     *
+     * "Under the user" is strict for a plane less than 1.2 m below the phone (bed / sofa height): the phone
+     * must be above its polygon, not merely within a meter of it.
      */
     val floorAutoLockable: Boolean = false,
     /** Unit view direction of the camera in world space (for angular-speed coaching); null when not tracking. */
@@ -80,9 +89,10 @@ data class ArFrameState(
 
 sealed interface MeasureRequest {
     /**
-     * Lock the floor height: plane under the reticle if it is an upward plane, else the current best floor,
-     * else (no floor plane detected) the median of depth / feature hits at the reticle over several frames
-     * while the phone points down at least 30°, when those readings agree.
+     * Lock the floor height: plane under the reticle if it is an upward plane, else the floor under the user
+     * ([ArFrameState.localFloorY]; a floor tracked elsewhere, e.g. another level seen through a doorway, is
+     * never taken unseen), else (no floor plane here) the median of depth / feature hits at the reticle over
+     * several frames while the phone points down at least 30°, when those readings agree.
      */
     data object LockFloor : MeasureRequest
 
@@ -90,6 +100,13 @@ sealed interface MeasureRequest {
      * Sample the wall under the reticle over [frames] frames (hit-test grid around screen center; more frames,
      * up to 25, when the reticle is beyond 2.5 m), then fit with WallEstimator using the median reticle hit
      * as the aim point. Falls back to a detected vertical plane under the reticle when the depth fit fails.
+     *
+     * [ceilingY] is the TOP of the height band (world Y) that wall points and the aim point are taken from:
+     * the measured ceiling, or, when the ceiling was not measured, a generous assumed top (capture passes
+     * floorY + max(default ceiling, 2.4 m) + 0.3 m), so a wall seen above tall furniture stays in band. It is
+     * a filter, not a claim about the ceiling: points less than 0.20 m above [floorY] or less than 0.15 m
+     * below [ceilingY] are ignored, by the fit and the aim point alike. null (or a value that leaves no band)
+     * means floorY + 2.4 m.
      */
     data class Wall(val floorY: Double, val ceilingY: Double?, val frames: Int = 15) : MeasureRequest
 

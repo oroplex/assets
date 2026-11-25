@@ -24,13 +24,15 @@
             is handled in place: dark mode / Bedtime mode (uiMode), screen zoom or resolution (density),
             pop-up view and split screen (smallestScreenSize, screenLayout, screenSize), font size and bold
             text (fontScale, fontWeightAdjustment), a Bluetooth keyboard or HID laser meter (keyboard,
-            keyboardHidden, navigation), language (locale, layoutDirection) and display color mode.
+            keyboardHidden, navigation), language (locale, layoutDirection), display color mode, an
+            external display or Samsung DeX taking over input (touchscreen), and a SIM / eSIM profile
+            switching operator (mcc, mnc).
         -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:screenOrientation="portrait"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|fontWeightAdjustment|locale|layoutDirection|colorMode"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|touchscreen|uiMode|density|fontScale|fontWeightAdjustment|locale|layoutDirection|colorMode|mcc|mnc"
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.FloorPlan">
             <intent-filter>

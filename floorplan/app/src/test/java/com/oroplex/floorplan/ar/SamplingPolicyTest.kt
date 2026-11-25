@@ -1,6 +1,8 @@
 package com.oroplex.floorplan.ar
 
+import com.oroplex.floorplan.core.fit.WallEstimator
 import com.oroplex.floorplan.core.fit.WallEstimatorConfig
+import com.oroplex.floorplan.core.fit.WallFitFailure
 import com.oroplex.floorplan.core.geometry.Vec3
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -193,6 +195,82 @@ class SamplingPolicyTest {
     }
 
     @Test
+    fun wall_isDone_farWallsReallyGetTheExtraFrames() {
+        val ms = 1_000_000L
+        // ARX-3: from 3.5 m the capture must not end at the base 15 frames.
+        assertFalse(WallSampling.isDone(15, 15, 3.5, 500 * ms))
+        assertFalse(WallSampling.isDone(24, 15, 3.5, 800 * ms))
+        assertTrue(WallSampling.isDone(25, 15, 3.5, 830 * ms))
+        // A near wall is done at the base count, and never before it.
+        assertFalse(WallSampling.isDone(14, 15, 2.0, 470 * ms))
+        assertTrue(WallSampling.isDone(15, 15, 2.0, 500 * ms))
+        // Unknown distance (no crosshair hit yet): the base count.
+        assertTrue(WallSampling.isDone(15, 15, null, 500 * ms))
+        // Slow frames: once the time budget is used up the capture ends with what it has (>= base frames).
+        assertFalse(WallSampling.isDone(16, 15, 3.5, WallSampling.LONG_RANGE_BUDGET_NS - 1))
+        assertTrue(WallSampling.isDone(16, 15, 3.5, WallSampling.LONG_RANGE_BUDGET_NS))
+        assertFalse(WallSampling.isDone(12, 15, 3.5, 3_000 * ms))
+    }
+
+    @Test
+    fun wall_isDone_hasAHardCap() {
+        assertEquals(25, WallSampling.maxFrames(15))
+        assertEquals(40, WallSampling.maxFrames(40))
+        assertEquals(25, WallSampling.maxFrames(1))
+        // The cap ends the capture whatever the distance estimate says, even a nonsensical one.
+        assertTrue(WallSampling.isDone(25, 15, Double.POSITIVE_INFINITY, 0))
+        assertTrue(WallSampling.isDone(25, 15, Double.NaN, 0))
+        assertTrue(WallSampling.isDone(40, 40, 3.5, 0))
+        assertFalse(WallSampling.isDone(39, 40, 3.5, 0))
+    }
+
+    /** A flat wall patch at plan y = 3 (world z = -3) seen from the origin, [heights] sampled 15 x 15. */
+    private fun wallPatch(heights: ClosedFloatingPointRange<Double>): List<Vec3> = buildList {
+        for (i in 0 until 15) {
+            for (j in 0 until 15) {
+                val x = -0.6 + 1.2 * i / 14.0
+                val y = heights.start + (heights.endInclusive - heights.start) * j / 14.0
+                // A few millimetres of deterministic "depth noise".
+                val noise = 0.003 * sin(12.9898 * i + 78.233 * j)
+                add(Vec3(x, y, -3.0 + noise))
+            }
+        }
+    }
+
+    @Test
+    fun wall_bandIsTheBandTheEstimatorFiltersWith() {
+        // CAPX-8: the aim filter (wallBand) and the fit (WallEstimator) must agree for the same request.
+        val viewer = Vec3(0.0, 1.4, 0.0)
+        val floorY = 0.0
+
+        // A measured 2.5 m ceiling: points between 1.0 and 2.2 m are on the wall for both.
+        val measured = WallSampling.wallBand(floorY, 2.5)
+        val inBand = wallPatch(1.0..2.2)
+        assertTrue(inBand.all { it.y in measured })
+        assertNotNull(WallEstimator.fromPoints(inBand, floorY, 2.5, viewer).observation)
+
+        // The strip above a 2.2 m wardrobe (2.40-2.80 m) is out of that band for both...
+        val aboveWardrobe = wallPatch(2.40..2.80)
+        assertTrue(aboveWardrobe.none { it.y in measured })
+        assertEquals(WallFitFailure.TOO_FEW_POINTS, WallEstimator.fromPoints(aboveWardrobe, floorY, 2.5, viewer).failure)
+        assertNull(WallSampling.aimPoint(aboveWardrobe.take(15), frames = 15, band = measured))
+
+        // ... and inside the band top capture passes for an unmeasured 2.7 m default ceiling
+        // (floor + max(default, 2.4) + 0.3 = 3.0 m), again for both.
+        val assumedTop = floorY + 2.7 + 0.3
+        val generous = WallSampling.wallBand(floorY, assumedTop)
+        assertTrue(aboveWardrobe.all { it.y in generous })
+        val fit = WallEstimator.fromPoints(aboveWardrobe, floorY, assumedTop, viewer)
+        assertNotNull(fit.failure?.name, fit.observation)
+        assertNotNull(WallSampling.aimPoint(aboveWardrobe.take(15), frames = 15, band = generous))
+
+        // Without any band top both fall back to the same assumed 2.4 m ceiling.
+        val fallback = WallSampling.wallBand(floorY, null)
+        assertTrue(aboveWardrobe.none { it.y in fallback })
+        assertEquals(WallFitFailure.TOO_FEW_POINTS, WallEstimator.fromPoints(aboveWardrobe, floorY, null, viewer).failure)
+    }
+
+    @Test
     fun wall_bandMatchesTheEstimatorDefaults() {
         val config = WallEstimatorConfig()
         val measured = WallSampling.wallBand(floorY = 0.0, ceilingY = 2.6)
@@ -238,5 +316,117 @@ class SamplingPolicyTest {
         WallSampleGrid.positions(1440, 3120, out)
         assertEquals(720f, out[2 * WallSampleGrid.CENTER_INDEX], 1e-3f)
         assertEquals(1560f, out[2 * WallSampleGrid.CENTER_INDEX + 1], 1e-3f)
+    }
+
+    @Test
+    fun grid_smallerGridsCoverTheSameSquareAroundTheCrosshair() {
+        val out = FloatArray(WallSampleGrid.COUNT * 2)
+        assertEquals(WallSampleGrid.SIZE, WallSampleGrid.SIZES.first())
+        for (size in WallSampleGrid.SIZES) {
+            assertEquals("grid sizes must be odd so the middle sample is the crosshair", 1, size % 2)
+            WallSampleGrid.positions(1440, 3120, out, size)
+            val center = WallSampleGrid.centerIndex(size)
+            assertEquals(720f, out[2 * center], 1e-3f)
+            assertEquals(1560f, out[2 * center + 1], 1e-3f)
+            val side = 1440 * WallSampleGrid.SIDE_FRACTION
+            val last = size * size - 1
+            assertEquals(720f - side / 2, out[0], 1e-3f)
+            assertEquals(1560f - side / 2, out[1], 1e-3f)
+            assertEquals(720f + side / 2, out[2 * last], 1e-3f)
+            assertEquals(1560f + side / 2, out[2 * last + 1], 1e-3f)
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Which hit along a ray is the wall sample (MATH-5)
+    // ---------------------------------------------------------------------------------------------
+
+    private val depthHit = Vec3(0.0, 1.3, -2.52)
+    private val planeHit = Vec3(0.0, 1.3, -2.50)
+    private val featureHit = Vec3(0.0, 1.3, -2.47)
+
+    @Test
+    fun wallSample_depthWinsEvenWhenThePlaneHitIsNearer() {
+        // The depth reading errs 2 cm AWAY from the viewer; "first hit" would have replaced it by the plane.
+        val sample = WallSampleRule.choose(depthHit, planeHit, featureHit, depthEnabled = true)!!
+        assertEquals(WallSampleKind.DEPTH, sample.kind)
+        assertEquals(depthHit, sample.world)
+        // ... and equally when it errs toward the viewer: the choice never depends on which is nearer.
+        val near = Vec3(0.0, 1.3, -2.48)
+        assertEquals(near, WallSampleRule.choose(near, planeHit, null, depthEnabled = true)!!.world)
+    }
+
+    @Test
+    fun wallSample_fallsBackToThePlaneAndSkipsFeaturePointsWhileDepthIsOn() {
+        val plane = WallSampleRule.choose(null, planeHit, featureHit, depthEnabled = true)!!
+        assertEquals(WallSampleKind.PLANE, plane.kind)
+        assertEquals(planeHit, plane.world)
+        assertNull(WallSampleRule.choose(null, null, featureHit, depthEnabled = true))
+        assertNull(WallSampleRule.choose(null, null, null, depthEnabled = true))
+    }
+
+    @Test
+    fun wallSample_withoutDepthUsesPlanesThenFeaturePoints() {
+        assertEquals(WallSampleKind.PLANE, WallSampleRule.choose(null, planeHit, featureHit, depthEnabled = false)!!.kind)
+        val feature = WallSampleRule.choose(null, null, featureHit, depthEnabled = false)!!
+        assertEquals(WallSampleKind.FEATURE, feature.kind)
+        assertEquals(featureHit, feature.world)
+        assertNull(WallSampleRule.choose(null, null, null, depthEnabled = false))
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Frame budget of wall sampling
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    fun gridGovernor_keepsTheFullGridOnAFastPhone() {
+        val governor = WallGridGovernor(budgetNs = 12_000_000L)
+        assertEquals(9, governor.gridSize())
+        repeat(25) {
+            governor.onFrameSampled(hitTests = 80, elapsedNs = 80 * 60_000L) // 4.8 ms per frame
+            assertEquals(9, governor.gridSize())
+        }
+        assertEquals(60_000.0, governor.costPerHitNs, 1.0)
+    }
+
+    @Test
+    fun gridGovernor_shrinksTheGridUntilAFrameFitsTheBudget() {
+        val governor = WallGridGovernor(budgetNs = 12_000_000L)
+        // 250 µs per hit test: 80 hits = 20 ms (too slow), 48 hits = 12 ms (just fits).
+        governor.onFrameSampled(80, 80 * 250_000L)
+        assertEquals(7, governor.gridSize())
+        governor.onFrameSampled(48, 48 * 250_000L)
+        assertEquals(7, governor.gridSize())
+        // 600 µs per hit test: even the smallest grid (24 hits = 14.4 ms) is over, but it never goes lower.
+        val slow = WallGridGovernor(budgetNs = 12_000_000L)
+        slow.onFrameSampled(80, 80 * 600_000L)
+        assertEquals(5, slow.gridSize())
+        repeat(10) { slow.onFrameSampled(24, 24 * 600_000L) }
+        assertEquals(5, slow.gridSize())
+    }
+
+    @Test
+    fun gridGovernor_growsBackOnlyWithHeadroom() {
+        val governor = WallGridGovernor(budgetNs = 12_000_000L)
+        governor.onFrameSampled(80, 80 * 250_000L)
+        assertEquals(7, governor.gridSize())
+        // One slow first frame (cold start) must not cost the rest of the session: the smoothed cost recovers.
+        repeat(30) { governor.onFrameSampled(48, 48 * 60_000L) }
+        assertEquals(9, governor.gridSize())
+        // Just under the budget for 9 x 9 (80 x 140 µs = 11.2 ms) is not enough headroom to grow from 7 x 7.
+        val marginal = WallGridGovernor(budgetNs = 12_000_000L)
+        marginal.onFrameSampled(80, 80 * 250_000L)
+        assertEquals(7, marginal.gridSize())
+        repeat(60) { marginal.onFrameSampled(48, 48 * 140_000L) }
+        assertEquals(7, marginal.gridSize())
+    }
+
+    @Test
+    fun gridGovernor_ignoresNonsenseMeasurements() {
+        val governor = WallGridGovernor()
+        governor.onFrameSampled(0, 5_000_000L)
+        governor.onFrameSampled(80, -1L)
+        assertEquals(0.0, governor.costPerHitNs, 0.0)
+        assertEquals(9, governor.gridSize())
     }
 }

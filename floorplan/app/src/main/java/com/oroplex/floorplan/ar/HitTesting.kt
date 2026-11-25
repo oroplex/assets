@@ -117,22 +117,32 @@ internal object HitTesting {
     }
 
     /**
-     * Wall sample from one grid ray: the first DepthPoint, feature Point, or VERTICAL plane hit (inside its
-     * polygon, front side). Horizontal planes along the ray are skipped, not treated as blockers.
+     * Wall sample from one ray (a grid ray or the crosshair): the hit [WallSampleRule] picks from ALL hits
+     * along the ray, not the nearest one. A DepthPoint wins; without one a VERTICAL plane hit (inside its
+     * polygon, front side); a feature Point only when depth is off ([depthEnabled] false). Taking the first
+     * hit would return min(depth, plane) and bias every wall toward the camera (MATH-5). Horizontal planes
+     * along the ray are skipped, not treated as blockers.
      */
-    fun firstWallSample(hits: List<HitResult>, camera: Vec3): Vec3? {
+    fun wallSample(hits: List<HitResult>, camera: Vec3, depthEnabled: Boolean): WallSample? {
+        var plane: Vec3? = null
+        var feature: Vec3? = null
         for (hit in hits) {
             val pose = hit.hitPose
-            val usable = when (val trackable = hit.trackable) {
-                is DepthPoint, is Point -> true
-                is Plane -> trackable.type == Plane.Type.VERTICAL && isUsablePlaneHit(trackable, pose, camera)
-                else -> false
+            when (val trackable = hit.trackable) {
+                is DepthPoint -> {
+                    val p = pose.position()
+                    // The nearest DepthPoint settles it; nothing behind it can change the choice.
+                    if (p.isFinite()) return WallSampleRule.choose(p, plane, feature, depthEnabled)
+                }
+                is Plane ->
+                    if (plane == null && trackable.type == Plane.Type.VERTICAL && isUsablePlaneHit(trackable, pose, camera)) {
+                        plane = pose.position().takeIf { it.isFinite() }
+                    }
+                is Point -> if (feature == null) feature = pose.position().takeIf { it.isFinite() }
+                else -> Unit
             }
-            if (!usable) continue
-            val p = pose.position()
-            if (p.isFinite()) return p
         }
-        return null
+        return WallSampleRule.choose(null, plane, feature, depthEnabled)
     }
 
     /** First VERTICAL plane along the center ray (inside its polygon, front side), even behind other hits. */
@@ -280,6 +290,18 @@ internal class FloorFallbackSample(val world: Vec3?, val rejection: FloorLockFal
 
 /** Translation of an ARCore pose as a world-space [Vec3]. */
 internal fun Pose.position(): Vec3 = Vec3(tx().toDouble(), ty().toDouble(), tz().toDouble())
+
+/**
+ * Unit view direction of a CAMERA pose in world space, or null when it is not usable. An ARCore camera
+ * looks along its local −Z axis (for Camera.getPose and getDisplayOrientedPose alike: the two differ only
+ * by a rotation about that axis), so this is the negated world-space Z axis of the pose.
+ */
+internal fun Pose.forward(): Vec3? {
+    val z = zAxis
+    val forward = Vec3(-z[0].toDouble(), -z[1].toDouble(), -z[2].toDouble())
+    if (!forward.isFinite()) return null
+    return forward.normalized().takeIf { it != Vec3.ZERO }
+}
 
 /** Yaw + horizontal translation of an ARCore pose as a plan-space rigid transform. */
 internal fun Pose.toPlanTransform(): RigidTransform2 = RigidTransform2.fromArPose(

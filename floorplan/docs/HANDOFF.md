@@ -13,7 +13,11 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
 * A narrow regression check of round 3 (major problems only, each finding verified by a second agent) found
   three bugs in the first four packages, all fixed (confirming a wall at its shown length did nothing; the
   "Scan interrupted" dialog could discard a restorable room; calibrating from a hand-set wall stored a
-  meaningless factor). The check of the accuracy and AR packages was running when this was written.
+  meaningless factor). The check of the AR package found one more, also fixed: the wall sampling grid was a
+  quarter of the screen's short side, about ±4.5° of the camera on a tall phone, while the estimator's
+  gates and the whole simulation assume ±12°. At ±4.5° walls nearer than about 0.6 m were always refused and
+  a sensor 1.5× noisier than the model failed most captures. The grid is now sized by angle from the
+  camera's projection (`WallSampleGrid.HALF_ANGLE_DEG` = 12), and each wall's log line states the angle used.
 * **Every wall capture keeps its raw samples on the phone** (`diagnostics/WallCaptureLog`, newest 60, in the
   app's private storage). "Share scan log" appends them to the shared text file. On a computer,
   `WallCaptureRecord.decodeAll(text)` reads them out of the whole file and `record.replay(config)` runs the
@@ -55,8 +59,8 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
   at 1/8" = 1'-0" fills about half a Letter page). Fit-to-page fills the sheet but is not to scale. A switch
   is a small change in `export/PlanScale.kt`.
 * Deferred for the feature freeze: extra room-schedule columns (wall area, volume, openings) in the PDF.
-* Wall sampling still uses hit tests (9x9 grid, shrinking to 7x7 / 5x5 when frames are slow) instead of
-  reading the depth image and its confidence map. Evaluate after the first device data.
+* Wall sampling still uses hit tests (9x9 grid over ±12°, shrinking to 7x7 / 5x5 when frames are slow) instead
+  of reading the depth image and its confidence map. Evaluate after the first device data.
 * Every threshold in the AR layer and the estimator is calibrated on simulation only.
 
 ## Ideas from similar projects (after the first phone test; nothing here is being built now)

@@ -347,9 +347,10 @@ internal object HardScenarios {
 
     /**
      * (a) clean walls of the sample house, nominal noise, sampled over ± [NARROW_GRID_DEG]° instead of ± 12°. The
-     * app samples a square of 25 % of the short side of the view: about ± 7° to ± 10° depending on the camera's
-     * field of view, which is not known from here. A narrower grid sees less of each wall, so directions are
-     * known less well.
+     * app sizes its grid by angle (`WallSampleGrid.HALF_ANGLE_DEG` = 12°, from the camera's projection), so this
+     * is not what the phone does: it shows what a narrower grid costs. A narrower grid sees less of each wall,
+     * so directions are known less well. (Until November 2026 the app sampled 25 % of the short side of the
+     * view, about ± 4.5° on a tall phone screen: far outside what this file simulates.)
      */
     val cleanNarrowGrid: List<RoomScan> by lazy {
         SimScenarios.SEED_SETS.flatMap { k ->

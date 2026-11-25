@@ -64,15 +64,32 @@ internal class MeasurementDeadline(
 }
 
 /**
- * The hit-test grid used to sample a wall: a centered square, ~25 % of the shorter view side, normally
- * 9 × 9 points. On a phone where that many hit tests per frame do not fit the frame budget, the same square
- * is sampled with fewer points ([SIZES], chosen by [WallGridGovernor]).
+ * The hit-test grid used to sample a wall: a centered square that spans ± [HALF_ANGLE_DEG] of the camera's
+ * view left-right and up-down, normally 9 × 9 points. On a phone where that many hit tests per frame do not
+ * fit the frame budget, the same square is sampled with fewer points ([SIZES], chosen by [WallGridGovernor]).
+ *
+ * The square is sized by ANGLE, not as a share of the screen: the wall estimator's direction precision and
+ * its "stations" (one per grid column) depend on how much of the wall is seen, and they were designed and
+ * simulated for ± 12°. A fixed 25 % of the short side of a tall phone screen is only about ± 4.5° (a 16 cm
+ * wide patch from 1 m), where walls close by are refused and the wall's direction is three times less
+ * certain.
  */
 internal object WallSampleGrid {
     /** Points per side of the full grid. */
     const val SIZE = 9
     const val COUNT = SIZE * SIZE
-    const val SIDE_FRACTION = 0.25f
+
+    /** Half-angle of the sampled square in the image plane (the same as the simulation's capture rig). */
+    const val HALF_ANGLE_DEG = 12.0
+
+    /**
+     * Side of the square as a share of the shorter view side when the camera's projection is not known:
+     * about ± 11° on a tall phone screen showing a camera with a 65–72° long-side field of view.
+     */
+    const val FALLBACK_SIDE_FRACTION = 0.6f
+
+    /** The square never takes more than this share of either view side, so every ray stays inside the view. */
+    const val MAX_SIDE_FRACTION = 0.9f
 
     /** Index of the middle sample of the full grid, which is exactly the view center (the crosshair). */
     const val CENTER_INDEX = COUNT / 2
@@ -80,25 +97,57 @@ internal object WallSampleGrid {
     /** Allowed points per side, densest first. All odd, so the middle sample is always the crosshair. */
     val SIZES = intArrayOf(SIZE, 7, 5)
 
+    private val TAN_HALF_ANGLE = kotlin.math.tan(Math.toRadians(HALF_ANGLE_DEG)).toFloat()
+
     /** Index of the middle sample (the crosshair) of a [size] × [size] grid. */
     fun centerIndex(size: Int): Int = size * size / 2
 
     /**
+     * The camera's focal length in view pixels along one axis, from the matching diagonal element of its
+     * OpenGL projection matrix ([projectionScale]: m00 for x, m11 for y) and the view's size along that
+     * axis. 0 when not usable.
+     */
+    fun focalPx(projectionScale: Float, viewportSide: Int): Float {
+        val focal = projectionScale * viewportSide / 2f
+        return if (focal.isFinite() && focal > 0f) focal else 0f
+    }
+
+    /**
+     * Side (view pixels) of the sampled square along an axis that is [viewportSide] pixels long and has the
+     * focal length [focalPx] (0 = unknown; then [FALLBACK_SIDE_FRACTION] of [shortSide] is used).
+     */
+    fun sidePx(viewportSide: Int, shortSide: Int, focalPx: Float): Float {
+        val wanted = if (focalPx.isFinite() && focalPx > 0f) 2f * focalPx * TAN_HALF_ANGLE else shortSide * FALLBACK_SIDE_FRACTION
+        return min(wanted, viewportSide * MAX_SIDE_FRACTION)
+    }
+
+    /**
      * Writes [size] × [size] (x, y) view-pixel pairs into [out] (length >= 2 · size²), row by row from the
      * top-left. For an odd [size] the middle sample ([centerIndex]) is exactly the view center.
+     * [focalXPx] / [focalYPx] are the camera's focal lengths in view pixels ([focalPx]; 0 = unknown).
      */
-    fun positions(viewportWidth: Int, viewportHeight: Int, out: FloatArray, size: Int = SIZE) {
+    fun positions(
+        viewportWidth: Int,
+        viewportHeight: Int,
+        out: FloatArray,
+        size: Int = SIZE,
+        focalXPx: Float = 0f,
+        focalYPx: Float = 0f,
+    ) {
         require(size >= 2) { "grid size must be at least 2" }
         require(out.size >= 2 * size * size) { "out needs ${2 * size * size} floats" }
-        val side = min(viewportWidth, viewportHeight) * SIDE_FRACTION
-        val step = side / (size - 1)
-        val x0 = viewportWidth / 2f - side / 2f
-        val y0 = viewportHeight / 2f - side / 2f
+        val shortSide = min(viewportWidth, viewportHeight)
+        val sideX = sidePx(viewportWidth, shortSide, focalXPx)
+        val sideY = sidePx(viewportHeight, shortSide, focalYPx)
+        val stepX = sideX / (size - 1)
+        val stepY = sideY / (size - 1)
+        val x0 = viewportWidth / 2f - sideX / 2f
+        val y0 = viewportHeight / 2f - sideY / 2f
         var k = 0
         for (row in 0 until size) {
             for (col in 0 until size) {
-                out[k++] = x0 + col * step
-                out[k++] = y0 + row * step
+                out[k++] = x0 + col * stepX
+                out[k++] = y0 + row * stepY
             }
         }
     }
@@ -145,6 +194,9 @@ internal class FrameInputs(
     val viewportWidth: Int,
     val viewportHeight: Int,
     val invViewProjection: FloatArray?,
+    /** The camera's focal lengths in view pixels ([WallSampleGrid.focalPx]); 0 when not known. */
+    val focalXPx: Float,
+    val focalYPx: Float,
     val centerHits: List<HitResult>,
     val reticle: ReticleResolution?,
     /** The floor under the user ([FloorState.local]): the only tracked floor a lock may take unseen. */
@@ -428,6 +480,10 @@ private class WallSampler(
     /** Rays cast so far (grid + crosshair); rays without a usable hit are the gap to the sample count. */
     private var rays = 0
     private var smallestGrid = WallSampleGrid.SIZE
+
+    /** Width of the sampled square (view pixels) and the focal length it was sized with, for the log. */
+    private var gridSidePx = 0f
+    private var gridFocalPx = 0f
     private var viewerX = 0.0
     private var viewerY = 0.0
     private var viewerZ = 0.0
@@ -441,7 +497,9 @@ private class WallSampler(
 
         val size = governor.gridSize()
         if (size < smallestGrid) smallestGrid = size
-        WallSampleGrid.positions(input.viewportWidth, input.viewportHeight, grid, size)
+        WallSampleGrid.positions(input.viewportWidth, input.viewportHeight, grid, size, input.focalXPx, input.focalYPx)
+        gridSidePx = grid[2 * (size * size - 1)] - grid[0]
+        gridFocalPx = input.focalXPx
         val centerIndex = WallSampleGrid.centerIndex(size)
         val startNs = System.nanoTime()
         for (i in 0 until size * size) {
@@ -559,7 +617,12 @@ private class WallSampler(
         sb.append(" (depth ").append(kindCounts[WallSampleKind.DEPTH.ordinal])
         sb.append(", plane ").append(kindCounts[WallSampleKind.PLANE.ordinal])
         sb.append(", feature ").append(kindCounts[WallSampleKind.FEATURE.ordinal]).append(')')
-        sb.append(" grid ").append(smallestGrid)
+        sb.append(" grid ").append(smallestGrid).append(" over ").append(gridSidePx.toDouble().fmt(0)).append(" px")
+        if (gridFocalPx > 0f) {
+            sb.append(" (±").append(Math.toDegrees(kotlin.math.atan2(gridSidePx / 2.0, gridFocalPx.toDouble())).fmt(1)).append("°)")
+        } else {
+            sb.append(" (camera angle unknown)")
+        }
         if (frames > 0) sb.append(" sampling ").append((samplingNs / frames).nsToMs()).append(" ms/frame")
         return sb.toString()
     }

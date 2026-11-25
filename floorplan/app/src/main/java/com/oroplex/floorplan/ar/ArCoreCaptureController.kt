@@ -265,6 +265,9 @@ internal class ArCoreCaptureController(
                 viewportWidth = viewportWidth,
                 viewportHeight = viewportHeight,
                 invViewProjection = invViewProjection,
+                // computeViewProjection() just filled projectionMatrix for this frame (column-major: m00, m11).
+                focalXPx = if (poseValid) WallSampleGrid.focalPx(projectionMatrix[0], viewportWidth) else 0f,
+                focalYPx = if (poseValid) WallSampleGrid.focalPx(projectionMatrix[5], viewportHeight) else 0f,
                 centerHits = centerHits,
                 reticle = reticle,
                 localFloor = floor.local,

@@ -328,12 +328,61 @@ class SamplingPolicyTest {
             val center = WallSampleGrid.centerIndex(size)
             assertEquals(720f, out[2 * center], 1e-3f)
             assertEquals(1560f, out[2 * center + 1], 1e-3f)
-            val side = 1440 * WallSampleGrid.SIDE_FRACTION
+            val side = 1440 * WallSampleGrid.FALLBACK_SIDE_FRACTION
             val last = size * size - 1
             assertEquals(720f - side / 2, out[0], 1e-3f)
             assertEquals(1560f - side / 2, out[1], 1e-3f)
             assertEquals(720f + side / 2, out[2 * last], 1e-3f)
             assertEquals(1560f + side / 2, out[2 * last + 1], 1e-3f)
+        }
+    }
+
+    /** A portrait phone view whose height shows a camera with tan(half field of view) = [tanHalfLong]. */
+    private fun focalOf(height: Int, tanHalfLong: Double) = WallSampleGrid.focalPx((1.0 / tanHalfLong).toFloat(), height)
+
+    @Test
+    fun grid_spansTwelveDegreesOfTheCameraWhateverTheScreen() {
+        val out = FloatArray(WallSampleGrid.COUNT * 2)
+        val last = WallSampleGrid.COUNT - 1
+        // The same camera (about 70 degrees along its long side) behind a tall phone screen and a 4:3 tablet.
+        for ((w, h) in listOf(1440 to 3120, 1536 to 2048)) {
+            val focal = focalOf(h, 0.70)
+            // Square pixels: m00 = m11 * h / w gives the same focal length along x.
+            assertEquals(focal, WallSampleGrid.focalPx((1.0 / 0.70).toFloat() * h / w, w), 1e-2f)
+            WallSampleGrid.positions(w, h, out, WallSampleGrid.SIZE, focal, focal)
+            val halfX = (out[2 * last] - out[0]) / 2.0
+            val halfY = (out[2 * last + 1] - out[1]) / 2.0
+            assertEquals(WallSampleGrid.HALF_ANGLE_DEG, Math.toDegrees(Math.atan(halfX / focal)), 1e-3)
+            assertEquals(WallSampleGrid.HALF_ANGLE_DEG, Math.toDegrees(Math.atan(halfY / focal)), 1e-3)
+            assertEquals(w / 2f, out[2 * WallSampleGrid.CENTER_INDEX], 1e-3f)
+            assertEquals(h / 2f, out[2 * WallSampleGrid.CENTER_INDEX + 1], 1e-3f)
+            // Columns are 3 degrees apart at the crosshair, which is what the estimator's stations assume.
+            val step = (out[2] - out[0]).toDouble()
+            assertEquals(3.0, Math.toDegrees(Math.atan(step / focal)), 0.1)
+        }
+        // On the tall screen that is far more than a quarter of its width (the old grid was about +-4.5 degrees).
+        WallSampleGrid.positions(1440, 3120, out, WallSampleGrid.SIZE, focalOf(3120, 0.70), focalOf(3120, 0.70))
+        assertTrue(out[2 * last] - out[0] > 0.6f * 1440)
+    }
+
+    @Test
+    fun grid_staysInsideTheViewAndWorksWithoutACameraProjection() {
+        val out = FloatArray(WallSampleGrid.COUNT * 2)
+        val last = WallSampleGrid.COUNT - 1
+        // A long lens: 12 degrees would be wider than the screen, so the square is cut to 90 % of each side.
+        WallSampleGrid.positions(1440, 3120, out, WallSampleGrid.SIZE, 20_000f, 20_000f)
+        assertEquals(0.05f * 1440, out[0], 1e-2f)
+        assertEquals(0.95f * 1440, out[2 * last], 1e-2f)
+        assertEquals(0.05f * 3120, out[1], 1e-2f)
+        assertEquals(0.95f * 3120, out[2 * last + 1], 1e-2f)
+        // No usable projection: a fixed share of the short side.
+        assertEquals(0f, WallSampleGrid.focalPx(Float.NaN, 1440))
+        assertEquals(0f, WallSampleGrid.focalPx(-1f, 1440))
+        assertEquals(0f, WallSampleGrid.focalPx(0f, 1440))
+        for (focal in floatArrayOf(0f, Float.NaN, -5f)) {
+            WallSampleGrid.positions(1440, 3120, out, WallSampleGrid.SIZE, focal, focal)
+            assertEquals(1440 * WallSampleGrid.FALLBACK_SIDE_FRACTION, out[2 * last] - out[0], 1e-2f)
+            assertEquals(1440 * WallSampleGrid.FALLBACK_SIDE_FRACTION, out[2 * last + 1] - out[1], 1e-2f)
         }
     }
 

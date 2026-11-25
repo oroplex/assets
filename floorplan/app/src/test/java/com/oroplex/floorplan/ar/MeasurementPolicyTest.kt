@@ -51,11 +51,11 @@ class MeasurementPolicyTest {
     }
 
     @Test
-    fun grid_isCenteredSquareOfQuarterShortSide() {
+    fun grid_withoutACameraProjectionIsACenteredSquareOfAShareOfTheShortSide() {
         for ((w, h) in listOf(1440 to 3120, 3120 to 1440, 1000 to 1000)) {
             val out = FloatArray(WallSampleGrid.COUNT * 2)
             WallSampleGrid.positions(w, h, out)
-            val side = min(w, h) * WallSampleGrid.SIDE_FRACTION
+            val side = min(w, h) * WallSampleGrid.FALLBACK_SIDE_FRACTION
             val xs = (0 until WallSampleGrid.COUNT).map { out[2 * it] }
             val ys = (0 until WallSampleGrid.COUNT).map { out[2 * it + 1] }
             assertEquals(w / 2f - side / 2, xs.min(), 1e-3f)

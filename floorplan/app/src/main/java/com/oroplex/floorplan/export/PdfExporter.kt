@@ -16,8 +16,13 @@ data class PdfOptions(
 )
 
 /**
- * Multi-page PDF (android.graphics.pdf.PdfDocument, 1 unit = 1 pt): one plan page per floor
- * (landscape when the plan is wide), followed by the room schedule page(s).
+ * Multi-page PDF (android.graphics.pdf.PdfDocument, 1 unit = 1 pt): one plan page per floor, followed by
+ * the room schedule page(s).
+ *
+ * All plan pages share one standard architectural scale and one orientation (see [PlanScales.choose]):
+ * the largest scale at which every floor fits, so the set can be read with a scale ruler and floors can be
+ * compared side by side. Only when even the smallest standard scale is too large is each floor fitted to its
+ * own page (landscape when its plan is wide), as a drawing "not to a standard scale".
  */
 object PdfExporter {
 
@@ -30,8 +35,13 @@ object PdfExporter {
         internal val sheets: List<FloorSheet>,
         internal val schedulePages: List<List<ScheduleRow>>,
         internal val branding: SheetBranding?,
+        /** The scale and orientation of every plan page; null = each floor is fitted to its own page. */
+        val sheetScale: SheetScale? = null,
     ) {
         val pageCount: Int get() = sheets.size + schedulePages.size
+
+        /** Number of plan pages (one per exported floor). */
+        val planPageCount: Int get() = sheets.size
 
         /** "Page i of n" labels in print order: plan sheets first, then the schedule pages. */
         val pageLabels: List<String> get() = (1..pageCount).map { FloorSheets.pageLabel(it, pageCount) }
@@ -39,11 +49,41 @@ object PdfExporter {
         /** Plan sheets with their final page labels (what [write] prints). */
         val labeledSheets: List<FloorSheet>
             get() = sheets.mapIndexed { i, sheet -> sheet.copy(pageLabel = FloorSheets.pageLabel(i + 1, pageCount)) }
+
+        /**
+         * Whether [sheet]'s page is landscape: the document's common orientation, or, for fit-to-page
+         * documents, the shape of the sheet's own plan.
+         */
+        fun isLandscape(sheet: FloorSheet): Boolean =
+            sheetScale?.landscape ?: SheetLayout.isLandscape(sheet.drawList?.bounds)
+
+        /**
+         * One line describing the document, shown under the export preview, e.g.
+         * `Letter landscape · 1/4" = 1'-0" · 3 pages`. Fit-to-page documents say "fit to page" in place of
+         * the scale and name the first sheet's orientation; a document without any drawing (only "no rooms"
+         * pages) has no scale to mention.
+         */
+        val summary: String
+            get() {
+                val landscape = sheets.firstOrNull()?.let(::isLandscape) ?: false
+                val pages = if (pageCount == 1) "1 page" else "$pageCount pages"
+                val scale = when {
+                    sheetScale != null -> sheetScale.scale.label
+                    sheets.any { it.drawList != null } -> "fit to page"
+                    else -> null
+                }
+                return listOfNotNull("${paper.label} ${if (landscape) "landscape" else "portrait"}", scale, pages)
+                    .joinToString(" · ")
+            }
     }
 
     /**
      * Renders every floor and lays out the schedule. CPU-only (no I/O, no Android graphics); throws
      * [ExportException] when a floor cannot be drawn.
+     *
+     * Each floor is rendered once per candidate scale until all of them fit (largest scale first); the
+     * renders at the chosen scale become the sheets. An empty floor has nothing to scale and prints its
+     * "no rooms" message on a page in the common orientation.
      */
     fun prepare(
         project: Project,
@@ -52,8 +92,15 @@ object PdfExporter {
         dateText: String,
         branding: SheetBranding? = null,
     ): Prepared {
-        val sheets = floors.map { floor ->
-            FloorSheets.build(project, floor, options.labels, dateText, branding).copy(showScaleRatio = true)
+        // Sheets by scale (null key = fitted to the page), so the scale search never renders a floor twice.
+        val built = HashMap<PlanScale?, List<FloorSheet>>()
+        fun sheetsAt(scale: PlanScale?): List<FloorSheet> = built.getOrPut(scale) {
+            floors.map { floor ->
+                FloorSheets.build(project, floor, options.labels, dateText, branding, scale).copy(showScaleRatio = true)
+            }
+        }
+        val sheetScale = PlanScales.choose(project.settings.unitSystem, options.paper) { scale ->
+            sheetsAt(scale).mapNotNull { it.drawList?.bounds }
         }
         val schedulePages = if (options.includeRoomSchedule && floors.isNotEmpty()) {
             ScheduleTable.paginate(ScheduleTable.rows(project, floors), options.paper.heightPt.toDouble())
@@ -65,9 +112,10 @@ object PdfExporter {
             address = project.address.trim(),
             dateText = dateText,
             paper = options.paper,
-            sheets = sheets,
+            sheets = sheetsAt(sheetScale?.scale),
             schedulePages = schedulePages,
             branding = branding,
+            sheetScale = sheetScale,
         )
     }
 
@@ -85,7 +133,7 @@ object PdfExporter {
             var pageNumber = 0
             for (sheet in prepared.labeledSheets) {
                 pageNumber++
-                val landscape = SheetLayout.isLandscape(sheet.drawList?.bounds)
+                val landscape = prepared.isLandscape(sheet)
                 val w = prepared.paper.widthPt(landscape)
                 val h = prepared.paper.heightPt(landscape)
                 val page = started(document.startPage(PdfDocument.PageInfo.Builder(w, h, pageNumber).create()))
@@ -183,9 +231,10 @@ internal object RoomSchedulePainter {
         val floorPaint = SheetText.paint(10.0, bold = true)
         val subtotalPaint = SheetText.paint(9.0, bold = true)
         val grandPaint = SheetText.paint(10.0, bold = true)
+        val grandPartPaint = SheetText.paint(10.0)
 
         var zebra = false
-        for (row in rows) {
+        for ((index, row) in rows.withIndex()) {
             when (row) {
                 is ScheduleRow.FloorHeading -> {
                     band(y, rowHeight, FLOOR_FILL)
@@ -206,12 +255,18 @@ internal object RoomSchedulePainter {
                     SheetText.hairline(canvas, left, right, y + rowHeight, GRID, 0.4)
                 }
                 is ScheduleRow.Total -> {
-                    val paint = if (row.grand) grandPaint else subtotalPaint
-                    if (row.grand) {
-                        band(y, rowHeight, HEADER_FILL)
-                        SheetText.hairline(canvas, left, right, y + 1.2, PlanColors.TEXT, 0.5)
+                    // A block of totals: one rule above its first row (doubled for the document's block),
+                    // category rows in regular weight, the row that sums them in bold.
+                    val paint = when {
+                        !row.sum -> if (row.grand) grandPartPaint else bodyPaint
+                        row.grand -> grandPaint
+                        else -> subtotalPaint
                     }
-                    SheetText.hairline(canvas, left, right, y, PlanColors.TEXT, 0.75)
+                    if (row.grand) band(y, rowHeight, HEADER_FILL)
+                    if (row.startsBlock || index == 0) {
+                        if (row.grand) SheetText.hairline(canvas, left, right, y + 1.2, PlanColors.TEXT, 0.5)
+                        SheetText.hairline(canvas, left, right, y, PlanColors.TEXT, 0.75)
+                    }
                     cell(row.label, 0, y, rowHeight, paint, spanTo = 1)
                     cell(row.area, 2, y, rowHeight, paint)
                     zebra = false

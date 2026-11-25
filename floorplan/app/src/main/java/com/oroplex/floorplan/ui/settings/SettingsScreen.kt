@@ -46,13 +46,18 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.UnitSystem
+import com.oroplex.floorplan.data.LocaleDefaults
 import com.oroplex.floorplan.data.SettingsRepository
 import com.oroplex.floorplan.data.appContainer
 import kotlinx.coroutines.launch
+import java.util.Locale
 import kotlin.math.roundToInt
 
 /** Accepted ranges for the editable lengths (meters); deliberately narrower than the repository's sanity limits. */
 private val WALL_THICKNESS_RANGE = 0.025..0.6
+
+/** 2 in to about 31 in (5-80 cm), the same range as the editor's project settings: timber frame to old stone walls. */
+private val EXTERIOR_WALL_THICKNESS_RANGE = 0.05..0.8
 private val CEILING_RANGE = 1.5..6.0
 private val DOOR_RANGE = 1.5..3.5
 private val DOOR_WIDTH_RANGE = 0.4..2.5
@@ -154,13 +159,23 @@ fun SettingsScreen(onBack: () -> Unit, onShowTutorial: (() -> Unit)? = null) {
             item(key = "walls") {
                 SectionHeader("Walls")
                 LengthSettingField(
-                    label = "Wall thickness",
+                    label = "Interior wall thickness",
                     valueMeters = settings.wallThickness,
                     unitSystem = settings.unitSystem,
                     imperialDenominator = settings.imperialDenominator,
                     range = WALL_THICKNESS_RANGE,
-                    supportingText = "Drawn on the plan. Interior walls are typically 4 1/2\" (11.4 cm).",
+                    supportingText = SettingsRules.interiorWallHelp(settings.unitSystem),
                     onCommit = { v -> repository.update { it.copy(wallThickness = v) } },
+                )
+                LengthSettingField(
+                    label = "Exterior wall thickness",
+                    // Not set (null) means "same as interior walls"; show what is in effect.
+                    valueMeters = SettingsRules.exteriorWallThickness(settings),
+                    unitSystem = settings.unitSystem,
+                    imperialDenominator = settings.imperialDenominator,
+                    range = EXTERIOR_WALL_THICKNESS_RANGE,
+                    supportingText = SettingsRules.EXTERIOR_WALL_HELP,
+                    onCommit = { v -> repository.update { it.copy(exteriorWallThickness = v) } },
                 )
                 SquaringSetting(settings, repository)
             }
@@ -264,7 +279,8 @@ fun SettingsScreen(onBack: () -> Unit, onShowTutorial: (() -> Unit)? = null) {
             },
             confirmButton = {
                 TextButton(onClick = {
-                    repository.update { PlanSettings() }
+                    // The original values are the first-run defaults for this device's country.
+                    repository.update { LocaleDefaults.settings(Locale.getDefault().country) }
                     confirmReset = false
                 }) { Text("Restore") }
             },
@@ -282,7 +298,8 @@ private fun UnitsSetting(settings: PlanSettings, repository: SettingsRepository)
             options.forEachIndexed { index, (system, label) ->
                 SegmentedButton(
                     selected = settings.unitSystem == system,
-                    onClick = { repository.update { it.copy(unitSystem = system) } },
+                    // Sizes still at the old system's built-in defaults follow (8' becomes 2.40 m, not 2.44 m).
+                    onClick = { repository.update { LocaleDefaults.switchUnits(it, system) } },
                     shape = SegmentedButtonDefaults.itemShape(index, options.size),
                 ) { Text(label, maxLines = 1) }
             }

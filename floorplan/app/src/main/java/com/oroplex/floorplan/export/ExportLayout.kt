@@ -1,7 +1,9 @@
 package com.oroplex.floorplan.export
 
 import com.oroplex.floorplan.core.geometry.Bounds
+import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.model.UnitSystem
+import com.oroplex.floorplan.core.render.ViewTransform
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.ln
@@ -65,6 +67,26 @@ object SheetLayout {
         val top = MARGIN + HEADER_HEIGHT + GAP
         val bottom = (heightPt - MARGIN - FOOTER_HEIGHT - GAP).coerceAtLeast(top + 1.0)
         return SheetRect(MARGIN, top, widthPt - MARGIN, bottom)
+    }
+
+    /**
+     * Transform that draws [bounds] inside the plan area [area] of a sheet drawn at [pxPerPt] output pixels
+     * per sheet point; its pixel coordinates are relative to the plan area's top-left corner.
+     *
+     * With [pointsPerMeter] (a fixed drawing scale, see [PlanScale.pointsPerMeter]) the plan is drawn at exactly
+     * that scale and centered in the area. Without it (null or not a positive number), or for bounds with no
+     * size, the plan is fitted to the area with [PLAN_FIT_MARGIN] on every side.
+     */
+    fun planView(bounds: Bounds, area: SheetRect, pointsPerMeter: Double?, pxPerPt: Double): ViewTransform {
+        val widthPx = area.width * pxPerPt
+        val heightPx = area.height * pxPerPt
+        val fixed = pointsPerMeter?.takeIf { it.isFinite() && it > 0.0 }
+        val sized = !bounds.isEmpty && (bounds.width > 0 || bounds.height > 0)
+        if (fixed == null || !sized) return ViewTransform.fit(bounds, widthPx, heightPx, PLAN_FIT_MARGIN * pxPerPt, pxPerPt)
+        val pxPerMeter = fixed * pxPerPt
+        val c = bounds.center
+        // Plan y points up, screen y down: the bounds' center lands on the middle of the plan area.
+        return ViewTransform(pxPerMeter, Vec2(widthPx / 2 - c.x * pxPerMeter, heightPx / 2 + c.y * pxPerMeter), pxPerPt)
     }
 
     /**
@@ -203,8 +225,19 @@ object ScaleBars {
      */
     fun ratio(ptPerMeter: Double): Long? {
         if (!ptPerMeter.isFinite() || ptPerMeter <= 0) return null
-        val n = 72.0 / 0.0254 / ptPerMeter
+        val n = PlanScales.POINTS_PER_METER / ptPerMeter
         return if (n.isFinite() && n >= 1) n.roundToLong() else null
+    }
+
+    /**
+     * The scale line printed under the bar on paper output: the standard [scale] the sheet was drawn at
+     * (`Scale 1/4" = 1'-0" when printed at 100%`, `Scale 1:50 …`), or, for a sheet fitted to its page
+     * ([scale] null), the rounded ratio of [ptPerMeter] (`Scale 1:73 …`). Null when neither is known.
+     * "At 100 %" matters: a printer's "fit to page" shrinks the sheet and with it the scale.
+     */
+    fun scaleNote(scale: PlanScale?, ptPerMeter: Double?): String? {
+        val text = scale?.label ?: ptPerMeter?.let { ratio(it) }?.let { "1:$it" } ?: return null
+        return "Scale $text when printed at 100%"
     }
 }
 

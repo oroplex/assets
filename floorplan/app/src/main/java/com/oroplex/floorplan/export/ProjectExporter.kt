@@ -72,15 +72,7 @@ class ProjectExporter(
                 FloorSheets.build(project, floors.first(), request.labels, dateText, branding),
             )
             ExportFormat.SVG -> Payload.Bytes(svgFor(project, requireRooms(floors.first()), request).toByteArray(Charsets.UTF_8))
-            ExportFormat.DXF -> {
-                val floor = requireRooms(floors.first())
-                val dxf = try {
-                    DxfExporter.export(floor.rooms, project.settings)
-                } catch (e: Exception) {
-                    throw ExportException("Couldn't create the DXF drawing of \u201C${floor.name}\u201D.", e)
-                }
-                Payload.Bytes(dxf.toByteArray(Charsets.UTF_8))
-            }
+            ExportFormat.DXF -> Payload.Bytes(dxfFor(project, requireRooms(floors.first()), request).toByteArray(Charsets.UTF_8))
             ExportFormat.JSON -> error("JSON is handled above")
         }
     }
@@ -115,17 +107,53 @@ class ProjectExporter(
             "“${floor.name}” has no rooms yet. Scan or draw a room first, or export a PDF."
 
         /**
+         * The DXF drawing of [floor] with the export screen's switches applied: room areas in the labels
+         * follow [ExportRequest.showAreas] and the DIMENSIONS layer follows
+         * [ExportRequest.showOverallDimensions] (not the project's own settings, which only seed the
+         * switches). DXF has no per-wall length labels. Throws [ExportException] when it cannot be created.
+         */
+        internal fun dxfFor(project: Project, floor: Floor, request: ExportRequest): String =
+            try {
+                DxfExporter.export(
+                    floor.rooms,
+                    project.settings,
+                    showAreas = request.showAreas,
+                    showOverallDimensions = request.showOverallDimensions,
+                )
+            } catch (e: Exception) {
+                throw ExportException("Couldn't create the DXF drawing of “${floor.name}”.", e)
+            }
+
+        /**
          * The floors [request] covers: the requested floor when it exists; otherwise all floors for
          * formats that hold several, or the first floor for single-floor formats.
+         *
+         * "All floors" of a document (PDF) leaves out floors without rooms, so an unused floor tab does not
+         * print a blank page and an empty schedule section; the preview, file name and page count all come
+         * from this list and therefore agree. When no floor has rooms, all of them are kept, so the result is
+         * the usual "no rooms" page rather than nothing. The JSON backup always holds every floor.
          */
         fun floorsFor(project: Project, request: ExportRequest): List<Floor> {
             if (project.floors.isEmpty()) return emptyList()
             val chosen = request.floorId?.let { id -> project.floors.firstOrNull { it.id == id } }
             return when {
                 chosen != null -> listOf(chosen)
-                request.format.supportsAllFloors -> project.floors
+                request.format == ExportFormat.JSON -> project.floors
+                request.format.supportsAllFloors ->
+                    project.floors.filter { it.rooms.isNotEmpty() }.ifEmpty { project.floors }
                 else -> listOf(project.floors.first())
             }
+        }
+
+        /**
+         * Floors an "all floors" export of [request] leaves out because they have no rooms (see [floorsFor]);
+         * empty when a single floor is chosen, for single-floor formats and for the JSON backup.
+         */
+        fun skippedEmptyFloors(project: Project, request: ExportRequest): List<Floor> {
+            val chosen = request.floorId?.let { id -> project.floors.firstOrNull { it.id == id } }
+            if (chosen != null || request.format == ExportFormat.JSON || !request.format.supportsAllFloors) return emptyList()
+            val covered = floorsFor(project, request)
+            return project.floors.filter { floor -> covered.none { it === floor } }
         }
 
         /** `<project>-<floor>.<ext>`, `<project>-All_floors.pdf`, or `<project>.json`. */

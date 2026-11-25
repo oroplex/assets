@@ -2,15 +2,18 @@ package com.oroplex.floorplan.ui.export
 
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.Info
@@ -34,6 +37,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
@@ -47,6 +51,10 @@ private const val COLLAPSED_ITEMS = 4
  * "Before you export": the pre-flight checks for the floors being exported. Errors (e.g. overlapping
  * rooms) outline the card in the error color and need an explicit "Export anyway" before Share / Save
  * go ahead; warnings and notes are informational.
+ *
+ * Nothing here changes the plan. A row about a room is a button that shows that room in the editor
+ * ([onOpenRoom]); a floor-wide row with a fix (straighten the floor) goes back to the editor
+ * ([onBackToEditor]), where the floor check offers the fix. See [CheckItem.target].
  */
 @Composable
 internal fun PreExportCard(
@@ -55,13 +63,18 @@ internal fun PreExportCard(
     onExportAnyway: () -> Unit,
     onBackToEditor: () -> Unit,
     modifier: Modifier = Modifier,
+    onOpenRoom: (roomId: String) -> Unit = {},
 ) {
     when (checks) {
         ChecksState.NotApplicable -> return
         ChecksState.Running -> CheckingRow(modifier)
         is ChecksState.Done -> {
             val report = checks.report
-            if (report.isClean) AllClearRow(modifier) else IssuesCard(report, acknowledged, onExportAnyway, onBackToEditor, modifier)
+            if (report.isClean) {
+                AllClearRow(modifier)
+            } else {
+                IssuesCard(report, acknowledged, onExportAnyway, onBackToEditor, onOpenRoom, modifier)
+            }
         }
     }
 }
@@ -109,6 +122,7 @@ private fun IssuesCard(
     acknowledged: Boolean,
     onExportAnyway: () -> Unit,
     onBackToEditor: () -> Unit,
+    onOpenRoom: (roomId: String) -> Unit,
     modifier: Modifier,
 ) {
     var expanded by rememberSaveable { mutableStateOf(false) }
@@ -123,45 +137,53 @@ private fun IssuesCard(
         border = border,
         colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow),
     ) {
-        Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 8.dp)) {
+        // Rows span the card so a tappable row highlights edge to edge; everything else is inset.
+        val inset = Modifier.padding(horizontal = CARD_INSET)
+        Column(Modifier.padding(top = 14.dp, bottom = 8.dp)) {
             Text(
                 "Before you export",
                 style = MaterialTheme.typography.titleSmall,
-                modifier = Modifier.semantics { heading() },
+                modifier = inset.semantics { heading() },
             )
             Text(
                 PreExportChecks.summary(report),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = inset,
             )
             Spacer(Modifier.padding(top = 6.dp))
             val shown = if (expanded) report.items else report.items.take(COLLAPSED_ITEMS)
-            shown.forEach { item -> IssueRow(item) }
+            shown.forEach { item -> IssueRow(item, onOpenRoom, onBackToEditor) }
             if (report.items.size > COLLAPSED_ITEMS) {
-                TextButton(onClick = { expanded = !expanded }) {
+                TextButton(onClick = { expanded = !expanded }, modifier = Modifier.padding(horizontal = 4.dp)) {
                     Text(if (expanded) "Show less" else "Show all ${report.items.size}")
                 }
             }
             if (report.hasErrors) {
-                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                HorizontalDivider(inset.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
                 if (needsDecision) {
                     Text(
                         "Fix these in the editor for an accurate plan, or export anyway.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = inset,
                     )
                     Row(
-                        Modifier.fillMaxWidth().padding(top = 4.dp),
+                        inset.fillMaxWidth().padding(top = 4.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        TextButton(onClick = onBackToEditor) { Text("Back to editor") }
+                        // Lands on the first problem's room when there is one, not just on the last view.
+                        val firstRoom = report.firstErrorRoomId
+                        TextButton(onClick = { if (firstRoom != null) onOpenRoom(firstRoom) else onBackToEditor() }) {
+                            Text("Back to editor")
+                        }
                         OutlinedButton(onClick = onExportAnyway) { Text("Export anyway") }
                     }
                 } else {
                     Text(
                         "You chose to export anyway. The file will include these problems.",
-                        modifier = Modifier.padding(bottom = 8.dp),
+                        modifier = inset.padding(bottom = 8.dp),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -171,15 +193,48 @@ private fun IssuesCard(
     }
 }
 
+/**
+ * One check result. A row that leads somewhere ([CheckItem.target]) is a 48 dp button with a chevron:
+ * "Show in editor" for a room, "Back to editor" for a floor-wide fix. Other rows are plain text.
+ */
 @Composable
-private fun IssueRow(item: CheckItem) {
+private fun IssueRow(item: CheckItem, onOpenRoom: (roomId: String) -> Unit, onBackToEditor: () -> Unit) {
     val (icon, tint, label) = severityStyle(item.severity)
-    Row(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.Top) {
+    val target = item.target
+    val tappable = target != CheckTarget.None
+    val rowModifier = when (target) {
+        is CheckTarget.Room -> Modifier
+            .heightIn(min = 48.dp)
+            .clickable(role = Role.Button, onClickLabel = "Show in editor") { onOpenRoom(target.roomId) }
+        CheckTarget.Editor -> Modifier
+            .heightIn(min = 48.dp)
+            .clickable(role = Role.Button, onClickLabel = "Back to editor", onClick = onBackToEditor)
+        CheckTarget.None -> Modifier
+    }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .then(rowModifier)
+            .padding(horizontal = CARD_INSET, vertical = 5.dp),
+        verticalAlignment = if (tappable) Alignment.CenterVertically else Alignment.Top,
+    ) {
         Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(20.dp))
         Spacer(Modifier.width(12.dp))
-        Text(item.text, style = MaterialTheme.typography.bodyMedium)
+        Text(item.text, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+        if (tappable) {
+            Spacer(Modifier.width(8.dp))
+            Icon(
+                Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
+            )
+        }
     }
 }
+
+/** Horizontal inset of the card's content. */
+private val CARD_INSET = 16.dp
 
 @Composable
 private fun severityStyle(severity: IssueSeverity): Triple<ImageVector, Color, String> = when (severity) {

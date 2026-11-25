@@ -23,11 +23,12 @@ import com.oroplex.floorplan.export.ExportedFile
 import com.oroplex.floorplan.export.FloorSheet
 import com.oroplex.floorplan.export.FloorSheets
 import com.oroplex.floorplan.export.PaperSize
+import com.oroplex.floorplan.export.PdfExporter
+import com.oroplex.floorplan.export.PdfOptions
 import com.oroplex.floorplan.export.PngExporter
 import com.oroplex.floorplan.export.ProjectExporter
 import com.oroplex.floorplan.export.SheetBranding
 import com.oroplex.floorplan.export.SheetBrandings
-import com.oroplex.floorplan.export.SheetLayout
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -47,6 +48,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.util.Locale
 
 /** What the user picked. Null option values mean "use the project's own default". */
 data class ExportSelection(
@@ -59,11 +61,14 @@ data class ExportSelection(
     val includeRoomSchedule: Boolean = true,
     val showOverallDimensions: Boolean? = null,
 ) {
-    /** Resolves defaults against [project] (paper from its unit system, labels from its settings). */
-    fun resolve(project: Project): ExportRequest = ExportRequest(
+    /**
+     * Resolves defaults against [project]: labels from its settings, paper from where the device is
+     * ([country], ISO 3166 alpha-2: Letter in the US and Canada, A4 elsewhere; see [PaperSize.defaultFor]).
+     */
+    fun resolve(project: Project, country: String = Locale.getDefault().country): ExportRequest = ExportRequest(
         format = format,
         floorId = floorId?.takeIf { id -> project.floors.any { it.id == id } },
-        paper = paper ?: if (project.settings.unitSystem == UnitSystem.METRIC) PaperSize.A4 else PaperSize.LETTER,
+        paper = paper ?: PaperSize.defaultFor(project.settings.unitSystem, country),
         showWallLengths = showWallLengths ?: project.settings.showWallLengths,
         showAreas = showAreas ?: project.settings.showRoomAreas,
         includeRoomSchedule = includeRoomSchedule,
@@ -72,6 +77,22 @@ data class ExportSelection(
 }
 
 data class FloorOption(val id: String, val name: String, val roomCount: Int)
+
+/** Short notices the export screen shows next to the choices (pure, unit-tested). */
+object ExportHints {
+    /**
+     * Says which floors an "All floors" export leaves out because they have no rooms ([names], in floor
+     * order), so a lower page count is not a surprise; null when nothing is left out.
+     */
+    fun skippedFloors(names: List<String>): String? {
+        val shown = names.map { it.trim().ifEmpty { "Floor" } }
+        return when (shown.size) {
+            0 -> null
+            1 -> "“${shown[0]}” has no rooms, so it is left out."
+            else -> "${shown.size} floors have no rooms, so they are left out: ${shown.joinToString(", ")}."
+        }
+    }
+}
 
 /** Share or save: the two ways a file leaves the export screen. */
 enum class ExportAction { SHARE, SAVE }
@@ -419,7 +440,7 @@ class ExportViewModel(
                 !multi && s.floorId == null && project.floors.size > 1 ->
                     "${request.format.name} holds one floor — exporting “${covered.firstOrNull()?.name.orEmpty()}”. " +
                         "Pick another floor above."
-                else -> null
+                else -> ExportHints.skippedFloors(ProjectExporter.skippedEmptyFloors(project, request).map { it.name })
             }
             val report = (checksState as? ChecksState.Done)?.report
             val gate = report?.let { PreExportChecks.gate(it, ackKey) } ?: ExportGate.Clear
@@ -446,23 +467,28 @@ class ExportViewModel(
         }
     }
 
-    /** Runs on Dispatchers.Default. Never throws: problems become a [ExportPreview.Message]. */
+    /**
+     * Runs on Dispatchers.Default. Never throws: problems become a [ExportPreview.Message].
+     *
+     * Every preview is built by the same code as the file. The PDF preview is page 1 of the document the
+     * exporter prepares, so its scale, orientation and page count are the file's; drawings are rendered with
+     * [ExportRequest.labels], the annotations the format really carries.
+     */
     private fun buildPreview(project: Project, request: ExportRequest, branding: SheetBranding?): ExportPreview {
         val floors = ProjectExporter.floorsFor(project, request)
         val floor = floors.firstOrNull() ?: return ExportPreview.Message("This project has no floors yet.")
         return try {
             when (request.format) {
                 ExportFormat.PDF -> {
-                    val sheet = FloorSheets.build(project, floor, request.labels, dateText, branding)
-                        .copy(showScaleRatio = true)
-                    val landscape = SheetLayout.isLandscape(sheet.drawList?.bounds)
-                    val pages = if (floors.size == 1) "1 plan page" else "${floors.size} plan pages"
-                    val schedule = if (request.includeRoomSchedule) " + room schedule" else ""
+                    val options = PdfOptions(request.paper, request.labels, request.includeRoomSchedule)
+                    val prepared = PdfExporter.prepare(project, floors, options, dateText, branding)
+                    val sheet = prepared.labeledSheets.first()
+                    val landscape = prepared.isLandscape(sheet)
                     ExportPreview.Sheet(
                         sheet = sheet,
                         widthPt = request.paper.widthPt(landscape).toDouble(),
                         heightPt = request.paper.heightPt(landscape).toDouble(),
-                        caption = "${request.paper.label} ${if (landscape) "landscape" else "portrait"} · $pages$schedule",
+                        caption = prepared.summary,
                     )
                 }
                 ExportFormat.PNG -> {
@@ -476,9 +502,9 @@ class ExportViewModel(
                     )
                 }
                 ExportFormat.SVG, ExportFormat.DXF -> {
-                    // DXF has no overall dimension lines; the preview shows what the file contains.
-                    val labels = if (request.format == ExportFormat.DXF) request.labels.copy(showOverallDimensions = false) else request.labels
-                    val drawList = FloorSheets.renderFloor(project, floor, labels, 1.0)
+                    // request.labels is format-aware: for DXF it has no wall lengths, and room areas and the
+                    // overall dimensions follow the same switches the DXF exporter is given.
+                    val drawList = FloorSheets.renderFloor(project, floor, request.labels, 1.0)
                         ?: return ExportPreview.Message(FloorSheets.EMPTY_FLOOR_MESSAGE)
                     val caption = if (request.format == ExportFormat.DXF) {
                         val units = if (project.settings.unitSystem == UnitSystem.IMPERIAL) "inches" else "millimeters"

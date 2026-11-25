@@ -1,5 +1,7 @@
 package com.oroplex.floorplan.ui.onboarding
 
+import com.oroplex.floorplan.core.model.UnitSystem
+
 /** Which illustration a page shows. */
 enum class OnboardingArt { PLAN, SCAN, ACCURACY, READY }
 
@@ -9,6 +11,8 @@ data class OnboardingPage(
     val title: String,
     val body: String,
     val points: List<String> = emptyList(),
+    /** The page also asks which units to measure in (see [Onboarding.UNITS_TITLE]). */
+    val asksUnits: Boolean = false,
 )
 
 /**
@@ -61,8 +65,26 @@ object Onboarding {
                 "Add your company name and logo in Settings",
                 "Replay this tour anytime from Settings",
             ),
+            asksUnits = true,
         ),
     )
+
+    /**
+     * The units question on the last page. The answer starts out as the device's country suggests and is
+     * written to the app-wide defaults (SettingsRepository.update), which only new projects copy: projects
+     * that already exist keep their own units, also when the tour is replayed from Settings.
+     */
+    const val UNITS_TITLE = "Measure in"
+    const val UNITS_HINT = "For new projects. You can change it anytime in Settings."
+
+    /** The two choices in the order they are offered. */
+    val unitChoices: List<UnitSystem> = listOf(UnitSystem.IMPERIAL, UnitSystem.METRIC)
+
+    /** Button label of a units choice (the same words as the editor's project settings). */
+    fun unitLabel(system: UnitSystem): String = when (system) {
+        UnitSystem.IMPERIAL -> "Feet & inches"
+        UnitSystem.METRIC -> "Metric"
+    }
 
     val lastIndex: Int get() = pages.lastIndex
 

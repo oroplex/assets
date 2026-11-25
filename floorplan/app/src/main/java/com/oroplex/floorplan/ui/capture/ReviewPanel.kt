@@ -34,6 +34,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
@@ -106,7 +107,7 @@ internal fun ReviewPanel(
 ) {
     val d = ui.draft
     val enabled = !ui.busy && !ui.finished
-    val maxHeight = (LocalConfiguration.current.screenHeightDp * 0.62f).dp
+    val maxHeight = (LocalConfiguration.current.screenHeightDp * 0.72f).dp
     val focusManager = LocalFocusManager.current
     val units = ui.settings.unitSystem
     val quality = remember(room, units) { room?.let { reviewQuality(safeAssess(it, units)) } }
@@ -116,12 +117,14 @@ internal fun ReviewPanel(
         color = MaterialTheme.colorScheme.surface,
         shadowElevation = 8.dp,
     ) {
+        // The details scroll; the two Save buttons stay pinned below them, always on screen: saving is what
+        // the user does at the end of every room, often one-handed on a job site.
+        Column(modifier = Modifier.navigationBarsPadding().heightIn(max = maxHeight)) {
         Column(
             modifier = Modifier
-                .navigationBarsPadding()
-                .heightIn(max = maxHeight)
+                .weight(1f, fill = false)
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 16.dp),
+                .padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 8.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -187,6 +190,26 @@ internal fun ReviewPanel(
             )
             RoomTypeDropdown(d.type, enabled, actions::setType)
 
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                val wallsLabel = if (d.method == CaptureMethod.CORNERS) "Back to corners" else "Back to walls"
+                EditButton(wallsLabel, Icons.AutoMirrored.Filled.ArrowBack, enabled, actions::backToWalls)
+                EditButton("Doors & windows", Icons.Outlined.DoorFront, enabled, actions::backToOpenings)
+                EditButton("Redo room", Icons.Outlined.Replay, enabled, actions::redoRoom)
+            }
+            Text(
+                "Scan every room of this floor before you finish: rooms scanned later won't line up automatically.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Column(
+            modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 10.dp, bottom = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             if (ui.saving) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
@@ -204,20 +227,7 @@ internal fun ReviewPanel(
                 enabled = canSave,
                 modifier = Modifier.fillMaxWidth().height(48.dp),
             ) { Text("Save & finish") }
-            Text(
-                "Scan every room of this floor before you finish: rooms scanned later won't line up automatically.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                val wallsLabel = if (d.method == CaptureMethod.CORNERS) "Back to corners" else "Back to walls"
-                EditButton(wallsLabel, Icons.AutoMirrored.Filled.ArrowBack, enabled, actions::backToWalls)
-                EditButton("Doors & windows", Icons.Outlined.DoorFront, enabled, actions::backToOpenings)
-                EditButton("Redo room", Icons.Outlined.Replay, enabled, actions::redoRoom)
-            }
+        }
         }
     }
 }

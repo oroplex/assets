@@ -106,8 +106,15 @@ class AppWalkthroughTest {
         rule.waitForIdle()
     }
 
+    /** Scrolls the screen's content down by about a third of the screen. */
     private fun scrollDown() {
-        rule.onAllNodes(isRoot()).onFirst().performTouchInput { swipeUp() }
+        rule.onAllNodes(isRoot()).onFirst().performTouchInput { swipeUp(startY = height * 0.7f, endY = height * 0.35f, durationMillis = 400) }
+        rule.waitForIdle()
+    }
+
+    /** Waits until some text containing [part] is on screen. */
+    private fun awaitTextContaining(part: String, timeoutMs: Long = 15_000) {
+        rule.waitUntil(timeoutMs) { rule.onAllNodesWithText(part, substring = true).fetchSemanticsNodes().isNotEmpty() }
         rule.waitForIdle()
     }
 
@@ -186,6 +193,7 @@ class AppWalkthroughTest {
         openSampleHouse()
         tap("3D view")
         await("Reset view")
+        awaitTextContaining("Drag to rotate")
         shoot("view3d", "sample-house")
     }
 
@@ -195,10 +203,10 @@ class AppWalkthroughTest {
         tap("Export")
         await("Share")
         shoot("export", "pdf")
-        scrollDown()
-        shoot("export", "scrolled")
-        scrollDown()
-        shoot("export", "scrolled-more")
+        repeat(4) {
+            scrollDown()
+            shoot("export", "scrolled-${it + 1}")
+        }
     }
 
     @Test
@@ -207,10 +215,10 @@ class AppWalkthroughTest {
         tap("Settings")
         await("Show wall lengths")
         shoot("settings", "top")
-        scrollDown()
-        shoot("settings", "scrolled")
-        scrollDown()
-        shoot("settings", "scrolled-more")
+        repeat(5) {
+            scrollDown()
+            shoot("settings", "scrolled-${it + 1}")
+        }
     }
 
     /** "Scan room" without a camera or ARCore: the app must show its explanation screens, not crash. */

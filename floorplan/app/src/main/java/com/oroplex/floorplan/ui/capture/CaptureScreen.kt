@@ -214,7 +214,7 @@ internal fun interruptedScanText(notice: InterruptedScan): String {
 
 /** Everything layered over the live camera once the AR session runs. */
 @Composable
-private fun CaptureContent(
+internal fun CaptureContent(
     vm: CaptureViewModel,
     state: State<CaptureUiState>,
     controller: ArCaptureController,

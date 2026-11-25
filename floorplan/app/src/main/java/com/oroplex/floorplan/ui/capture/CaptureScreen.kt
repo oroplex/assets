@@ -64,12 +64,6 @@ fun CaptureScreen(projectId: String, floorId: String, onDone: () -> Unit) {
     val state = vm.state.collectAsStateWithLifecycle()
     val finished by remember { derivedStateOf { state.value.finished } }
     val loadError by remember { derivedStateOf { state.value.loadError } }
-    val confirmDiscard by remember { derivedStateOf { state.value.confirmDiscard } }
-    val confirmEndSession by remember { derivedStateOf { state.value.confirmEndSession } }
-    val interrupted by remember { derivedStateOf { state.value.interrupted } }
-    val savedRoomCount by remember { derivedStateOf { state.value.sessionRoomIds.size } }
-    val showTips by remember { derivedStateOf { state.value.showTips } }
-    val tipsFromHelp by remember { derivedStateOf { state.value.tipsFromHelp } }
     val currentOnDone by rememberUpdatedState(onDone)
 
     // The AR controller last handed to the capture UI. Back on the AR host's own screens (e.g. "camera in
@@ -96,18 +90,34 @@ fun CaptureScreen(projectId: String, floorId: String, onDone: () -> Unit) {
     }
 
     // Composed outside the AR host so they also show above its error screens.
+    CaptureDialogs(vm, state) { lastController }
+}
+
+/**
+ * The capture flow's dialogs (discard room, end scan, interrupted scan) and the "How to scan" sheet. Kept
+ * apart from [CaptureContent] so they also show above the AR host's own error screens; [lastController] is
+ * the AR controller last handed to the capture UI, if any.
+ */
+@Composable
+internal fun CaptureDialogs(vm: CaptureViewModel, state: State<CaptureUiState>, lastController: () -> ArCaptureController?) {
+    val confirmDiscard by remember { derivedStateOf { state.value.confirmDiscard } }
+    val confirmEndSession by remember { derivedStateOf { state.value.confirmEndSession } }
+    val interrupted by remember { derivedStateOf { state.value.interrupted } }
+    val savedRoomCount by remember { derivedStateOf { state.value.sessionRoomIds.size } }
+    val showTips by remember { derivedStateOf { state.value.showTips } }
+    val tipsFromHelp by remember { derivedStateOf { state.value.tipsFromHelp } }
     if (confirmDiscard) {
         DiscardRoomDialog(
             savedRoomCount = savedRoomCount,
             onKeepScanning = vm::discardRoom,
-            onEndScan = { vm.discardAndExit(lastController) },
+            onEndScan = { vm.discardAndExit(lastController()) },
             onCancel = vm::dismissDiscard,
         )
     }
     if (confirmEndSession) {
         EndScanDialog(
             savedRoomCount = savedRoomCount,
-            onEnd = { vm.endSession(lastController) },
+            onEnd = { vm.endSession(lastController()) },
             onKeepScanning = vm::dismissEndSession,
         )
     }

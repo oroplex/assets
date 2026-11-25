@@ -30,7 +30,10 @@ import com.oroplex.floorplan.core.model.WallObservation
 import com.oroplex.floorplan.core.model.WallSource
 import com.oroplex.floorplan.data.ProjectRepository
 import com.oroplex.floorplan.data.ProjectSummary
+import com.oroplex.floorplan.core.model.CaptureMethod
 import com.oroplex.floorplan.ui.capture.CaptureContent
+import com.oroplex.floorplan.ui.capture.CaptureDialogs
+import com.oroplex.floorplan.ui.capture.CaptureSnapshotStore
 import com.oroplex.floorplan.ui.capture.CaptureStep
 import com.oroplex.floorplan.ui.capture.CaptureViewModel
 import com.oroplex.floorplan.ui.capture.OneTimeFlag
@@ -64,18 +67,25 @@ class CaptureWalkthroughTest {
     @Test
     fun scanARoomFacingAWhiteWall() = scanARoom("capture-bright", listOf(Color(0xFFF4F2EE), Color(0xFFD9D5CC)))
 
+    /** Shows the capture UI (and its dialogs) for [vm] over [backdrop]; returns the driver to pump and shoot with. */
+    private fun host(vm: CaptureViewModel, controller: FakeController, backdrop: List<Color>): RawUi {
+        rule.mainClock.autoAdvance = false
+        rule.activity.setContent {
+            FloorPlanTheme {
+                val state = vm.state.collectAsStateWithLifecycle()
+                Box(Modifier.fillMaxSize().background(Brush.verticalGradient(backdrop))) {
+                    CaptureContent(vm, state, controller)
+                }
+                CaptureDialogs(vm, state) { controller }
+            }
+        }
+        return RawUi(rule.mainClock)
+    }
+
     private fun scanARoom(group: String, backdrop: List<Color>) {
         val controller = FakeController()
         val vm = CaptureViewModel(FakeRepository(project), project.id, FLOOR_ID, OneTimeFlag.InMemory(true))
-        rule.mainClock.autoAdvance = false
-        val ui = RawUi(rule.mainClock)
-        rule.activity.setContent {
-            FloorPlanTheme {
-                Box(Modifier.fillMaxSize().background(Brush.verticalGradient(backdrop))) {
-                    CaptureContent(vm, vm.state.collectAsStateWithLifecycle(), controller)
-                }
-            }
-        }
+        val ui = host(vm, controller, backdrop)
         fun show(frame: ArFrameState) {
             controller.frames.value = frame
             ui.pump()
@@ -120,10 +130,75 @@ class CaptureWalkthroughTest {
         ui.pump()
         ui.shoot(group, "review")
 
-        // 6. Leaving with a room in progress.
+        // 6. Leaving with a room in progress: the discard dialog.
         vm.requestExit(controller)
+        ui.shoot(group, "discard-dialog")
+        vm.dismissDiscard()
         ui.pump()
-        ui.shoot(group, "leave-dialog")
+
+        // 7. Save and start the next room; leaving now asks before ending the scan.
+        vm.saveAndScanNext(controller)
+        ui.pump(1_000)
+        ui.shoot(group, "next-room")
+        vm.requestExit(controller)
+        ui.shoot(group, "end-scan-dialog")
+        vm.dismissEndSession()
+        ui.pump()
+
+        // 8. The help sheet.
+        vm.openTips()
+        ui.shoot(group, "how-to-scan")
+        vm.dismissTips()
+        ui.pump()
+
+        // 9. Second room in corners mode, with a failed measurement and then lost tracking.
+        if (vm.state.value.step == CaptureStep.CEILING) vm.skipCeiling(controller)
+        vm.setMethod(CaptureMethod.CORNERS)
+        show(frame(t = 20, lookAt = FLOOR_AHEAD, reticle = ReticleHit(FLOOR_AHEAD, SurfaceKind.FLOOR, 2.0, Vec3.UP)))
+        for (corner in listOf(Vec3(5.0, 0.0, 1.5), Vec3(8.0, 0.0, 1.5), Vec3(8.0, 0.0, -1.5))) {
+            controller.results += MeasureResult.Point(corner, samples = 6, spread = 0.01)
+            vm.addCorner(controller)
+        }
+        ui.shoot(group, "corners-three-tapped")
+        vm.addCorner(controller) // nothing queued: the measurement fails and says why
+        ui.shoot(group, "measurement-failed")
+        show(
+            frame(t = 21, lookAt = WALL_AHEAD, reticle = null).copy(
+                tracking = TrackingStatus.PAUSED,
+                problem = TrackingProblem.INSUFFICIENT_FEATURES,
+            ),
+        )
+        ui.pump(1_500)
+        ui.shoot(group, "tracking-lost")
+    }
+
+    /** The app was killed mid-scan and restored into a new AR session: the recovery dialog. */
+    @Test
+    fun interruptedScan() {
+        val backdrop = listOf(Color(0xFF2B2E33), Color(0xFF4A4741))
+        val store = CaptureSnapshotStore.InMemory()
+        val repository = FakeRepository(project)
+        val first = FakeController("session-before")
+        val before = CaptureViewModel(repository, project.id, FLOOR_ID, OneTimeFlag.InMemory(true), snapshotStore = store)
+        before.attach(first)
+        val floorFrame = frame(t = 2, lookAt = FLOOR_AHEAD, reticle = ReticleHit(FLOOR_AHEAD, SurfaceKind.FLOOR, 2.0, Vec3.UP))
+        first.frames.value = floorFrame
+        before.onFrame(floorFrame, first, nowNs = 0L)
+        before.onFrame(floorFrame.copy(timestampNs = 3), first, nowNs = 1_500_000_000L)
+        before.skipCeiling(first)
+        rectangleWalls().forEach { capture(before, first, it) }
+        before.closeRoom()
+        before.finishOpenings()
+        assertEquals(CaptureStep.REVIEW, before.state.value.step)
+        before.onBackground(first)
+        store.saveNow()
+
+        val second = FakeController("session-after")
+        val after = CaptureViewModel(repository, project.id, FLOOR_ID, OneTimeFlag.InMemory(true), snapshotStore = store)
+        val ui = host(after, second, backdrop)
+        second.frames.value = frame(t = 30, floorY = null, lookAt = FLOOR_AHEAD, reticle = null)
+        ui.pump(1_000)
+        ui.shoot("capture-interrupted", "recovery-dialog")
     }
 
     private fun capture(vm: CaptureViewModel, controller: FakeController, wall: WallObservation) {

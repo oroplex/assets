@@ -188,6 +188,56 @@ class AppWalkthroughTest {
         }
     }
 
+    /**
+     * Opens every editor dialog, sheet and menu once (the first crash this walkthrough found lived in a
+     * dialog). A step whose trigger is not on screen is skipped with a note; an exception thrown by the app
+     * fails the test.
+     */
+    @Test
+    fun editorDialogs() {
+        openSampleHouse()
+        rule.mainClock.autoAdvance = false
+        val ui = RawUi(rule.mainClock)
+        val skipped = ArrayList<String>()
+        fun step(name: String, block: RawUi.() -> Unit) {
+            try {
+                ui.block()
+                ui.shoot("dialogs", name)
+            } catch (e: AssertionError) {
+                skipped += "$name: ${e.message?.take(160)}"
+            }
+            ui.dismissAll()
+        }
+        step("project-settings") { tap("More options"); tap("Project settings"); await("Cancel") }
+        step("rename-project") { tap("More options"); tap("Rename project"); await("Cancel") }
+        step("add-floor") { tap("Add floor"); await("Cancel") }
+        step("floor-menu") { tap("Floor options"); await("Rooms") }
+        step("rooms-sheet") { tap("Floor options"); tap("Rooms") }
+        step("rename-floor") { tap("Floor options"); tap("Rename floor"); await("Cancel") }
+
+        // Room panel and its dialogs (selected the way TalkBack would, through the canvas actions).
+        fun selectRoom() = ui.customAction("Floor plan", "Select Living")
+        step("room-panel") { selectRoom() }
+        step("room-details") { selectRoom(); tap("Rename room"); await("Cancel") }
+        step("ceiling-height") { selectRoom(); tap("Edit"); await("Cancel") }
+        step("edit-opening") { selectRoom(); tapStartingWith("Window"); await("Cancel") }
+        step("re-solve") { selectRoom(); tap("Re-solve") }
+        step("delete-room") { selectRoom(); tap("Delete"); await("Cancel") }
+
+        // Wall panel and its dialogs.
+        fun selectWall() {
+            selectRoom()
+            ui.customAction("Floor plan", "Select wall 1")
+        }
+        step("wall-panel") { selectWall() }
+        step("set-wall-length") { selectWall(); tap("Set length"); await("Cancel") }
+        step("calibrate-floor") { selectWall(); tap("Calibrate floor"); await("Cancel") }
+        step("corner-panel") { selectRoom(); customAction("Floor plan", "Select corner 1") }
+
+        rule.mainClock.autoAdvance = true
+        if (skipped.isNotEmpty()) System.err.println("walkthrough: skipped editor steps:\n  " + skipped.joinToString("\n  "))
+    }
+
     @Test
     fun view3d() {
         openSampleHouse()

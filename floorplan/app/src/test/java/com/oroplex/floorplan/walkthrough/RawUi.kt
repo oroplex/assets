@@ -1,6 +1,7 @@
 package com.oroplex.floorplan.walkthrough
 
 import android.os.Looper
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inspector.WindowInspector
@@ -74,6 +75,45 @@ internal class RawUi(private val clock: MainTestClock) {
             ?: throw AssertionError("No clickable \"$label\" (raw). Labels on screen: ${nodes().flatMap { it.labels() }}")
         node.config[SemanticsActions.OnClick].action?.invoke()
         pump()
+    }
+
+    /** Clicks the last clickable node with a label that starts with [prefix]. */
+    fun tapStartingWith(prefix: String) {
+        val node = nodes().lastOrNull { n -> n.labels().any { it.startsWith(prefix) } && n.config.getOrNull(SemanticsActions.OnClick) != null }
+            ?: throw AssertionError("No clickable label starting with \"$prefix\" (raw). Labels on screen: ${nodes().flatMap { it.labels() }}")
+        node.config[SemanticsActions.OnClick].action?.invoke()
+        pump()
+    }
+
+    /**
+     * Runs the accessibility custom action whose label starts with [actionPrefix] on the node whose label
+     * contains [nodeLabelPart] (e.g. the plan canvas' "Select wall 1 ..." action, as TalkBack would).
+     */
+    fun customAction(nodeLabelPart: String, actionPrefix: String) {
+        val node = nodes().lastOrNull { n -> n.labels().any { nodeLabelPart in it } }
+            ?: throw AssertionError("No node labelled like \"$nodeLabelPart\" (raw)")
+        val actions = node.config.getOrNull(SemanticsActions.CustomActions).orEmpty()
+        val action = actions.firstOrNull { it.label.startsWith(actionPrefix) }
+            ?: throw AssertionError("No custom action starting with \"$actionPrefix\"; available: ${actions.map { it.label }}")
+        action.action()
+        pump()
+    }
+
+    /** System Back on the topmost window (closes a dialog, menu or sheet); false if only the screen is shown. */
+    fun dismissTop(): Boolean {
+        val roots = WindowInspector.getGlobalWindowViews().filter { it.isShown }
+        if (roots.size < 2) return false
+        val top = roots.last()
+        top.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK))
+        top.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK))
+        pump()
+        return true
+    }
+
+    /** Closes every dialog, menu and sheet that is open. */
+    fun dismissAll() {
+        var guard = 0
+        while (guard++ < 5 && dismissTop()) Unit
     }
 
     fun shoot(group: String, name: String) {

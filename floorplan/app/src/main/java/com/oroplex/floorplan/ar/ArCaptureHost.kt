@@ -42,12 +42,13 @@ import com.google.ar.core.exceptions.CameraNotAvailableException
 @Composable
 fun ArCaptureHost(
     modifier: Modifier = Modifier,
+    mode: ArSessionMode = ArSessionMode.MEASURE,
     onExit: () -> Unit,
     content: @Composable (controller: ArCaptureController) -> Unit,
 ) {
     Box(modifier.fillMaxSize().background(Color.Black)) {
         CameraPermissionGate(onExit = onExit) {
-            ArSessionGate(onExit = onExit, content = content)
+            ArSessionGate(mode = mode, onExit = onExit, content = content)
         }
     }
 }
@@ -112,7 +113,7 @@ private sealed interface SetupState {
 }
 
 @Composable
-private fun ArSessionGate(onExit: () -> Unit, content: @Composable (ArCaptureController) -> Unit) {
+private fun ArSessionGate(mode: ArSessionMode, onExit: () -> Unit, content: @Composable (ArCaptureController) -> Unit) {
     val context = LocalContext.current
     val activity = remember(context) { context.findActivity() }
     var state by remember { mutableStateOf<SetupState>(SetupState.Checking) }
@@ -131,7 +132,7 @@ private fun ArSessionGate(onExit: () -> Unit, content: @Composable (ArCaptureCon
         }
         state = SetupState.Checking
         state = when (val availability = ArAvailability.prepare(activity, userRequestedInstall = !installRequested)) {
-            ArAvailabilityResult.Ready -> when (val created = ArSessionFactory.create(activity)) {
+            ArAvailabilityResult.Ready -> when (val created = ArSessionFactory.create(activity, mode)) {
                 is SessionCreateResult.Created -> SetupState.Ready(created.holder)
                 is SessionCreateResult.Failed -> SetupState.Failed(created.error)
             }

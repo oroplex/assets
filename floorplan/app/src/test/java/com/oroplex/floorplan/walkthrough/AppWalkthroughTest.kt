@@ -198,6 +198,13 @@ class AppWalkthroughTest : WalkthroughBase() {
     }
 
     @Test
+    fun recordWalkthroughWithoutCamera() {
+        skipOnboarding()
+        tap("Record walk-through")
+        shoot("recording", "entry-without-camera")
+    }
+
+    @Test
     @Config(sdk = [35], qualifiers = WALKTHROUGH_PHONE_NIGHT)
     fun darkTheme() {
         skipOnboarding()

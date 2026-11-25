@@ -1,5 +1,22 @@
 # First test on the phone
 
+## The five-minute test: record a walk-through
+This is the test that matters now. It needs no tape measure.
+
+1. Install the newest build and open the app. On the project list tap the **camera icon** at the top.
+2. Allow the camera. If Google Play Services for AR will not install, stop and say so.
+3. Tap **Start recording** and walk slowly through one room (or the whole floor), phone upright at chest
+   height. Pan across each wall, keep the bottom of the walls in view, and end where you started.
+   One to three minutes is plenty.
+4. Tap **Stop and save**. Then **Share** it (Quick Share to the PC, or Google Drive) or tap **Downloads**
+   and copy `Download/FloorPlanScan/Walkthrough-….zip` to the PC over USB.
+5. Say where the file is, and anything that looked wrong: a message, a freeze, "frames" not counting up.
+
+What the first recording decides: whether the phone gives the app sharp enough frames and steady enough
+tracking for a computer to build the plan from. Everything after that is built against that file.
+
+## The longer test: measuring a room wall by wall
+
 The app has been checked on a computer in every way that does not need a camera. This first session answers
 the two questions only a phone can: **does scanning work on the Galaxy S26 Ultra, and how accurate is it?**
 Plan on about 30 minutes. A tape measure (or a laser measure) is required.

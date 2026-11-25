@@ -1,2 +1,4 @@
 # Temporary git worktrees used by Claude Code agents
 .claude/worktrees/
+__pycache__/
+*.pyc

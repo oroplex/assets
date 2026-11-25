@@ -58,11 +58,20 @@ internal sealed interface SessionCreateResult {
     class Failed(val error: ArSetupError) : SessionCreateResult
 }
 
+/**
+ * What a session is for. [RECORD] asks the camera for larger images for the app to read (see
+ * [ArSessionFactory.selectCameraConfig]); everything else about the session is the same.
+ */
+enum class ArSessionMode { MEASURE, RECORD }
+
 /** Creates and configures the ARCore session (main thread, after availability was confirmed). */
 internal object ArSessionFactory {
     private const val PREFERRED_FPS = 30
 
-    fun create(activity: Activity): SessionCreateResult {
+    /** Width (pixels, landscape) of the camera images a walk-through recording asks for: 1280 x 720 or 960. */
+    private const val RECORD_IMAGE_WIDTH = 1280
+
+    fun create(activity: Activity, mode: ArSessionMode = ArSessionMode.MEASURE): SessionCreateResult {
         val session = try {
             Session(activity)
         } catch (e: UnavailableArcoreNotInstalledException) {
@@ -83,7 +92,7 @@ internal object ArSessionFactory {
         }
 
         return try {
-            val hardwareDepth = selectCameraConfig(session)
+            val hardwareDepth = selectCameraConfig(session, mode)
             val depthEnabled = configure(session)
             ArLog.i(describe(session, hardwareDepth))
             SessionCreateResult.Created(ArSessionHolder(session, depthEnabled, hardwareDepth))
@@ -111,10 +120,15 @@ internal object ArSessionFactory {
      *    config with the same GPU texture size is chosen (30 fps leaves GPU / thermal headroom for the
      *    per-frame hit testing and halves the number of near-duplicate frames).
      *
+     * 3. For a walk-through recording ([ArSessionMode.RECORD]) the image the app reads matters too: ARCore's
+     *    default is 640 x 480, too coarse for a computer to reconstruct rooms from. Among the configs that
+     *    pass rule 1 or 2, the one whose image is closest to [RECORD_IMAGE_WIDTH] pixels wide is taken
+     *    (a 1920 x 1080 image triples the storage and the time to save a frame for little gain).
+     *
      * Returns true when the active config uses a hardware depth sensor. Never throws: on any error the
      * default config is kept.
      */
-    private fun selectCameraConfig(session: Session): Boolean {
+    private fun selectCameraConfig(session: Session, mode: ArSessionMode): Boolean {
         val tofUsage = EnumSet.of(CameraConfig.DepthSensorUsage.REQUIRE_AND_USE)
         val fpsPreferences = listOf(
             EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30),
@@ -122,7 +136,7 @@ internal object ArSessionFactory {
         )
         var tofSelected = false
         for (fps in fpsPreferences) {
-            val tofConfig = supportedConfigs(session, fps, tofUsage).firstOrNull() ?: continue
+            val tofConfig = preferred(supportedConfigs(session, fps, tofUsage), mode, null) ?: continue
             if (applyConfig(session, tofConfig)) {
                 tofSelected = true
                 break
@@ -133,8 +147,11 @@ internal object ArSessionFactory {
             try {
                 val current = session.cameraConfig
                 val maxFps = current.fpsRange?.upper ?: PREFERRED_FPS
-                if (maxFps > PREFERRED_FPS) {
-                    val thirty = supportedConfigs(session, EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30), null)
+                val thirty = supportedConfigs(session, EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30), null)
+                if (mode == ArSessionMode.RECORD) {
+                    val match = preferred(thirty, mode, current)
+                    if (match != null && match.imageSize != current.imageSize) applyConfig(session, match)
+                } else if (maxFps > PREFERRED_FPS) {
                     val match = thirty.firstOrNull { it.textureSize == current.textureSize } ?: thirty.firstOrNull()
                     if (match != null) applyConfig(session, match)
                 }
@@ -149,6 +166,22 @@ internal object ArSessionFactory {
             false
         }
     }
+
+    /**
+     * The config to use out of [configs]: the first one when measuring (ARCore lists its own preference
+     * first); for a recording the one whose image is closest to [RECORD_IMAGE_WIDTH] wide, and among those
+     * one with [current]'s texture size, so the picture on screen does not change.
+     */
+    private fun preferred(configs: List<CameraConfig>, mode: ArSessionMode, current: CameraConfig?): CameraConfig? {
+        if (mode != ArSessionMode.RECORD) return configs.firstOrNull()
+        val best = configs.minOfOrNull { imageWidthMiss(it.imageSize.width) } ?: return null
+        val closest = configs.filter { imageWidthMiss(it.imageSize.width) == best }
+        return closest.firstOrNull { current != null && it.textureSize == current.textureSize } ?: closest.firstOrNull()
+    }
+
+    /** How far an image [width] is from the recording's preferred one; a little too large beats too small. */
+    internal fun imageWidthMiss(width: Int): Int =
+        if (width >= RECORD_IMAGE_WIDTH) width - RECORD_IMAGE_WIDTH else 2 * (RECORD_IMAGE_WIDTH - width)
 
     private fun supportedConfigs(
         session: Session,

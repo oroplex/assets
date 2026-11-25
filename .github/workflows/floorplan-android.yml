@@ -35,6 +35,11 @@ jobs:
       - name: App unit tests and headless UI walkthrough
         run: ./gradlew :app:testDebugUnitTest --console=plain
 
+      - name: Walk-through reader (computer side) against a synthetic room and the app's own sample
+        run: |
+          python3 -m pip install --quiet numpy pillow
+          python3 tools/walkthrough/test_recording.py app/build/walkthrough-sample
+
       - name: Upload UI walkthrough screenshots
         if: always()
         uses: actions/upload-artifact@v4

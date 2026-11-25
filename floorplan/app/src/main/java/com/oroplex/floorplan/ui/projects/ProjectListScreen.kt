@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.outlined.Apartment
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
@@ -93,7 +94,11 @@ private sealed interface ListDialog {
 }
 
 @Composable
-fun ProjectListScreen(onOpenProject: (projectId: String) -> Unit, onOpenSettings: () -> Unit) {
+fun ProjectListScreen(
+    onOpenProject: (projectId: String) -> Unit,
+    onOpenSettings: () -> Unit,
+    onRecordWalkthrough: () -> Unit = {},
+) {
     val container = appContainer()
     val viewModel: ProjectListViewModel = viewModel(factory = ProjectListViewModel.Factory(container.projects, container.settings))
     val summaries by viewModel.summaries.collectAsStateWithLifecycle()
@@ -150,6 +155,7 @@ fun ProjectListScreen(onOpenProject: (projectId: String) -> Unit, onOpenSettings
                 onImport = startImport,
                 onOpenSettings = onOpenSettings,
                 onOpenSample = viewModel::openSample,
+                onRecordWalkthrough = onRecordWalkthrough,
             )
         },
         floatingActionButton = {
@@ -229,16 +235,30 @@ fun ProjectListScreen(onOpenProject: (projectId: String) -> Unit, onOpenSettings
 }
 
 @Composable
-private fun ProjectListTopBar(onImport: () -> Unit, onOpenSettings: () -> Unit, onOpenSample: () -> Unit) {
+private fun ProjectListTopBar(
+    onImport: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenSample: () -> Unit,
+    onRecordWalkthrough: () -> Unit,
+) {
     var menuOpen by remember { mutableStateOf(false) }
     TopAppBar(
         title = { Text("FloorPlan Scan") },
         actions = {
+            IconButton(onClick = onRecordWalkthrough) { Icon(Icons.Filled.Videocam, contentDescription = "Record walk-through") }
             IconButton(onClick = onImport) { Icon(Icons.Filled.FileOpen, contentDescription = "Import backup") }
             IconButton(onClick = onOpenSettings) { Icon(Icons.Filled.Settings, contentDescription = "Settings") }
             Box {
                 IconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "More options") }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text("Record walk-through") },
+                        leadingIcon = { Icon(Icons.Filled.Videocam, contentDescription = null) },
+                        onClick = {
+                            menuOpen = false
+                            onRecordWalkthrough()
+                        },
+                    )
                     DropdownMenuItem(
                         text = { Text("Open sample house") },
                         leadingIcon = { Icon(Icons.Outlined.Apartment, contentDescription = null) },

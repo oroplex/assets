@@ -3,6 +3,7 @@ package com.oroplex.floorplan.ar
 import com.oroplex.floorplan.core.fit.WallFit
 import com.oroplex.floorplan.core.geometry.RigidTransform2
 import com.oroplex.floorplan.core.geometry.Vec3
+import com.oroplex.floorplan.recording.WalkthroughRecording
 import kotlinx.coroutines.flow.StateFlow
 
 enum class TrackingStatus { NOT_STARTED, TRACKING, PAUSED, STOPPED }
@@ -162,4 +163,7 @@ interface ArCaptureController {
      * [ArFrameState.floorY] / [ArFrameState.localFloorY] stay the tracker's independent estimates.
      */
     fun setReferenceFloor(y: Double?) {}
+
+    /** Records what the camera sees for processing on a computer; null when this controller cannot. */
+    val walkthrough: WalkthroughRecording? get() = null
 }

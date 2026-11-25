@@ -24,6 +24,15 @@ projects**. Use *Export → JSON backup* now and then anyway.
 
 Developers: `adb install -r app/build/outputs/apk/debug/app-debug.apk` after building (see below).
 
+## Recording a walk-through (new, experimental)
+
+Tap the **camera icon** on the project list. Walk slowly through the rooms with the phone upright while it
+records what the camera sees and how the phone moves; tap **Stop and save**; then **Share** the file (Quick
+Share, Drive) or save it to **Downloads** and copy it to a computer over USB. Nothing is measured on the
+phone in this mode: a computer turns the recording into a floor plan afterwards. That computer-side step is
+being built; today `tools/walkthrough/inspect_recording.py` reads a recording and draws what the phone saw
+from above. The format is described in `docs/WALKTHROUGH-FORMAT.md`.
+
 ## Scanning a room — the short version
 
 1. **Find the floor.** Point at the floor and sweep slowly until the app locks it.

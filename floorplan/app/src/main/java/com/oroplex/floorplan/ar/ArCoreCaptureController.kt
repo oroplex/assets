@@ -13,6 +13,7 @@ import com.google.ar.core.exceptions.NotTrackingException
 import com.oroplex.floorplan.core.geometry.RigidTransform2
 import com.oroplex.floorplan.core.geometry.Vec3
 import com.oroplex.floorplan.core.io.Ids
+import com.oroplex.floorplan.recording.WalkthroughRecording
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -71,6 +72,9 @@ internal class ArCoreCaptureController(
      */
     @Volatile
     private var referenceFloorY: Double? = null
+
+    private val recorder = WalkthroughRecorder(depthEnabled = depthEnabled, hardwareDepth = hardwareDepth)
+    override val walkthrough: WalkthroughRecording get() = recorder
 
     // ---- GL-thread state ----
     private val engine = MeasurementEngine(incomingMeasurements)
@@ -166,6 +170,7 @@ internal class ArCoreCaptureController(
         isClosed = true
         isRunning = false
         failOutstanding(MSG_CLOSED)
+        recorder.abort()
         incomingMeasurements.clear()
         pendingAnchors.clear()
         val anchorCount = anchors.size
@@ -227,6 +232,7 @@ internal class ArCoreCaptureController(
         // Tracking with a usable pose; anything else counts as lost tracking for measurements.
         val poseValid = cameraPosition != null && viewProjection != null
         lastTracking = poseValid
+        recorder.onFrame(session, frame, camera, poseValid, resumeCount, nowNs)
 
         processAnchorRequests(session, poseValid)
 

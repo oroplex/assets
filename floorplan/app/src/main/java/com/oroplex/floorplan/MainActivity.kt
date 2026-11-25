@@ -33,6 +33,7 @@ import com.oroplex.floorplan.ui.projects.ProjectListScreen
 import com.oroplex.floorplan.ui.settings.SettingsScreen
 import com.oroplex.floorplan.ui.theme.FloorPlanTheme
 import com.oroplex.floorplan.ui.view3d.DollhouseScreen
+import com.oroplex.floorplan.ui.walkthrough.WalkthroughScreen
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,6 +83,9 @@ internal object Routes {
     const val VIEW_3D = "view3d/{$ARG_PROJECT}/{$ARG_FLOOR}"
     const val SETTINGS = "settings"
 
+    /** Records a walk-through for processing on a computer. */
+    const val WALKTHROUGH = "walkthrough"
+
     /**
      * Key in the editor entry's SavedStateHandle: the id of a room the editor should select and zoom to when
      * it comes back (set by the export screen's pre-flight list); null once the editor has handled it.
@@ -125,7 +129,11 @@ private fun FloorPlanNavHost() {
             ProjectListScreen(
                 onOpenProject = { projectId -> nav.navigateFrom(entry, Routes.editor(projectId)) },
                 onOpenSettings = { nav.navigateFrom(entry, Routes.SETTINGS) },
+                onRecordWalkthrough = { nav.navigateFrom(entry, Routes.WALKTHROUGH) },
             )
+        }
+        composable(Routes.WALKTHROUGH) { entry ->
+            WalkthroughScreen(onDone = { nav.popFrom(entry) })
         }
         composable(
             Routes.EDITOR,

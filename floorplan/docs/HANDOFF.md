@@ -2,6 +2,29 @@
 
 _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
 
+## Direction since 2026-11-25: walk and record, plan on the computer
+The owner's verdict on the wall-by-wall app: far more work than CubiCasa, where you simply walk around. The
+reason CubiCasa can be that easy is that its phone app only records and its servers make the plan. The
+owner's PC (Ryzen 9 9950X, RTX 5090, 64 GB) takes that role here.
+
+* **Built:** "Record walk-through" (camera icon on the project list; `ui/walkthrough`, `recording/`,
+  `ar/WalkthroughRecorder`). It saves about five camera frames a second (1280 px wide where the phone
+  offers it), the pose of every camera frame, intrinsics, ARCore raw depth with confidence and ARCore's
+  planes, and packs them into one zip (`docs/WALKTHROUGH-FORMAT.md`). Share sheet or Download/FloorPlanScan.
+  Recordings cut off by a closed app can be recovered.
+* **Built, computer side:** `tools/walkthrough/recording.py` (reader), `inspect_recording.py` (summary and
+  a top-down picture from the phone's own depth), `make_synthetic.py` and `test_recording.py` (run in CI
+  against a synthetic room and a sample written by the app's Kotlin code, so the two sides cannot drift).
+* **Not built:** the pipeline that makes the plan. Plan: a depth model on the GPU for every frame, scaled
+  and fused with the recorded poses into one point cloud; walls extracted with the existing estimator and
+  room solver ideas; result imported into the editor as a project. Doors and windows by hand at first.
+  It needs a real recording first and the session attached to the PC (the cloud machine has no GPU).
+* **Never run on a phone:** the recorder's camera path (image acquisition, JPEG encoding, depth copy) is
+  compiled and its pure parts are tested, but ARCore cannot run here. The first recording is the test.
+  If frames are 640 x 480, the phone did not offer a larger image to the app; the log line
+  "session created" lists what it chose.
+* The wall-by-wall mode stays as it is: it gives a plan on the spot without a computer.
+
 ## Where things stand
 * Rounds 1, 2 and 3 are merged. Round 3 fixed the 55 confirmed findings of `REVIEW-2.md` in six packages
   (capture flow, editor, core ops/render, export/shell, core accuracy, AR layer); the joins between them

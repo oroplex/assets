@@ -2,4 +2,7 @@
 <paths>
     <!-- Exports are written to cacheDir/exports and shared through FileProvider. -->
     <cache-path name="exports" path="exports/" />
+    <!-- Walk-through recordings: app-private external storage, or internal storage on a phone without it. -->
+    <external-files-path name="walkthroughs" path="walkthroughs/" />
+    <files-path name="walkthroughs_internal" path="walkthroughs/" />
 </paths>

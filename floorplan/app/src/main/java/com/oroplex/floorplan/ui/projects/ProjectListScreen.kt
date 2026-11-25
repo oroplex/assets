@@ -156,7 +156,8 @@ fun ProjectListScreen(onOpenProject: (projectId: String) -> Unit, onOpenSettings
             if (loaded && summaries.isNotEmpty()) {
                 ExtendedFloatingActionButton(
                     onClick = { dialog = ListDialog.Create },
-                    icon = { Icon(Icons.Filled.Add, contentDescription = null) },
+                    // The extended FAB hides its text from accessibility services: the icon carries the label.
+                    icon = { Icon(Icons.Filled.Add, contentDescription = "New project") },
                     text = { Text("New project") },
                 )
             }

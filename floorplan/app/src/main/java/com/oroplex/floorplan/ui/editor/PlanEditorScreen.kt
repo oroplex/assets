@@ -176,14 +176,14 @@ fun PlanEditorScreen(
                 Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     ExtendedFloatingActionButton(
                         onClick = { dialog = EditorDialog.DrawRoom },
-                        icon = { Icon(Icons.Filled.Draw, contentDescription = null) },
+                        icon = { Icon(Icons.Filled.Draw, contentDescription = "Draw room") },
                         text = { Text("Draw room") },
                         containerColor = MaterialTheme.colorScheme.surface,
                         contentColor = MaterialTheme.colorScheme.primary,
                     )
                     ExtendedFloatingActionButton(
                         onClick = { onScanRoom(projectId, floor.id) },
-                        icon = { Icon(Icons.Filled.ViewInAr, contentDescription = null) },
+                        icon = { Icon(Icons.Filled.ViewInAr, contentDescription = "Scan room") },
                         text = { Text("Scan room") },
                         containerColor = MaterialTheme.colorScheme.primary,
                         contentColor = MaterialTheme.colorScheme.onPrimary,

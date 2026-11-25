@@ -27,6 +27,23 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 
+/**
+ * Moves focus to the field using [requester] once it is on screen. Call it INSIDE the dialog's content, next
+ * to that field: a dialog's content is composed later than the composable that declares the dialog, so an
+ * effect outside the content asks for focus before the field exists and FocusRequester throws
+ * ("FocusRequester is not initialized"), which crashed "New project" and every rename dialog.
+ */
+@Composable
+internal fun FocusOnShow(requester: FocusRequester) {
+    LaunchedEffect(requester) {
+        try {
+            requester.requestFocus()
+        } catch (e: IllegalStateException) {
+            // The field is not attached (yet): leave it unfocused rather than crash; a tap focuses it.
+        }
+    }
+}
+
 /** Yes/no confirmation. [destructive] colors the confirm button with the error color. */
 @Composable
 fun ConfirmDialog(
@@ -78,7 +95,6 @@ fun TextInputDialog(
     }
     val error = validate(value.text.trim())
     val focus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { focus.requestFocus() }
     val confirm = {
         if (error == null) {
             onConfirm(value.text.trim())
@@ -89,6 +105,7 @@ fun TextInputDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
+            FocusOnShow(focus)
             OutlinedTextField(
                 value = value,
                 onValueChange = { value = it },
@@ -121,7 +138,6 @@ fun ProjectDetailsDialog(
     }
     var address by rememberSaveable { mutableStateOf(initialAddress) }
     val focus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { focus.requestFocus() }
     val valid = name.text.isNotBlank()
     val confirm = {
         if (valid) {
@@ -133,6 +149,7 @@ fun ProjectDetailsDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
+            FocusOnShow(focus)
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = name,

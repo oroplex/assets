@@ -64,10 +64,10 @@ android {
                 // Robolectric downloads its Android runtime jars itself; use the same mirror as the build.
                 it.systemProperty("robolectric.dependency.repo.url", "https://maven-central.storage-download.googleapis.com/maven2")
                 it.systemProperty("robolectric.dependency.repo.id", "google-maven-central")
-                it.systemProperty(
-                    "floorplan.walkthrough.dir",
-                    layout.buildDirectory.dir("ui-walkthrough").get().asFile.absolutePath,
-                )
+                val walkthroughDir = layout.buildDirectory.dir("ui-walkthrough").get().asFile
+                it.systemProperty("floorplan.walkthrough.dir", walkthroughDir.absolutePath)
+                it.outputs.dir(walkthroughDir)
+                it.doFirst { walkthroughDir.deleteRecursively() }
             }
         }
     }

@@ -14,7 +14,7 @@ import java.io.File
 /**
  * Saves what the screen shows as PNG files under `app/build/ui-walkthrough/` so a person (or a reviewer
  * agent) can look at every screen without a device. Every window root (the screen, plus any dialog, menu
- * or sheet on top of it) is saved as its own file: `NN-name.png`, `NN-name-popup1.png`, ...
+ * or sheet on top of it) is saved as its own file: `group-NN-name.png`, `group-NN-name-popup1.png`, ...
  *
  * Each root view is recorded into a RenderNode and drawn by a real HardwareRenderer (Robolectric native
  * graphics), i.e. the same drawing path as on a device; Compose's own captureToImage waits for a window
@@ -22,18 +22,19 @@ import java.io.File
  */
 internal object Screenshots {
     private val dir: File by lazy {
-        File(System.getProperty("floorplan.walkthrough.dir") ?: "build/ui-walkthrough").apply {
-            deleteRecursively()
-            mkdirs()
-        }
+        File(System.getProperty("floorplan.walkthrough.dir") ?: "build/ui-walkthrough").apply { mkdirs() }
     }
-    private var counter = 0
+    private val counters = HashMap<String, Int>()
 
-    /** Saves every attached window root; returns the files written. */
-    fun shoot(name: String): List<File> {
+    /**
+     * Saves every attached window root as `<group>-NN-<name>.png` (NN counts shots within [group]);
+     * returns the files written.
+     */
+    fun shoot(group: String, name: String): List<File> {
         shadowOf(Looper.getMainLooper()).idle()
-        counter++
-        val prefix = "%02d-%s".format(counter, name)
+        val n = (counters[group] ?: 0) + 1
+        counters[group] = n
+        val prefix = "%s-%02d-%s".format(group, n, name)
         val roots = WindowInspector.getGlobalWindowViews().filter { it.width > 0 && it.height > 0 && it.isShown }
         return roots.mapIndexedNotNull { i, root ->
             val bitmap = try {

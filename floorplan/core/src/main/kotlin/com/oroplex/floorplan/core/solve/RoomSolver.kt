@@ -27,9 +27,11 @@ data class SolverOptions(
     /** Parallel consecutive walls whose faces are within this distance are merged into one wall. */
     val sameWallOffset: Double = 0.10,
     /**
-     * Preferred squaring axis (radians, mod 90deg), e.g. the dominant axis of rooms already captured in the
-     * same AR session, so neighbouring rooms come out exactly parallel. Used when the room's own dominant
-     * axis is within squareToleranceDeg of it; ignored otherwise.
+     * Preferred squaring axis (radians, mod 90deg), e.g. the axis of rooms already captured in the same AR
+     * session ([RoomSolver.sharedAxis]), so neighbouring rooms come out exactly parallel. Used only when the
+     * room's own robust axis agrees with it within that axis's own uncertainty (at least 0.5deg, see
+     * [RoomSolver.solveWalls]); the room is then squared on its own axis and turned rigidly onto the hint, so
+     * the hint never changes a dimension. Ignored otherwise, and without squaring.
      */
     val axisHint: Double? = null,
 )
@@ -107,6 +109,21 @@ object RoomSolver {
     private const val AXIS_REFINE_ITERATIONS = 5
 
     /**
+     * An axis hint is taken when the room's own axis is within max(this, [HINT_ERRORS] standard errors of that
+     * axis) of it: the hint may settle what the room's own walls leave open, not overrule them (a 1° hint
+     * applied to a room measured to 0.2° is a rotation of the plan, not a correction).
+     */
+    private val MIN_HINT_TOLERANCE = Math.toRadians(0.5)
+    private const val HINT_ERRORS = 2.0
+
+    /** [sharedAxis]: an edge's vote is its length up to this (m); the axis needs this share of the total length. */
+    private const val MAX_SHARED_SUPPORT_LENGTH = 3.0
+    private const val MIN_SHARED_SUPPORT = 0.5
+
+    /** [sharedAxis] uses the default squaring tolerance to tell supporting edges from angled ones. */
+    private val SHARED_AXIS_TOLERANCE = Math.toRadians(5.0)
+
+    /**
      * Snapped corner-tap edges meeting at |sin| below this (~14.5deg) are too close to parallel for a stable
      * intersection; the corner then keeps its tapped position.
      */
@@ -128,6 +145,13 @@ object RoomSolver {
     /** Overlap (fraction of the shorter extent, and at least [MIN_DUPLICATE_OVERLAP] m) for such a duplicate. */
     private const val DUPLICATE_OVERLAP_FRACTION = 0.3
     private const val MIN_DUPLICATE_OVERLAP = 0.10
+
+    /**
+     * A captured wall is the step between two such parallel walls ([stepBetween]) when it is within 30° of
+     * perpendicular to them and its observed middle lies between their faces (± [STEP_FACE_MARGIN] m).
+     */
+    private val STEP_MIN_SIN = sin(Math.toRadians(60.0))
+    private const val STEP_FACE_MARGIN = 0.15
 
     // Ordering cost (meter-equivalents): what each inconsistency of a candidate wall order costs.
     /** A "missing wall" connector between two facing walls. */
@@ -163,14 +187,16 @@ object RoomSolver {
      * 1. Each observation's line is re-oriented so its viewer is on the left (interior-left convention)
      *    even if the stored direction is inconsistent. Observations with non-finite or degenerate data
      *    are ignored (their index never appears in [SolveResult.edgeSources]).
-     * 2. Squaring (optional): a robust dominant axis (see [robustAxis]; snapped to
-     *    [SolverOptions.axisHint] when within tolerance of it) and every wall within tolerance of it
+     * 2. Squaring (optional): a robust dominant axis (see [robustAxis]) and every wall within tolerance of it
      *    (mod 90°) rotated onto it about its pivot (see [pivotOf]: where its position is known best), so its
      *    measured position is kept; angled walls stay as measured.
      * 3. Duplicates, wherever they are in the capture order: same-facing near-parallel captures whose faces
      *    are within [SolverOptions.sameWallOffset] and whose observed extents overlap (or nearly touch) are
      *    merged (weighted line, union of extents; the heavier capture names the edge). Overlapping ones
-     *    10–75 cm apart are one wall measured twice, once on furniture: the outer one is kept (warning).
+     *    10–75 cm apart are one wall measured twice, once on furniture: the outer one is kept (warning),
+     *    unless a captured wall steps between them ([stepBetween]): then both are real (a closet return, a
+     *    chimney breast), both are kept with their extents ended at the step, and a warning asks to check
+     *    that corner.
      * 4. Wall order: the capture order is solved first; if anything is inconsistent, single-wall moves
      *    (any wall to any position, which covers swaps, late re-captures and U-shaped rooms) are searched
      *    from the capture order and from the order by angle around the walls' centre, scoring each order by
@@ -183,6 +209,12 @@ object RoomSolver {
      *    normalized to CCW and rotated to start with the earliest capture; edges shorter than 5 cm are
      *    collapsed and collinear vertices removed.
      * 6. If squaring makes every order cross itself, the walls are solved unsquared ([UNSQUARED_WARNING]).
+     * 7. [SolverOptions.axisHint] (squared rooms only): when the room's own axis is within
+     *    max(0.5°, 2 standard errors of that axis) of the hint, the finished outline is turned rigidly onto the
+     *    hint about the walls' weighted mean pivot and the hint is reported as [SolveResult.dominantAngle];
+     *    otherwise the hint is ignored. Review round 2 (MATH-2): the hint used to replace the room's axis whenever
+     *    it was within the squaring tolerance (5°), and snapping each wall about its own pivot onto an axis the
+     *    walls were not measured at changed the room's dimensions (1° gave 3 cm, 3° gave 8.6 cm).
      *
      * Warnings (1-based wall numbers = capture numbers): re-ordered; same wall at two depths; missing wall /
      * assumed step; a wall left out; two walls meeting at a shallow angle (uncertain corner); spikes; very
@@ -197,11 +229,8 @@ object RoomSolver {
         if (raw.size < 3) return null
 
         val cfg = Config.of(options)
-        val dominant = withHint(
-            robustAxis(raw.map { it.line.angle() }, raw.map { it.support }, raw.map { it.precision }, cfg.toleranceRad),
-            options.axisHint,
-            cfg.toleranceRad,
-        )
+        val own = axisEstimate(raw.map { it.line.angle() }, raw.map { it.support }, raw.map { it.precision }, cfg.toleranceRad)
+        val dominant = own.angle
         val snapper = if (options.squareAngles) Snapper(dominant, cfg.toleranceRad) else null
         var solved = solveOrdered(raw, cfg, snapper)
         var unsquared = false
@@ -210,6 +239,11 @@ object RoomSolver {
             unsquared = solved != null
         }
         val chosen = solved ?: return null
+        // The session's shared axis, when this room's own walls agree with it: a rigid turn of the finished room.
+        val turn = if (snapper != null && !unsquared) hintTurn(own, options.axisHint, cfg.toleranceRad) else null
+        val corners = chosen.attempt.edges.map { it.start }.let { c ->
+            if (turn == null) c else rotateAbout(c, weightedPivot(raw), turn)
+        }
 
         val warnings = buildList {
             if (unsquared) add(UNSQUARED_WARNING)
@@ -221,9 +255,9 @@ object RoomSolver {
             addAll(shapeWarnings(chosen.attempt.edges, wallsMode = true))
         }.distinct()
         return SolveResult(
-            corners = chosen.attempt.edges.map { it.start },
+            corners = corners,
             edgeSources = chosen.attempt.edges.map { it.source },
-            dominantAngle = dominant,
+            dominantAngle = if (turn == null) dominant else canonicalAxis(dominant + turn),
             warnings = warnings,
         )
     }
@@ -235,11 +269,12 @@ object RoomSolver {
      *   corner closes the room and is dropped too); vertices within 1 cm of their neighbours' chord are
      *   dropped as collinear.
      * * Squaring: the dominant direction is the robust consensus axis of the edges ([robustAxis]; an
-     *   angled edge does not pull it; snapped to [SolverOptions.axisHint] when within tolerance); every
-     *   edge within tolerance becomes a line through its midpoint at the exact axis angle (others keep the
-     *   line through their two taps), consecutive edges snapped onto the same axis are merged, and each
-     *   corner is the intersection of its two edge lines. If squaring would make the outline cross
-     *   itself, the unsquared outline is returned with [UNSQUARED_WARNING].
+     *   angled edge does not pull it); every edge within tolerance becomes a line through its midpoint at
+     *   the exact axis angle (others keep the line through their two taps), consecutive edges snapped onto
+     *   the same axis are merged, and each corner is the intersection of its two edge lines. If squaring
+     *   would make the outline cross itself, the unsquared outline is returned with [UNSQUARED_WARNING].
+     * * [SolverOptions.axisHint]: as in [solveWalls], a squared outline whose own axis agrees with the hint
+     *   (within max(0.5°, 2 standard errors)) is turned rigidly onto it, about the mean of its corners.
      * * edgeSources[i] is the index (into [taps]) of the tap edge taps[j] -> taps[j+1] that the output
      *   edge comes from; when tap edges were merged, the longest one wins.
      * * Returns null for fewer than 3 usable corners, a degenerate outline or one that crosses itself.
@@ -262,15 +297,18 @@ object RoomSolver {
         val lengths = edgeLengths(edges)
         // Two taps σ apart give a direction variance of 2σ²/L².
         val precision = lengths.map { 1.0 / (2 * TAP_SIGMA * TAP_SIGMA / max(it, MIN_WEIGHT_LENGTH).let { l -> l * l } + SYSTEMATIC_DIRECTION_VARIANCE) }
-        val dominant = withHint(
-            robustAxis(edgeAngles(edges), lengths.map { min(it, MAX_SUPPORT_LENGTH) }, precision, cfg.toleranceRad),
-            options.axisHint,
-            cfg.toleranceRad,
-        )
+        val own = axisEstimate(edgeAngles(edges), lengths.map { min(it, MAX_SUPPORT_LENGTH) }, precision, cfg.toleranceRad)
+        val dominant = own.angle
         val unsquared = finishCornerOutline(edges)
         if (options.squareAngles) {
             val squared = squareCornerOutline(edges, Snapper(dominant, cfg.toleranceRad))?.let(::finishCornerOutline)
-            if (squared != null) return cornerResult(squared, dominant, emptyList())
+            if (squared != null) {
+                val turn = hintTurn(own, options.axisHint, cfg.toleranceRad) ?: return cornerResult(squared, dominant, emptyList())
+                val corners = squared.map { it.start }
+                val center = corners.fold(Vec2.ZERO) { acc, c -> acc + c } / corners.size.toDouble()
+                val turned = rotateAbout(corners, center, turn)
+                return cornerResult(squared.mapIndexed { k, e -> e.copy(start = turned[k]) }, canonicalAxis(dominant + turn), emptyList())
+            }
             if (unsquared != null) return cornerResult(unsquared, dominant, listOf(UNSQUARED_WARNING))
             return null
         }
@@ -283,9 +321,34 @@ object RoomSolver {
      * consensus over the edges (support = edges within the squaring tolerance, refined with supporters only),
      * not the plain 4θ mean of [dominantAngle]. Returns null when there is no usable edge or when the
      * supporting length is less than half of the total (no coherent axis).
-     * Round-3 contract: currently the FloorAxis refinement (mean, then 10° and 5° windows).
+     *
+     * It is [robustAxis] over every edge of every outline: an edge votes with its length up to 3 m (one long
+     * wall must not outvote a room), supporters are the edges within 5° of a candidate (mod 90°), and the
+     * axis is the length-weighted mean of the supporters only. Review round 2 (SEAM-2): the plain mean moved by
+     * 1.2° for one 1.5 m wall at 30° in a 4 × 5 m room, and that tilt was then squared into every later room.
+     * Edges with non-finite ends or shorter than 1 µm are ignored.
      */
-    fun sharedAxis(outlines: List<List<Vec2>>): Double? = FloorAxis.ofOutlines(outlines)
+    fun sharedAxis(outlines: List<List<Vec2>>): Double? {
+        val angles = ArrayList<Double>()
+        val lengths = ArrayList<Double>()
+        for (corners in outlines) {
+            if (corners.size < 2) continue
+            for (i in corners.indices) {
+                val a = corners[i]
+                val b = corners[(i + 1) % corners.size]
+                if (!a.isFinite() || !b.isFinite()) continue
+                val length = a.distanceTo(b)
+                if (!length.isFinite() || length <= 1e-6) continue
+                angles += (b - a).angle()
+                lengths += length
+            }
+        }
+        if (angles.isEmpty()) return null
+        val axis = robustAxis(angles, lengths.map { min(it, MAX_SHARED_SUPPORT_LENGTH) }, lengths, SHARED_AXIS_TOLERANCE)
+        var supporting = 0.0
+        for (i in angles.indices) if (axisDistance(angles[i], axis) <= SHARED_AXIS_TOLERANCE + 1e-12) supporting += lengths[i]
+        return if (supporting >= MIN_SHARED_SUPPORT * lengths.sum()) axis else null
+    }
 
     /**
      * Weighted dominant direction mod 90deg, in [0, PI/2). Uses the 4θ circular-mean trick so that
@@ -324,13 +387,23 @@ object RoomSolver {
      * when squaring. Invalid entries (non-finite angle, non-positive / non-finite weights) are ignored;
      * returns 0 when nothing is usable.
      */
-    internal fun robustAxis(angles: List<Double>, support: List<Double>, precision: List<Double>, toleranceRad: Double): Double {
+    internal fun robustAxis(angles: List<Double>, support: List<Double>, precision: List<Double>, toleranceRad: Double): Double =
+        axisEstimate(angles, support, precision, toleranceRad).angle
+
+    /**
+     * A squaring axis and its standard error (radians): 1 / √(total [robustAxis] precision of the supporting
+     * walls), infinite when nothing supports it.
+     */
+    private class AxisEstimate(val angle: Double, val standardError: Double)
+
+    /** [robustAxis] with the standard error of the result. */
+    private fun axisEstimate(angles: List<Double>, support: List<Double>, precision: List<Double>, toleranceRad: Double): AxisEstimate {
         val idx = angles.indices.filter { i ->
             val s = support.getOrNull(i) ?: 0.0
             val p = precision.getOrNull(i) ?: 0.0
             angles[i].isFinite() && s.isFinite() && s > 0.0 && p.isFinite() && p > 0.0
         }
-        if (idx.isEmpty()) return 0.0
+        if (idx.isEmpty()) return AxisEstimate(0.0, Double.POSITIVE_INFINITY)
         val tol = if (toleranceRad.isFinite()) toleranceRad.coerceIn(0.0, PI / 4) else Math.toRadians(5.0)
         fun supporters(axis: Double) = idx.filter { axisDistance(angles[it], axis) <= tol + 1e-12 }
         val candidates = ArrayList<Double>(idx.size + 1)
@@ -355,14 +428,36 @@ object RoomSolver {
             if (next == members) break
             members = next
         }
-        return axis
+        val total = supporters(axis).sumOf { precision[it] }
+        return AxisEstimate(axis, if (total > 0.0) 1.0 / sqrt(total) else Double.POSITIVE_INFINITY)
     }
 
-    /** [axis], or the hint (mod 90°) when the hint is finite and within [toleranceRad] of it. */
-    private fun withHint(axis: Double, hint: Double?, toleranceRad: Double): Double {
-        if (hint == null || !hint.isFinite()) return axis
-        val h = canonicalAxis(hint)
-        return if (axisDistance(axis, h) <= toleranceRad + 1e-12) h else axis
+    /**
+     * The signed turn (radians, CCW) that takes a room squared on its [own] axis onto [hint] (mod 90°), or null
+     * when there is no finite hint or the room does not agree with it: the two must be within
+     * max([MIN_HINT_TOLERANCE], [HINT_ERRORS] standard errors of the room's axis), and within the squaring
+     * tolerance [toleranceRad] in any case.
+     */
+    private fun hintTurn(own: AxisEstimate, hint: Double?, toleranceRad: Double): Double? {
+        if (hint == null || !hint.isFinite()) return null
+        val quarter = PI / 2
+        var turn = (canonicalAxis(hint) - own.angle) % quarter
+        if (turn > quarter / 2) turn -= quarter
+        if (turn <= -quarter / 2) turn += quarter
+        val error = if (own.standardError.isFinite()) own.standardError else 0.0
+        val tolerance = min(max(MIN_HINT_TOLERANCE, HINT_ERRORS * error), toleranceRad)
+        return if (abs(turn) <= tolerance + 1e-12) turn else null
+    }
+
+    /** [points] turned by [angle] (CCW) about [pivot]; unchanged for a zero angle. */
+    private fun rotateAbout(points: List<Vec2>, pivot: Vec2, angle: Double): List<Vec2> =
+        if (angle == 0.0) points else points.map { pivot + (it - pivot).rotated(angle) }
+
+    /** Weighted mean of the walls' pivots: where the room as a whole is known best (the centre of a hint turn). */
+    private fun weightedPivot(walls: List<Wall>): Vec2 {
+        val total = walls.sumOf { it.weight }
+        if (!(total > 0.0)) return walls.fold(Vec2.ZERO) { acc, w -> acc + w.pivot } / walls.size.toDouble()
+        return walls.fold(Vec2.ZERO) { acc, w -> acc + w.pivot * w.weight } / total
     }
 
     /** Angle mod 90°, in [0, PI/2) (values a hair below 90° or above 0 are the same axis as 0). */
@@ -579,6 +674,18 @@ object RoomSolver {
                     } else if (offset <= MAX_DUPLICATE_DEPTH &&
                         overlap >= max(MIN_DUPLICATE_OVERLAP, DUPLICATE_OVERLAP_FRACTION * min(a.length(), b.length()))
                     ) {
+                        // A captured wall steps from one to the other: two real walls (a closet return, a chimney
+                        // breast) whose observed extents reach past the step. Review round 2 (MATH-1): deleting
+                        // the inner one turned such rooms into plain rectangles.
+                        val step = stepBetween(a, b, walls)
+                        if (step != null) {
+                            // Neither wall can have been seen beyond the step: end both extents there, so the
+                            // order search does not take the overhang for a wall captured out of order.
+                            walls[i] = endAt(a, step.line)
+                            walls[j] = endAt(b, step.line)
+                            warnings += "Walls ${a.first + 1} and ${b.first + 1} overlap at the step along wall ${step.first + 1}; check that corner"
+                            continue
+                        }
                         // The same stretch of wall measured at two depths: the inner one stood in front of it.
                         val outerIsA = a.line.signedDistance(b.midpoint) > 0
                         val outer = if (outerIsA) a else b
@@ -599,6 +706,33 @@ object RoomSolver {
     }
 
     private fun Wall.length() = start.distanceTo(end)
+
+    /** [w] with its observed extent ended where it crosses [cut], keeping the side its middle is on. */
+    private fun endAt(w: Wall, cut: Line2): Wall {
+        val crossing = w.line.intersect(cut) ?: return w
+        val t = w.line.param(crossing)
+        val t0 = w.line.param(w.start)
+        val t1 = w.line.param(w.end)
+        if (!t.isFinite() || t <= t0 || t >= t1) return w
+        return if ((t0 + t1) / 2 >= t) w.copy(start = w.line.at(t)) else w.copy(end = w.line.at(t))
+    }
+
+    /**
+     * A captured wall that is the step between the same-facing parallel walls [a] and [b]: roughly perpendicular
+     * to them (within 30°), with its observed middle between their two faces, and with the middles of [a] and
+     * [b] on opposite sides of it (one wall runs up to the step, the other goes on behind it). Null when there
+     * is none: then one of the two was measured on furniture standing in front of the other.
+     */
+    private fun stepBetween(a: Wall, b: Wall, walls: List<Wall>): Wall? {
+        val depth = a.line.signedDistance(b.midpoint)
+        val low = min(0.0, depth) - STEP_FACE_MARGIN
+        val high = max(0.0, depth) + STEP_FACE_MARGIN
+        return walls.firstOrNull { c ->
+            c !== a && c !== b && c.source >= 0 && a.line.sinAngleTo(c.line) >= STEP_MIN_SIN &&
+                a.line.signedDistance(c.midpoint) in low..high &&
+                c.line.signedDistance(a.midpoint) * c.line.signedDistance(b.midpoint) < 0
+        }
+    }
 
     /** Overlap (m) of two near-parallel walls' observed extents along [a]'s direction; negative = gap. */
     private fun extentOverlap(a: Wall, b: Wall): Double {

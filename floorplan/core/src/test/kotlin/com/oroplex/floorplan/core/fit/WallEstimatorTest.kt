@@ -6,11 +6,14 @@ import com.oroplex.floorplan.core.geometry.Vec3
 import com.oroplex.floorplan.core.model.WallObservation
 import com.oroplex.floorplan.core.model.WallSource
 import com.oroplex.floorplan.core.sim.CAMERA_HEIGHT
+import com.oroplex.floorplan.core.sim.DepthNoise
 import com.oroplex.floorplan.core.sim.FurnitureBox
+import com.oroplex.floorplan.core.sim.HardScenarios
 import com.oroplex.floorplan.core.sim.RayHit
 import com.oroplex.floorplan.core.sim.SIM_CEILING_Y
 import com.oroplex.floorplan.core.sim.SIM_FLOOR_Y
 import com.oroplex.floorplan.core.sim.ScanSimulator
+import com.oroplex.floorplan.core.sim.SimFace
 import com.oroplex.floorplan.core.sim.SimRoom
 import java.util.Random
 import kotlin.math.abs
@@ -154,10 +157,11 @@ class WallEstimatorTest {
         val back = assertNotNull(WallEstimator.fromPoints(pts, floorY, null, Vec3.fromPlan(otherViewerPlan, 0.0)).observation)
         assertOrientedViewerLeft(back, otherViewerPlan)
         assertTrue((front.line.direction dot back.line.direction) < -0.999)
-        // Same observed span either way, just reversed (the along-ray fit depends on where the viewer is, so
-        // the two fits differ by a fraction of the noise).
-        assertTrue(front.extentStart.distanceTo(back.extentEnd) < 0.02, "${front.extentStart} vs ${back.extentEnd}")
-        assertTrue(front.extentEnd.distanceTo(back.extentStart) < 0.02, "${front.extentEnd} vs ${back.extentStart}")
+        // Same observed span either way, just reversed. The extent is a robust span of where the samples' rays
+        // meet the line (review round 2, MATH-6), so it depends a little on where the viewer is: the two differ by
+        // about the noise of a few samples (2.2 cm here), not by the outliers that used to stretch extents.
+        assertTrue(front.extentStart.distanceTo(back.extentEnd) < 0.04, "${front.extentStart} vs ${back.extentEnd}")
+        assertTrue(front.extentEnd.distanceTo(back.extentStart) < 0.04, "${front.extentEnd} vs ${back.extentStart}")
     }
 
     @Test fun nearWallIsKeptWhenFartherLineIsWeak() {
@@ -284,15 +288,30 @@ class WallEstimatorTest {
         assertEquals(WallFitFailure.NO_DOMINANT_PLANE, WallEstimator.fromPoints(patch, floorY, null, s.viewerWorld).failure)
     }
 
-    @Test fun tooNoisy() {
+    @Test fun tooNoisyOnlyWhenTheNoiseIsGrosslyOffTheModel() {
+        // Review round 2, MATH-4: the model expects 3.6 cm at 2.6 m. Only noise several times that fails; the
+        // message for it ("hold steady, add light, or move closer") then makes sense.
         val rnd = Random(34)
         val s = scene()
-        val fit = WallEstimator.fromPoints(wallPoints(rnd, s, 1000, sigma = 0.06), floorY, null, s.viewerWorld)
-        assertEquals(WallFitFailure.TOO_NOISY, fit.failure)
-        assertNull(fit.observation)
-        assertTrue(fit.usedPoints > 0)
-        // The same scene with moderate noise is accepted.
-        assertNotNull(WallEstimator.fromPoints(wallPoints(rnd, s, 1000, sigma = 0.012), floorY, null, s.viewerWorld).observation)
+        val gross = WallEstimator.fromPoints(wallPoints(rnd, s, 1000, sigma = 0.20), floorY, null, s.viewerWorld)
+        assertEquals(WallFitFailure.TOO_NOISY, gross.failure)
+        assertNull(gross.observation)
+        assertNull(gross.hint)
+        assertEquals(WallFitFailure.TOO_NOISY.message, gross.message)
+        assertTrue(gross.usedPoints > 0)
+        assertTrue(assertNotNull(gross.noiseRatio) > WallEstimatorConfig().grossNoiseFactor, "ratio ${gross.noiseRatio}")
+
+        // 1.7 x the model (6 cm) used to fail; the line is still good to millimetres, so it is accepted with a
+        // lower confidence than a quiet capture, and the measured ratio is reported for tuning on device.
+        val noisy = WallEstimator.fromPoints(wallPoints(rnd, s, 1000, sigma = 0.06), floorY, null, s.viewerWorld)
+        val quiet = WallEstimator.fromPoints(wallPoints(rnd, s, 1000, sigma = 0.012), floorY, null, s.viewerWorld)
+        val noisyWall = assertNotNull(noisy.observation, "failure: ${noisy.failure}")
+        val quietWall = assertNotNull(quiet.observation, "failure: ${quiet.failure}")
+        assertNull(noisy.message)
+        assertMatchesTruth(noisyWall, s, offsetTol = 0.03, angleTolDeg = 1.0)
+        assertTrue(noisyWall.confidence < quietWall.confidence, "${noisyWall.confidence} vs ${quietWall.confidence}")
+        assertEquals(0.06 / 0.0362, assertNotNull(noisy.noiseRatio), 0.35)
+        assertTrue(assertNotNull(quiet.noiseRatio) < 0.6, "ratio ${quiet.noiseRatio}")
     }
 
     @Test fun fromPointsIsDeterministic() {
@@ -327,16 +346,37 @@ class WallEstimatorTest {
         assertEquals(0.005, c.noiseSigmaBase)
         assertEquals(0.012, c.noiseSigmaPerMeter)
         assertEquals(0.005 + 0.012 * 3.0, c.expectedSigma(3.0), 1e-12)
-        // Close range: the fixed minimums apply; far: 2σ band and 1.5σ noise limit.
+        // Close range: the fixed minimum band applies; far: the 2σ band. The noise limit is a GROSS cap
+        // (review round 2, MATH-4): 3.5σ, never below maxRms.
         assertEquals(0.025, c.inlierThresholdAt(0.5), 1e-12)
-        assertEquals(0.03, c.noiseLimitAt(0.5), 1e-12)
         assertEquals(2 * (0.005 + 0.012 * 4.0), c.inlierThresholdAt(4.0), 1e-12)
-        assertEquals(1.5 * (0.005 + 0.012 * 4.0), c.noiseLimitAt(4.0), 1e-12)
+        assertEquals(3.5, c.grossNoiseFactor)
+        assertEquals(3.5 * (0.005 + 0.012 * 0.5), c.noiseLimitAt(0.5), 1e-12)
+        assertEquals(3.5 * (0.005 + 0.012 * 4.0), c.noiseLimitAt(4.0), 1e-12)
+        assertEquals(0.03, c.noiseLimitAt(0.0), 1e-12)
+        assertEquals(0.03, WallEstimatorConfig(grossNoiseFactor = 1.0).noiseLimitAt(1.0), 1e-12)
         // Bad input never yields NaN bands.
         assertEquals(0.025, c.inlierThresholdAt(Double.NaN), 1e-12)
         assertEquals(0.025, c.inlierThresholdAt(-3.0), 1e-12)
         assertEquals(0.0, WallEstimatorConfig(noiseSigmaBase = Double.NaN).expectedSigma(2.0))
         assertTrue(c.maxRange >= 4.0, "TOO_FAR must not fire before the ~4 m the message asks for")
+    }
+
+    @Test fun lineErrorsFollowNoiseCountAndExtent() {
+        val c = WallEstimatorConfig()
+        // 100 samples of 2 cm noise over 1 m: offset 2 mm, direction sqrt(12) x 2 mm / 1 m.
+        val (offset, direction) = c.lineErrors(0.02, 100, 1.0)
+        assertEquals(0.002, offset, 1e-12)
+        assertEquals(kotlin.math.sqrt(12.0) * 0.002, direction, 1e-12)
+        // Samples share errors: beyond maxEffectivePoints more of them do not make the line more precise.
+        assertEquals(c.lineErrors(0.02, c.maxEffectivePoints, 1.0), c.lineErrors(0.02, 100_000, 1.0))
+        // Half the extent, twice the direction error; the offset error stays.
+        assertEquals(2 * direction, c.lineErrors(0.02, 100, 0.5).second, 1e-12)
+        assertEquals(offset, c.lineErrors(0.02, 100, 0.5).first, 1e-12)
+        // Nothing to go by: infinitely uncertain, never NaN.
+        for (bad in listOf(c.lineErrors(Double.NaN, 100, 1.0), c.lineErrors(0.02, 0, 1.0), c.lineErrors(0.02, 100, 0.0), c.lineErrors(-1.0, 100, 1.0))) {
+            assertEquals(Double.POSITIVE_INFINITY to Double.POSITIVE_INFINITY, bad)
+        }
     }
 
     /** A synthetic capture from the scan simulation (15 frames x 9x9 rays, range noise 5 mm + 1.2 %, 10 % outliers). */
@@ -465,6 +505,155 @@ class WallEstimatorTest {
         val o = assertNotNull(capture(bigRoom, Vec2(2.0, 2.5), Vec2(4.0, 0.0), 1.4, 7000L).fit.observation)
         val t = o.line.param(o.line.point)
         assertTrue(t > o.line.param(o.extentStart) && t < o.line.param(o.extentEnd), "anchor outside the extent")
+    }
+
+    // ---------------------------------------------------------------- short walls (review round 2, MATH-1)
+
+    /** 5 x 4 m room with a 0.4 m closet return (wall 4: x = 1.4, y 3.6..4.0) between walls 3 (y = 4) and 5 (y = 3.6). */
+    private val closetRoom = HardScenarios.closet40
+    private val closetReturn = SimFace("return", closetRoom.start(3), closetRoom.end(3))
+
+    @Test fun shortWallSeenAtAnAngleIsRefusedNotFittedToAChordOrANeighbour() {
+        // From the room's pole the return is 2.3 m away at about 50 degrees. Round 2 accepted 97 % of such
+        // captures on a diagonal chord through the corner or on wall 3 / wall 5, with normal confidence.
+        val station = closetRoom.pole
+        assertEquals(50.0, Math.toDegrees(Math.acos(((station - closetReturn.pointOn(0.5)).normalized() dot closetReturn.normal))), 8.0)
+        var refused = 0
+        var hinted = 0
+        for (k in 0 until 40) {
+            val rnd = Random(8000L + k)
+            val aim = closetReturn.pointOn(0.2 + 0.6 * rnd.nextDouble())
+            val fit = capture(closetRoom, station, aim, 1.0 + 0.8 * rnd.nextDouble(), 8100L + k).fit
+            val o = fit.observation
+            if (o != null) {
+                // A failed capture is fine; a wrong observation is not.
+                assertTrue(closetReturn.matches(o), "trial $k: accepted a line ${angleDeg(o.line.direction, closetReturn.direction)} deg off the return")
+                continue
+            }
+            refused++
+            assertNotNull(fit.failure)
+            val message = assertNotNull(fit.message)
+            if (fit.hint != null) {
+                hinted++
+                // The message says what to do, and it is the hint, not the generic text.
+                assertEquals(fit.hint, message)
+                assertTrue("Stand square" in message && "tap its base" in message, message)
+            } else {
+                assertEquals(fit.failure!!.message, message)
+            }
+        }
+        assertTrue(refused >= 36, "only $refused of 40 oblique captures of the 0.4 m return were refused")
+        assertTrue(hinted >= 30, "only $hinted of $refused refusals say what to do")
+    }
+
+    @Test fun shortWallIsMeasuredFromSquareInFrontOfIt() {
+        // What the hint asks for: square to the return from about a metre.
+        var accepted = 0
+        for (k in 0 until 30) {
+            val rnd = Random(8200L + k)
+            val aim = closetReturn.pointOn(0.2 + 0.6 * rnd.nextDouble())
+            val fit = capture(closetRoom, aim + closetReturn.normal * 0.9, aim, 1.0 + 0.8 * rnd.nextDouble(), 8300L + k).fit
+            val o = fit.observation ?: continue
+            accepted++
+            assertNull(fit.message)
+            assertTrue(closetReturn.matches(o), "trial $k: wrong wall")
+            assertTrue(angleDeg(o.line.direction, closetReturn.direction) < 3.0, "trial $k: ${angleDeg(o.line.direction, closetReturn.direction)} deg")
+            assertTrue(closetReturn.line.distance(o.line.project(closetReturn.pointOn(0.5))) < 0.005, "trial $k: offset")
+            // The observed extent is the return, not the walls around the corner (MATH-6).
+            for (end in listOf(o.extentStart, o.extentEnd)) {
+                assertTrue(closetReturn.line.param(end) in -0.05..closetReturn.length + 0.05, "trial $k: extent end $end")
+            }
+        }
+        assertTrue(accepted >= 27, "only $accepted of 30 square-on captures of the 0.4 m return succeeded")
+    }
+
+    @Test fun wallsNextToTheReturnAreStillMeasuredFromThePole() {
+        // The long walls on either side of the return (walls 3 and 5) are ordinary captures and must stay so.
+        for (edge in listOf(2, 4)) {
+            val face = SimFace("wall ${edge + 1}", closetRoom.start(edge), closetRoom.end(edge))
+            var accepted = 0
+            for (k in 0 until 20) {
+                val rnd = Random(8400L + 100 * edge + k)
+                val fit = capture(closetRoom, closetRoom.pole, face.pointOn(0.3 + 0.4 * rnd.nextDouble()), 1.0 + 0.8 * rnd.nextDouble(), 8500L + 100 * edge + k).fit
+                val o = fit.observation ?: continue
+                accepted++
+                assertTrue(face.matches(o), "wall ${edge + 1} trial $k: wrong wall")
+                assertTrue(angleDeg(o.line.direction, face.direction) < 1.5, "wall ${edge + 1} trial $k: angle")
+            }
+            assertTrue(accepted >= 19, "wall ${edge + 1}: only $accepted of 20 accepted")
+        }
+    }
+
+    @Test fun observedExtentStopsAtTheWallsEnd() {
+        // Review round 2 (MATH-6): extents were the extreme inliers, and range outliers on rays that pass the
+        // corner stretched them by up to 1.7 m beyond the wall (wall 5 "seen" at x = -1.3 when it ends at x = 0).
+        // That overlap then made RoomSolver delete a correct wall.
+        val wall5 = SimFace("wall 5", closetRoom.start(4), closetRoom.end(4))
+        var accepted = 0
+        for (k in 0 until 30) {
+            val rnd = Random(8600L + k)
+            val fit = capture(closetRoom, closetRoom.pole, wall5.pointOn(0.25 + 0.5 * rnd.nextDouble()), 1.0 + 0.8 * rnd.nextDouble(), 8700L + k).fit
+            val o = fit.observation ?: continue
+            accepted++
+            assertTrue(wall5.matches(o), "trial $k: wrong wall")
+            for (end in listOf(o.extentStart, o.extentEnd)) {
+                val along = wall5.line.param(end)
+                assertTrue(along in -0.10..wall5.length + 0.10, "trial $k: extent reaches ${along} m along a ${wall5.length} m wall")
+            }
+        }
+        assertTrue(accepted >= 25, "only $accepted of 30 accepted")
+        // Seen obliquely next to an ordinary corner: the same bound.
+        val box = SimRoom("5x4", listOf(Vec2(0.0, 0.0), Vec2(5.0, 0.0), Vec2(5.0, 4.0), Vec2(0.0, 4.0)))
+        val top = SimFace("top", box.start(2), box.end(2))
+        for (k in 0 until 20) {
+            val o = capture(box, Vec2(3.5, 1.2), Vec2(1.0 + 0.1 * k, 4.0), 1.4, 8800L + k).fit.observation ?: continue
+            for (end in listOf(o.extentStart, o.extentEnd)) {
+                assertTrue(top.line.param(end) in -0.10..top.length + 0.10, "trial $k: extent end $end")
+            }
+        }
+    }
+
+    @Test fun wallSeenThroughTwoSamplingColumnsIsNotAWall() {
+        // Two columns of samples always fit a line: nothing shows whether it is a wall or a chord across a corner.
+        // A 0.25 m pier seen square-on from 2.4 m spans 6 degrees (two of the nine columns): refused; from 0.5 m
+        // it fills most of the view: measured.
+        val pier = SimRoom(
+            "pier",
+            listOf(Vec2(0.0, 0.0), Vec2(6.0, 0.0), Vec2(6.0, 4.0), Vec2(3.25, 4.0), Vec2(3.25, 3.7), Vec2(3.0, 3.7), Vec2(3.0, 4.0), Vec2(0.0, 4.0)),
+        )
+        val face = SimFace("pier front", pier.start(4), pier.end(4))
+        assertEquals(0.25, face.length, 1e-12)
+        for (k in 0 until 12) {
+            val far = capture(pier, face.pointOn(0.5) + face.normal * 2.4, face.pointOn(0.5), 1.4, 8900L + k).fit
+            assertNull(far.observation, "trial $k: a 0.25 m face 2.4 m away was accepted")
+            assertTrue(far.hint == WallEstimator.HINT_SHORT_WALL || far.hint == WallEstimator.HINT_IMPRECISE, "trial $k: ${far.failure} / ${far.hint}")
+            val near = capture(pier, face.pointOn(0.5) + face.normal * 0.5, face.pointOn(0.5), 1.4, 9000L + k).fit
+            val o = assertNotNull(near.observation, "trial $k from 0.5 m: ${near.message}")
+            assertTrue(face.matches(o), "trial $k: wrong wall")
+        }
+    }
+
+    // ---------------------------------------------------------------- noise (review round 2, MATH-4)
+
+    @Test fun sensorTwiceAsNoisyAsTheModelStillMeasuresWalls() {
+        // The 1.5 x gate failed every capture beyond 1 m at 1.7 x the model's noise. The line is still precise.
+        val truth = Line2(Vec2(0.0, 0.0), Vec2(1.0, 0.0))
+        for (d in listOf(1.0, 2.5, 4.0)) {
+            for (k in 0 until 5) {
+                val aim = Vec2(4.0 + 0.3 * k - 0.6, 0.0)
+                val nominal = ScanSimulator.capture(bigRoom, Vec3.fromPlan(Vec2(4.0, d), CAMERA_HEIGHT), Vec3.fromPlan(aim, 1.4), Random(9100L + k)).fit
+                val noisy = ScanSimulator.capture(
+                    bigRoom, Vec3.fromPlan(Vec2(4.0, d), CAMERA_HEIGHT), Vec3.fromPlan(aim, 1.4), Random(9100L + k), noise = DepthNoise(scale = 2.0),
+                ).fit
+                val o = assertNotNull(noisy.observation, "$d m, trial $k: ${noisy.message}")
+                assertTrue(truth.distance(Vec2.lerp(o.extentStart, o.extentEnd, 0.5)) < 0.005 + 0.005 * d, "$d m offset")
+                assertTrue(angleDeg(o.line.direction, truth.direction) < 2.5, "$d m angle ${angleDeg(o.line.direction, truth.direction)}")
+                // The measured-to-expected noise ratio is reported and lowers the confidence.
+                assertEquals(2.0, assertNotNull(noisy.noiseRatio), 0.35)
+                assertEquals(1.0, assertNotNull(nominal.noiseRatio), 0.2)
+                assertTrue(o.confidence < assertNotNull(nominal.observation).confidence, "$d m: confidence not lowered")
+            }
+        }
     }
 
     // ---------------------------------------------------------------- fromPlane

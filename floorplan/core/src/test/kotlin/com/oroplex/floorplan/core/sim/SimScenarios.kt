@@ -347,11 +347,13 @@ internal object SimScenarios {
                 "depth noise sigma = 5 mm + 1.2 % of range along the ray; 10 % outliers; floorY 0, ceilingY 2.44; the " +
                 "AR layer passes the aim point (median of the center-ray hits) like the app; production WallEstimatorConfig " +
                 "and default SolverOptions. ${SEED_SETS.count()} seed sets x 2 stations per room unless noted. On TOO_NOISY/TOO_FAR " +
-                "the simulated user steps closer (to 60 %), on NO_DOMINANT_PLANE/TOO_FEW_POINTS re-aims (max 4 tries).",
+                "the simulated user steps closer (to 60 %), on NO_DOMINANT_PLANE/TOO_FEW_POINTS re-aims, on a hint " +
+                "('stand square to this wall') stands square in front of it, closer each time (max 4 tries).",
         )
         appendLine(
-            "Columns: scans; topo = scans with the true corner count; offT = scans with >= 1 capture that fitted a " +
-                "different surface than the aimed-at wall; 1stfail = captures whose first try failed / captures; dist = " +
+            "Columns: scans; topo = scans with the true corner count; WRONG = scans with >= 1 capture accepted on a " +
+                "different surface than the aimed-at wall (or > 5 deg / 5 cm off its face); miss = walls not captured " +
+                "after 4 tries; 1stfail = captures whose first try failed / captures; dist = " +
                 "mean camera-to-aim distance (m). Accuracy columns are over scans that are on target with correct " +
                 "topology: maxdL / p95dL = wall length error (mm), corner = max corner position error (mm), area% = max " +
                 "|area error|, sq = max interior-angle error, rot = max |rotation| of the outline (deg). '!' lines list " +
@@ -384,7 +386,30 @@ internal object SimScenarios {
         append(sweepSection())
         appendLine()
         append(grazingSection())
+        appendLine()
+        append(HardScenarios.report())
+        appendLine()
+        append(LIMITS)
     }
+
+    /** What the simulation cannot tell about a real phone; printed at the end of every report. */
+    private val LIMITS = """
+        == what this simulation does NOT tell us about a real phone
+          * The size and shape of real depth error. Every number above assumes range noise of 5 mm + 1.2 % (x 1.5 / x 2 in
+            the stress rows), independent from ray to ray. Depth-from-motion on a plain wall is smooth: a whole patch is off
+            together. The (a-field) row and the 'field' sweep put in one smooth 0.3 % error per capture to show the
+            sensitivity (wall directions move by about a degree, lengths by centimetres); what the S26 Ultra really does is
+            unknown until it is measured against a tape.
+          * Tracking. Camera poses are exact here apart from the +2 % scale case (c). Real ARCore drifts in position and
+            yaw over a session, relocalizes, and may lose tracking.
+          * Depth holes and bias on dark, glossy, mirrored or glass surfaces, at window frames, door frames and edges
+            (mixed pixels), and in dim light. The simulated walls are ideal diffuse planes with sharp corners.
+          * How often ARCore returns a plane hit instead of a depth hit, how far its planes are off, and how many samples of
+            the 9 x 9 grid a real frame yields. The grid's angular size is a guess too: +-12 deg here; the app takes 25 % of
+            the short side of the view, about +-7 to +-10 deg depending on the camera (see (a-narrow)).
+          * The user. The simulated user holds the phone steady (0.3 deg, 3 mm), aims where told and follows every hint.
+          * Real rooms: curtains, plants, open doors, skirting boards, sloped ceilings, walls that are not flat or plumb.
+        """.trimIndent() + "\n"
 
     private fun furnitureStats(scans: List<RoomScan>): List<String> {
         val furnishedCaptures = scans.flatMap { scan ->

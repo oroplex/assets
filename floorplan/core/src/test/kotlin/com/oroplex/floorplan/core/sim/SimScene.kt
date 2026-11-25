@@ -31,6 +31,8 @@ internal class FurnitureBox(
     val u1: Double,
     val depth: Double,
     val height: Double,
+    /** Surface code its ray hits report ([RayHit.FURNITURE], or [RayHit.COLUMN] for a free-standing column). */
+    val surface: Int = RayHit.FURNITURE,
 ) {
     /** Ray parameter of the first hit on the box (slab method in the wall frame), or null. */
     fun raycast(o: Vec3, d: Vec3, floorY: Double): Double? {
@@ -65,6 +67,25 @@ internal class FurnitureBox(
         val b = q dot v
         return a >= u0 - margin && a <= u1 + margin && b >= -margin && b <= depth + margin
     }
+
+    /** True when the plan segment [from] -> [to] crosses the footprint (sampled every 2 cm). */
+    fun blocks(from: Vec2, to: Vec2): Boolean {
+        val steps = (from.distanceTo(to) / 0.02).toInt().coerceAtLeast(2)
+        return (1 until steps).any { footprintContains(Vec2.lerp(from, to, it.toDouble() / steps)) }
+    }
+
+    /** The four corners of the footprint, CCW when [u] × [v] > 0. */
+    val footprint: List<Vec2>
+        get() = listOf(origin + u * u0, origin + u * u1, origin + u * u1 + v * depth, origin + u * u0 + v * depth)
+
+    companion object {
+        /** A free-standing, full-height square column of side [size] centred at [center] (axis-aligned). */
+        fun column(center: Vec2, size: Double, ceilingHeight: Double): FurnitureBox =
+            FurnitureBox(
+                -1, center - Vec2(size / 2, size / 2), Vec2(1.0, 0.0), Vec2(0.0, 1.0), 0.0, size, size, ceilingHeight,
+                RayHit.COLUMN,
+            )
+    }
 }
 
 /** A ray hit: distance [t] and [surface] = wall (edge) index, or one of the negative constants. */
@@ -74,6 +95,7 @@ internal class RayHit(val t: Double, val surface: Int) {
         const val FLOOR = -1
         const val CEILING = -2
         const val FURNITURE = -3
+        const val COLUMN = -4
     }
 }
 
@@ -117,6 +139,22 @@ internal class SimRoom(
 
     fun withFurniture(boxes: List<FurnitureBox>) = SimRoom(name, corners, boxes, floorY, ceilingY)
 
+    /** Free-standing columns (full-height boxes): nobody aims through them. */
+    val columns: List<FurnitureBox> get() = furniture.filter { it.surface == RayHit.COLUMN }
+
+    /**
+     * Distance along the ray [o] + t·[d] to the detected ARCore plane of wall [wall]: its face shifted by
+     * [offset] along the inward normal (the plane's own estimation error); null when the ray runs parallel.
+     */
+    fun planeHit(o: Vec3, d: Vec3, wall: Int, offset: Double): Double? {
+        val n = inwardNormal(wall)
+        val dp = Vec2(d.x, -d.z)
+        val g = dp dot n
+        if (abs(g) < 1e-9) return null
+        val t = (offset - ((o.toPlan() - start(wall)) dot n)) / g
+        return t.takeIf { it > RAY_EPS }
+    }
+
     /**
      * First surface hit along the ray [o] + t·[d] ([d] unit): walls, floor, ceiling and furniture.
      * Returns t (= distance, since [d] is unit) and the surface that was hit, or null when nothing is hit.
@@ -154,7 +192,7 @@ internal class SimRoom(
             val t = b.raycast(o, d, floorY) ?: continue
             if (t < best) {
                 best = t
-                surface = RayHit.FURNITURE
+                surface = b.surface
             }
         }
         return if (best.isFinite()) RayHit(best, surface) else null
@@ -170,7 +208,7 @@ internal class SimRoom(
             val t = rayHitsSegment(from, d, start(i), end(i)) ?: continue
             if (t > 1e-6 && t < 1 - 1e-6) return false
         }
-        return true
+        return columns.none { it.blocks(from, to) }
     }
 
     /** Free distance from the face of wall [i] at [p] along its inward normal to the opposite boundary. */

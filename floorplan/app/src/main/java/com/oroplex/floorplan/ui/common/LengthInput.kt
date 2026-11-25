@@ -3,12 +3,38 @@ package com.oroplex.floorplan.ui.common
 import com.oroplex.floorplan.core.measure.Units
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.UnitSystem
+import java.util.Locale
+import kotlin.math.abs
 
 /** Formats a length with the project's unit system and imperial precision. */
 fun PlanSettings.formatLength(meters: Double): String = Units.formatLength(meters, unitSystem, imperialDenominator)
 
 /** Formats an area (square meters) with the project's unit system. */
 fun PlanSettings.formatArea(squareMeters: Double): String = Units.formatArea(squareMeters, unitSystem)
+
+/** Formats a volume (cubic meters) with the project's unit system, see [formatVolume]. */
+fun PlanSettings.formatVolume(cubicMeters: Double): String = formatVolume(cubicMeters, unitSystem)
+
+private const val CUBIC_FEET_PER_CUBIC_METER = 35.314666721488590
+
+/**
+ * "1,152 cu ft" (whole cubic feet) or "32.6 m³" (one decimal), with comma thousands separators regardless of the
+ * device locale (like Units.formatArea). Non-finite input gives "—".
+ */
+fun formatVolume(cubicMeters: Double, system: UnitSystem): String {
+    if (!cubicMeters.isFinite()) return "—"
+    val sign = if (cubicMeters < 0) "-" else ""
+    return when (system) {
+        UnitSystem.IMPERIAL -> {
+            val cuft = Math.round(abs(cubicMeters) * CUBIC_FEET_PER_CUBIC_METER)
+            (if (cuft == 0L) "" else sign) + "%,d".format(Locale.US, cuft) + " cu ft"
+        }
+        UnitSystem.METRIC -> {
+            val tenths = Math.round(abs(cubicMeters) * 10)
+            (if (tenths == 0L) "" else sign) + "%,d".format(Locale.US, tenths / 10) + ".${tenths % 10} m³"
+        }
+    }
+}
 
 /**
  * Parsing of typed lengths on top of [Units.parseLength], with two options the editor needs:

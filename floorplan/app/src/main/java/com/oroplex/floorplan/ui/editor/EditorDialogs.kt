@@ -7,21 +7,30 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
@@ -35,11 +44,15 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.oroplex.floorplan.core.model.AreaCategory
 import com.oroplex.floorplan.core.model.Calibration
 import com.oroplex.floorplan.core.model.CaptureMethod
 import com.oroplex.floorplan.core.model.DoorSwing
@@ -47,9 +60,11 @@ import com.oroplex.floorplan.core.model.Opening
 import com.oroplex.floorplan.core.model.OpeningType
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.Room
+import com.oroplex.floorplan.core.model.RoomNames
 import com.oroplex.floorplan.core.model.RoomType
 import com.oroplex.floorplan.core.model.UnitSystem
 import com.oroplex.floorplan.ui.common.LengthField
+import com.oroplex.floorplan.ui.common.LengthFieldState
 import com.oroplex.floorplan.ui.common.formatLength
 import com.oroplex.floorplan.ui.common.rememberLengthFieldState
 import java.util.Locale
@@ -74,20 +89,34 @@ sealed interface EditorDialog {
 
 // ---- Room ----------------------------------------------------------------------------------------------
 
+/**
+ * Name, type and "counts as" (area category) of a room. Changing the type renames a room that still has a
+ * default name ([nameAfterTypeChange], numbered against [floorRooms]); the area category follows the type
+ * unless the user picks another one.
+ */
 @Composable
-fun RoomDetailsDialog(room: Room, onConfirm: (name: String, type: RoomType) -> Unit, onDismiss: () -> Unit) {
+fun RoomDetailsDialog(
+    room: Room,
+    floorRooms: List<Room>,
+    onConfirm: (name: String, type: RoomType, areaCategory: AreaCategory?) -> Unit,
+    onDismiss: () -> Unit,
+) {
     var name by rememberSaveable { mutableStateOf(room.name) }
     var type by rememberSaveable { mutableStateOf(room.type) }
+    // null = follow the type's default category.
+    var category by rememberSaveable { mutableStateOf(room.areaCategory?.takeIf { it != room.type.defaultArea }) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Room details") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 RoomTypeDropdown(
                     selected = type,
                     onSelect = { newType ->
-                        // Keep auto-generated names in sync with the type ("Bedroom 2" -> "Office").
-                        if (name.isBlank() || RoomPlacement.isDefaultName(name, type)) name = newType.displayName
+                        // Keep auto-generated names in sync with the type ("Room 3" -> "Bedroom 3"), numbered
+                        // against the floor so two rooms never share a name.
+                        name = nameAfterTypeChange(name, type, newType, floorRooms, room.id)
+                        if (category == newType.defaultArea) category = null
                         type = newType
                     },
                 )
@@ -99,16 +128,75 @@ fun RoomDetailsDialog(room: Room, onConfirm: (name: String, type: RoomType) -> U
                     keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Words, imeAction = ImeAction.Done),
                     modifier = Modifier.fillMaxWidth(),
                 )
+                AreaCategoryChoice(
+                    selected = category ?: type.defaultArea,
+                    typeDefault = type.defaultArea,
+                    onSelect = { category = it.takeIf { c -> c != type.defaultArea } },
+                )
             }
         },
         confirmButton = {
             TextButton(onClick = {
-                onConfirm(name.trim().ifEmpty { type.displayName }, type)
+                onConfirm(name.trim().ifEmpty { RoomNames.unique(type, floorRooms, room.id) }, type, category)
                 onDismiss()
             }) { Text("Save") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+/** "Counts as" radio list: which area total the room's floor area goes into. */
+@Composable
+private fun AreaCategoryChoice(selected: AreaCategory, typeDefault: AreaCategory, onSelect: (AreaCategory) -> Unit) {
+    Column(Modifier.selectableGroup()) {
+        Text("Counts as", style = MaterialTheme.typography.labelLarge)
+        AreaCategory.entries.forEach { c ->
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .selectable(selected = c == selected, onClick = { onSelect(c) }, role = Role.RadioButton),
+            ) {
+                RadioButton(selected = c == selected, onClick = null)
+                Column(Modifier.padding(start = 12.dp)) {
+                    Text(c.displayName, style = MaterialTheme.typography.bodyLarge)
+                    if (c == typeDefault) {
+                        Text(
+                            "Usual for this room type",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Room types grouped for the type picker, in display order. Every [RoomType] appears exactly once; types not
+ * listed in a group (added later) go to "Other".
+ */
+internal object RoomTypeGroups {
+    private val GROUPS: List<Pair<String, List<RoomType>>> = listOf(
+        "Living" to listOf(RoomType.LIVING, RoomType.FAMILY, RoomType.DEN, RoomType.OFFICE, RoomType.BONUS, RoomType.SUNROOM),
+        "Kitchen & dining" to listOf(RoomType.KITCHEN, RoomType.DINING, RoomType.PANTRY),
+        "Bedrooms & baths" to listOf(
+            RoomType.BEDROOM, RoomType.PRIMARY_BEDROOM, RoomType.BATHROOM, RoomType.HALF_BATH, RoomType.CLOSET,
+        ),
+        "Halls & entries" to listOf(RoomType.HALLWAY, RoomType.ENTRY, RoomType.MUDROOM, RoomType.STAIRS),
+        "Utility & storage" to listOf(
+            RoomType.LAUNDRY, RoomType.UTILITY, RoomType.STORAGE, RoomType.GARAGE, RoomType.WORKSHOP, RoomType.BASEMENT,
+        ),
+        "Outdoor" to listOf(RoomType.PORCH, RoomType.DECK, RoomType.BALCONY, RoomType.PATIO),
+    )
+
+    val groups: List<Pair<String, List<RoomType>>> by lazy {
+        val listed = GROUPS.flatMap { it.second }.toSet()
+        val rest = RoomType.entries.filter { it !in listed }
+        GROUPS + ("Other" to rest)
+    }
 }
 
 @Composable
@@ -124,16 +212,34 @@ fun RoomTypeDropdown(selected: RoomType, onSelect: (RoomType) -> Unit, modifier:
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
             modifier = Modifier.fillMaxWidth().menuAnchor(MenuAnchorType.PrimaryNotEditable),
         )
+        // The menu scrolls; group headings keep the long list easy to scan.
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            RoomType.entries.forEach { type ->
-                DropdownMenuItem(
-                    text = { Text(type.displayName) },
-                    onClick = {
-                        onSelect(type)
-                        expanded = false
-                    },
-                    contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding,
+            RoomTypeGroups.groups.forEach { (heading, types) ->
+                if (types.isEmpty()) return@forEach
+                Text(
+                    heading,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier
+                        .padding(horizontal = 16.dp)
+                        .padding(top = 12.dp, bottom = 4.dp)
+                        .semantics { heading() },
                 )
+                types.forEach { type ->
+                    DropdownMenuItem(
+                        text = { Text(type.displayName) },
+                        onClick = {
+                            onSelect(type)
+                            expanded = false
+                        },
+                        trailingIcon = if (type == selected) {
+                            { Icon(Icons.Filled.Check, contentDescription = "Selected") }
+                        } else {
+                            null
+                        },
+                        contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding,
+                    )
+                }
             }
         }
     }
@@ -429,12 +535,16 @@ fun SetWallLengthDialog(
     )
 }
 
-/** Tape calibration of the whole floor from one wall. [onApply] returns an error or null on success. */
+/**
+ * Tape calibration of the floor from one wall of a scanned room. [scannedRooms] / [drawnRooms] count the floor's
+ * rooms for the explanation. [onApply] returns an error or null on success.
+ */
 @Composable
 fun CalibrateDialog(
     room: Room,
     wallIndex: Int,
-    roomCount: Int,
+    scannedRooms: Int,
+    drawnRooms: Int,
     settings: PlanSettings,
     previous: Calibration?,
     onApply: (Double) -> String?,
@@ -456,12 +566,7 @@ fun CalibrateDialog(
         title = { Text("Calibrate floor") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
-                Text(
-                    "Measure wall ${wallIndex + 1} of ${room.name} with a tape (inside face, corner to corner) and enter " +
-                        "the true length. All $roomCount ${if (roomCount == 1) "room" else "rooms"} on this floor are scaled to match, " +
-                        "which removes the AR scale error.",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+                Text(calibrationExplanation(room.name, wallIndex, scannedRooms, drawnRooms), style = MaterialTheme.typography.bodyMedium)
                 Spacer(Modifier.padding(4.dp))
                 Text("Measured by the app", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(settings.formatLength(measured), style = MaterialTheme.typography.titleLarge)
@@ -502,10 +607,40 @@ fun CalibrateDialog(
     )
 }
 
+/**
+ * What tape calibration does, for the dialog: only AR measurements are scaled. Scanned rooms scale; drawn rooms
+ * keep their typed sizes and move with the plan; lengths, ceilings and door / window sizes the user typed stay.
+ */
+internal fun calibrationExplanation(roomName: String, wallIndex: Int, scannedRooms: Int, drawnRooms: Int): String = buildString {
+    append("Measure wall ${wallIndex + 1} of $roomName with a tape (inside face, corner to corner) and enter the true length. ")
+    val scanned = scannedRooms.coerceAtLeast(1)
+    append(
+        if (scanned == 1) "The scanned room on this floor is scaled to match, which removes the AR scale error."
+        else "The $scanned scanned rooms on this floor are scaled to match, which removes the AR scale error.",
+    )
+    if (drawnRooms > 0) {
+        append(
+            if (drawnRooms == 1) " The drawn room keeps its typed size and moves with the plan."
+            else " The $drawnRooms drawn rooms keep their typed sizes and move with the plan.",
+        )
+    }
+    append(" Lengths, ceilings and door sizes you typed are kept.")
+}
+
 // ---- Project settings ----------------------------------------------------------------------------------
 
+/**
+ * The project's own settings. [estimatedCeilingRooms] is the number of rooms whose ceiling is still the current
+ * default estimate; when the default ceiling changes, the dialog offers to apply the new default to them
+ * ([onConfirm]'s second argument).
+ */
 @Composable
-fun ProjectSettingsDialog(settings: PlanSettings, onConfirm: (PlanSettings) -> Unit, onDismiss: () -> Unit) {
+fun ProjectSettingsDialog(
+    settings: PlanSettings,
+    estimatedCeilingRooms: Int,
+    onConfirm: (PlanSettings, applyCeilingToEstimated: Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
     var units by rememberSaveable { mutableStateOf(settings.unitSystem) }
     var denominator by rememberSaveable { mutableStateOf(settings.imperialDenominator.takeIf { it in DENOMINATORS } ?: 2) }
     var square by rememberSaveable { mutableStateOf(settings.squareAngles) }
@@ -513,36 +648,70 @@ fun ProjectSettingsDialog(settings: PlanSettings, onConfirm: (PlanSettings) -> U
     var showLengths by rememberSaveable { mutableStateOf(settings.showWallLengths) }
     var showAreas by rememberSaveable { mutableStateOf(settings.showRoomAreas) }
     var showOverall by rememberSaveable { mutableStateOf(settings.showOverallDimensions) }
+    var applyCeiling by rememberSaveable { mutableStateOf(true) }
     // The length fields follow the unit choice made in this dialog.
     val fieldSettings = settings.copy(unitSystem = units, imperialDenominator = if (units == UnitSystem.IMPERIAL) denominator else settings.imperialDenominator)
+    val exteriorStored = settings.exteriorWallThickness?.takeIf { it.isFinite() && it > 0 }
     // Last valid values; they seed the fields again when a unit change recreates them.
     var thickness by rememberSaveable { mutableStateOf(settings.wallThickness) }
+    var exterior by rememberSaveable { mutableStateOf(exteriorStored ?: settings.wallThickness) }
+    var ceiling by rememberSaveable { mutableStateOf(settings.defaultCeilingHeight) }
     var doorWidth by rememberSaveable { mutableStateOf(settings.defaultDoorWidth) }
+    var doorHeight by rememberSaveable { mutableStateOf(settings.defaultDoorHeight) }
     var windowWidth by rememberSaveable { mutableStateOf(settings.defaultWindowWidth) }
+    var windowHeight by rememberSaveable { mutableStateOf(settings.defaultWindowHeight) }
+    var sill by rememberSaveable { mutableStateOf(settings.defaultWindowSill) }
+
     val thicknessField = rememberLengthFieldState(thickness, fieldSettings, smallUnits = true)
+    val exteriorField = rememberLengthFieldState(exterior, fieldSettings, smallUnits = true)
+    val ceilingField = rememberLengthFieldState(ceiling, fieldSettings)
     val doorField = rememberLengthFieldState(doorWidth, fieldSettings, smallUnits = true)
+    val doorHeightField = rememberLengthFieldState(doorHeight, fieldSettings, smallUnits = true)
     val windowField = rememberLengthFieldState(windowWidth, fieldSettings, smallUnits = true)
+    val windowHeightField = rememberLengthFieldState(windowHeight, fieldSettings, smallUnits = true)
+    val sillField = rememberLengthFieldState(sill, fieldSettings, smallUnits = true, allowZero = true)
+
+    // A value outside the range is accepted when it is the stored value itself (e.g. from an imported backup),
+    // so the dialog can always be saved without touching unrelated fields.
+    fun fieldError(field: LengthFieldState, range: ClosedFloatingPointRange<Double>, stored: Double?): String? =
+        field.value?.takeUnless { stored != null && abs(it - stored) < 1e-9 }?.let { rangeError(it, range, fieldSettings) }
+
     val keepLengths = {
-        thicknessField.value?.takeIf { it in THICKNESS_RANGE }?.let { thickness = it }
-        doorField.value?.takeIf { it in DOOR_WIDTH_RANGE }?.let { doorWidth = it }
-        windowField.value?.takeIf { it in WINDOW_WIDTH_RANGE }?.let { windowWidth = it }
+        fun keep(field: LengthFieldState, range: ClosedFloatingPointRange<Double>, set: (Double) -> Unit) {
+            field.value?.takeIf { it in range }?.let(set)
+        }
+        keep(thicknessField, THICKNESS_RANGE) { thickness = it }
+        keep(exteriorField, EXTERIOR_THICKNESS_RANGE) { exterior = it }
+        keep(ceilingField, DEFAULT_CEILING_RANGE) { ceiling = it }
+        keep(doorField, DOOR_WIDTH_RANGE) { doorWidth = it }
+        keep(doorHeightField, DOOR_HEIGHT_RANGE) { doorHeight = it }
+        keep(windowField, WINDOW_WIDTH_RANGE) { windowWidth = it }
+        keep(windowHeightField, WINDOW_HEIGHT_RANGE) { windowHeight = it }
+        keep(sillField, SILL_RANGE) { sill = it }
     }
-    val thicknessValue = thicknessField.value
-    val thicknessError = rangeError(thicknessValue, THICKNESS_RANGE, fieldSettings)
-    val doorValue = doorField.value
-    val doorError = rangeError(doorValue, DOOR_WIDTH_RANGE, fieldSettings)
-    val windowValue = windowField.value
-    val windowError = rangeError(windowValue, WINDOW_WIDTH_RANGE, fieldSettings)
+    val thicknessError = fieldError(thicknessField, THICKNESS_RANGE, settings.wallThickness)
+    val exteriorError = fieldError(exteriorField, EXTERIOR_THICKNESS_RANGE, exteriorStored)
+    val ceilingError = fieldError(ceilingField, DEFAULT_CEILING_RANGE, settings.defaultCeilingHeight)
+    val doorError = fieldError(doorField, DOOR_WIDTH_RANGE, settings.defaultDoorWidth)
+    val doorHeightError = fieldError(doorHeightField, DOOR_HEIGHT_RANGE, settings.defaultDoorHeight)
+    val windowError = fieldError(windowField, WINDOW_WIDTH_RANGE, settings.defaultWindowWidth)
+    val windowHeightError = fieldError(windowHeightField, WINDOW_HEIGHT_RANGE, settings.defaultWindowHeight)
+    val sillError = fieldError(sillField, SILL_RANGE, settings.defaultWindowSill)
+    val lengthFields = listOf(
+        thicknessField, exteriorField, ceilingField, doorField, doorHeightField, windowField, windowHeightField, sillField,
+    )
+    val lengthErrors = listOf(
+        thicknessError, exteriorError, ceilingError, doorError, doorHeightError, windowError, windowHeightError, sillError,
+    )
     val tolerance = toleranceText.trim().replace(',', '.').toDoubleOrNull()
     val toleranceError = if (tolerance == null || tolerance !in TOLERANCE_RANGE) {
         "Between ${formatDegrees(TOLERANCE_RANGE.start)} and ${formatDegrees(TOLERANCE_RANGE.endInclusive)}"
     } else {
         null
     }
-    val valid = thicknessValue != null && thicknessError == null &&
-        doorValue != null && doorError == null &&
-        windowValue != null && windowError == null &&
-        (!square || toleranceError == null)
+    val valid = lengthFields.all { it.value != null } && lengthErrors.all { it == null } && (!square || toleranceError == null)
+    val newCeiling = ceilingField.value
+    val ceilingChanged = newCeiling != null && ceilingError == null && abs(newCeiling - settings.defaultCeilingHeight) > 1e-9
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -571,11 +740,43 @@ fun ProjectSettingsDialog(settings: PlanSettings, onConfirm: (PlanSettings) -> U
                         },
                     )
                 }
-                LengthField(thicknessField, label = "Wall thickness", error = thicknessError, imeAction = ImeAction.Next, modifier = Modifier.fillMaxWidth())
+                HorizontalDivider()
+                Text("Walls", style = MaterialTheme.typography.labelLarge)
+                LengthField(thicknessField, label = "Interior wall thickness", error = thicknessError, imeAction = ImeAction.Next, modifier = Modifier.fillMaxWidth())
+                LengthField(
+                    exteriorField,
+                    label = "Exterior wall thickness",
+                    error = exteriorError,
+                    imeAction = ImeAction.Next,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "Overall dimensions measure to the outside of the exterior walls.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                HorizontalDivider()
+                Text("Ceilings", style = MaterialTheme.typography.labelLarge)
+                LengthField(ceilingField, label = "Default ceiling height", error = ceilingError, imeAction = ImeAction.Next, modifier = Modifier.fillMaxWidth())
+                Text(
+                    "Used when a room's ceiling isn't measured. Such rooms are marked (est.).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (ceilingChanged && estimatedCeilingRooms > 0) {
+                    CheckboxRow(
+                        text = "Apply to $estimatedCeilingRooms ${if (estimatedCeilingRooms == 1) "room" else "rooms"} with estimated ceilings",
+                        checked = applyCeiling,
+                        onCheckedChange = { applyCeiling = it },
+                    )
+                }
                 HorizontalDivider()
                 Text("New doors & windows", style = MaterialTheme.typography.labelLarge)
                 LengthField(doorField, label = "Door width", error = doorError, imeAction = ImeAction.Next, modifier = Modifier.fillMaxWidth())
-                LengthField(windowField, label = "Window width", error = windowError, modifier = Modifier.fillMaxWidth())
+                LengthField(doorHeightField, label = "Door height", error = doorHeightError, imeAction = ImeAction.Next, modifier = Modifier.fillMaxWidth())
+                LengthField(windowField, label = "Window width", error = windowError, imeAction = ImeAction.Next, modifier = Modifier.fillMaxWidth())
+                LengthField(windowHeightField, label = "Window height", error = windowHeightError, imeAction = ImeAction.Next, modifier = Modifier.fillMaxWidth())
+                LengthField(sillField, label = "Window sill height", error = sillError, modifier = Modifier.fillMaxWidth())
                 HorizontalDivider()
                 SwitchRow(
                     title = "Square corners",
@@ -610,20 +811,36 @@ fun ProjectSettingsDialog(settings: PlanSettings, onConfirm: (PlanSettings) -> U
             TextButton(
                 enabled = valid,
                 onClick = {
-                    if (thicknessValue != null && doorValue != null && windowValue != null) {
+                    val values = lengthFields.map { it.value }
+                    if (values.all { it != null }) {
+                        val exteriorValue = exteriorField.value
                         onConfirm(
                             settings.copy(
                                 unitSystem = units,
                                 imperialDenominator = denominator,
-                                wallThickness = thicknessValue,
+                                wallThickness = thicknessField.value ?: settings.wallThickness,
+                                // Keep "same as interior" (null) unless the user entered a different value
+                                // (compared by value, so an edit survives a unit switch that recreates the field).
+                                exteriorWallThickness = if (
+                                    exteriorStored == null && (exteriorValue == null || abs(exteriorValue - settings.wallThickness) < 1e-9)
+                                ) {
+                                    settings.exteriorWallThickness
+                                } else {
+                                    exteriorValue
+                                },
                                 squareAngles = square,
                                 squareToleranceDeg = if (square && tolerance != null) tolerance else settings.squareToleranceDeg,
                                 showWallLengths = showLengths,
                                 showRoomAreas = showAreas,
                                 showOverallDimensions = showOverall,
-                                defaultDoorWidth = doorValue,
-                                defaultWindowWidth = windowValue,
+                                defaultCeilingHeight = ceilingField.value ?: settings.defaultCeilingHeight,
+                                defaultDoorWidth = doorField.value ?: settings.defaultDoorWidth,
+                                defaultDoorHeight = doorHeightField.value ?: settings.defaultDoorHeight,
+                                defaultWindowWidth = windowField.value ?: settings.defaultWindowWidth,
+                                defaultWindowHeight = windowHeightField.value ?: settings.defaultWindowHeight,
+                                defaultWindowSill = sillField.value ?: settings.defaultWindowSill,
                             ),
+                            ceilingChanged && estimatedCeilingRooms > 0 && applyCeiling,
                         )
                         onDismiss()
                     }
@@ -632,6 +849,20 @@ fun ProjectSettingsDialog(settings: PlanSettings, onConfirm: (PlanSettings) -> U
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+@Composable
+private fun CheckboxRow(text: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .toggleable(value = checked, onValueChange = onCheckedChange, role = Role.Checkbox),
+    ) {
+        Checkbox(checked = checked, onCheckedChange = null)
+        Text(text, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(start = 12.dp))
+    }
 }
 
 // ---- Building blocks -----------------------------------------------------------------------------------
@@ -675,6 +906,13 @@ private fun formatNumber(v: Double): String =
 private fun formatDegrees(v: Double): String = formatNumber(v) + "°"
 
 private val DENOMINATORS = listOf(1, 2, 4, 8, 16)
+
+// Same ranges as the app Settings screen for the defaults it also edits.
+private val DEFAULT_CEILING_RANGE = 1.5..6.0
+private val DOOR_HEIGHT_RANGE = 1.5..3.5
+private val WINDOW_HEIGHT_RANGE = 0.2..3.0
+private val SILL_RANGE = 0.0..2.5
+private val EXTERIOR_THICKNESS_RANGE = 0.05..0.8
 private val CEILING_RANGE = 1.5..10.0
 private val DRAWN_ROOM_RANGE = 0.3..50.0
 private val WALL_RANGE = 0.06..100.0

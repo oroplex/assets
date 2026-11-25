@@ -7,6 +7,7 @@ import com.oroplex.floorplan.core.model.Floor
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.Project
 import com.oroplex.floorplan.core.model.Room
+import com.oroplex.floorplan.core.model.placementFrame
 import com.oroplex.floorplan.core.solve.FloorIssue
 import com.oroplex.floorplan.core.solve.IssueSeverity
 
@@ -30,30 +31,41 @@ data class EditorUiState(
     /** Always the id of an existing floor once READY (or null for a project without floors). */
     val floorId: String? = null,
     val selection: Selection? = null,
-    /** One-finger drags translate the selected room instead of panning. */
+    /** One-finger drags translate the selected room (or its whole scan) instead of panning. */
     val moveMode: Boolean = false,
-    /** Live result of an in-progress corner drag / move, drawn instead of the committed room. */
-    val preview: Room? = null,
+    /**
+     * Live result of an in-progress corner drag / move, drawn instead of the committed rooms: the dragged room
+     * first, then the other rooms of its scan when the whole scan is being moved. Empty when nothing is dragged.
+     */
+    val previewRooms: List<Room> = emptyList(),
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
     /** Checks of the current floor (as committed), recomputed whenever the floor or the settings change. */
     val insights: FloorInsights = FloorInsights(),
     /** Snap guides of the drag in progress, or null when nothing is being dragged / snapped. */
     val dragGuides: DragGuides? = null,
+    /**
+     * The user's "Whole scan" choice per placement frame ([Room.placementFrame]); frames without a choice use
+     * [ScanGroups.defaultWholeScan].
+     */
+    val wholeScanChoices: Map<String, Boolean> = emptyMap(),
 ) {
     val floor: Floor? get() = project?.floors?.firstOrNull { it.id == floorId }
     val settings: PlanSettings get() = project?.settings ?: PlanSettings()
 
+    /** The dragged room as currently previewed, or null when nothing is being dragged. */
+    val preview: Room? get() = previewRooms.firstOrNull()
+
     /**
-     * Rooms drawn with a warning outline: every room of an overlapping pair. While a room is being dragged,
-     * pairs involving it are left out (their overlap is re-checked when the finger lifts) so the highlight
-     * never lags behind the moving room.
+     * Rooms drawn with a warning outline: every room of an overlapping pair. While rooms are being dragged,
+     * pairs involving them are left out (their overlap is re-checked when the finger lifts) so the highlight
+     * never lags behind the moving rooms.
      */
     val highlightRoomIds: Set<String>
         get() {
-            val moving = preview?.id
+            val moving = previewRooms.mapTo(HashSet()) { it.id }
             return insights.overlaps
-                .filter { moving == null || (it.first != moving && it.second != moving) }
+                .filter { it.first !in moving && it.second !in moving }
                 .flatMap { listOf(it.first, it.second) }
                 .toSet()
         }
@@ -62,13 +74,34 @@ data class EditorUiState(
     val displayRooms: List<Room>
         get() {
             val rooms = floor?.rooms ?: return emptyList()
-            val p = preview ?: return rooms
-            return rooms.map { if (it.id == p.id) p else it }
+            if (previewRooms.isEmpty()) return rooms
+            val byId = previewRooms.associateBy { it.id }
+            return rooms.map { byId[it.id] ?: it }
         }
 
     /** The selected room as currently displayed (preview while dragging). */
     val selectedRoom: Room?
         get() = selection?.let { s -> displayRooms.firstOrNull { it.id == s.roomId } }
+
+    /**
+     * The selected room's scan: every room sharing its placement frame (itself included), or empty when it is
+     * alone in its frame (no "Whole scan" choice to offer).
+     */
+    val scanGroupIds: Set<String>
+        get() {
+            val f = floor ?: return emptySet()
+            val id = selection?.roomId ?: return emptySet()
+            return ScanGroups.groupOf(f, id).takeIf { it.size > 1 } ?: emptySet()
+        }
+
+    /** True when moves, turns and snaps of the selected room act on its whole scan ([scanGroupIds]). */
+    val wholeScan: Boolean
+        get() {
+            if (scanGroupIds.isEmpty()) return false
+            val f = floor ?: return false
+            val room = selection?.let { s -> f.rooms.firstOrNull { it.id == s.roomId } } ?: return false
+            return wholeScanChoices[room.placementFrame] ?: ScanGroups.defaultWholeScan(f, room.id)
+        }
 }
 
 /** Results of the floor checks shown in the editor (overlap banner, "Floor check" sheet and its badge). */
@@ -91,8 +124,8 @@ data class DragGuides(
     val lines: List<Segment2> = emptyList(),
     /** Corners that are exactly square after the snap. */
     val rightAngles: List<RightAngleMark> = emptyList(),
-    /** Where the moved room lands if the finger lifts now (auto-snap preview), or null. */
-    val snapOutline: List<Vec2>? = null,
+    /** Where the moved rooms land if the finger lifts now (auto-snap preview), one outline per room; empty for none. */
+    val snapOutlines: List<List<Vec2>> = emptyList(),
     /** Name of the room the moved room would snap to. */
     val snapTargetName: String? = null,
     /** Identifies what the drag is snapped to; changes whenever it snaps onto something new (haptic tick). */

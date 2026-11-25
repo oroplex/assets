@@ -20,7 +20,9 @@ import com.oroplex.floorplan.render.PlanPainter
 
 /**
  * Small label-free drawing of a project's first non-empty floor, for list cards. Shows [placeholder]
- * while the project is loading, when it has no rooms, or when the plan cannot be drawn.
+ * while the project is loading, when it has no rooms, or when the plan cannot be drawn. The plan uses the
+ * always-light plan colours, so callers put it on a [com.oroplex.floorplan.core.render.PlanColors.BACKGROUND]
+ * tile (also in dark mode, where the near-black walls would vanish on a dark surface).
  */
 @Composable
 fun PlanThumbnail(project: Project?, modifier: Modifier = Modifier, placeholder: @Composable () -> Unit) {
@@ -47,7 +49,15 @@ private fun renderThumbnail(rooms: List<Room>, settings: PlanSettings): DrawList
     PlanRenderer.render(
         rooms,
         settings,
-        RenderOptions(showRoomNames = false, showRoomDimensions = false, showAreas = false, showWallLengths = false),
+        // Label-free, and no overall dimension lines: they are sized for a full plan and would only clutter a
+        // tile this small (and shrink the drawing to make room for them).
+        RenderOptions(
+            showRoomNames = false,
+            showRoomDimensions = false,
+            showAreas = false,
+            showWallLengths = false,
+            showOverallDimensions = false,
+        ),
     )
 } catch (e: Exception) {
     Log.w("PlanThumbnail", "Could not render a thumbnail", e)

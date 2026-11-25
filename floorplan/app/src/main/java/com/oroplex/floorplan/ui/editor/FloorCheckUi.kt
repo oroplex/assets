@@ -51,12 +51,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.oroplex.floorplan.core.model.Floor
 import com.oroplex.floorplan.core.solve.FloorIssue
+import com.oroplex.floorplan.core.solve.FloorIssueAction
 import com.oroplex.floorplan.core.solve.IssueSeverity
 import kotlinx.coroutines.launch
 
 /**
  * "Floor check" bottom sheet: every [FloorChecks][com.oroplex.floorplan.core.solve.FloorChecks] item of the
- * floor, most severe first. Tapping an item about a room closes the sheet and selects that room.
+ * floor, most severe first. Tapping an item about a room closes the sheet and selects that room; an item with a
+ * one-tap fix ([FloorIssue.action]) also gets a button that closes the sheet and runs [onAction].
  */
 @Composable
 fun FloorCheckSheet(
@@ -64,6 +66,7 @@ fun FloorCheckSheet(
     issues: List<FloorIssue>,
     onSelectRoom: (roomId: String) -> Unit,
     onDismiss: () -> Unit,
+    onAction: (FloorIssue) -> Unit = {},
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
     val scope = rememberCoroutineScope()
@@ -93,6 +96,14 @@ fun FloorCheckSheet(
                                 {
                                     scope.launch { sheetState.hide() }.invokeOnCompletion {
                                         onSelectRoom(id)
+                                        onDismiss()
+                                    }
+                                }
+                            },
+                            onAction = issue.action?.takeIf { it != FloorIssueAction.SNAP_ROOM || roomId != null }?.let {
+                                {
+                                    scope.launch { sheetState.hide() }.invokeOnCompletion {
+                                        onAction(issue)
                                         onDismiss()
                                     }
                                 }
@@ -147,8 +158,14 @@ private fun AllClear(floor: Floor) {
 
 private val AllClearTint = Color(0xFF1E8E3E)
 
+/** Button label of a floor-check item's one-tap fix. */
+internal fun FloorIssueAction.label(): String = when (this) {
+    FloorIssueAction.STRAIGHTEN_FLOOR -> "Straighten"
+    FloorIssueAction.SNAP_ROOM -> "Snap"
+}
+
 @Composable
-private fun IssueRow(issue: FloorIssue, roomName: String?, onClick: (() -> Unit)?) {
+private fun IssueRow(issue: FloorIssue, roomName: String?, onClick: (() -> Unit)?, onAction: (() -> Unit)?) {
     val (icon, tint, label) = severityStyle(issue.severity)
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -171,7 +188,15 @@ private fun IssueRow(issue: FloorIssue, roomName: String?, onClick: (() -> Unit)
             }
             Text(issue.message, style = MaterialTheme.typography.bodyMedium)
         }
-        if (onClick != null) {
+        val action = issue.action
+        if (onAction != null && action != null) {
+            FilledTonalButton(
+                onClick = onAction,
+                modifier = Modifier.padding(start = 8.dp).semantics {
+                    contentDescription = action.label() + (roomName?.let { " $it" } ?: if (action == FloorIssueAction.STRAIGHTEN_FLOOR) " the floor" else "")
+                },
+            ) { Text(action.label()) }
+        } else if (onClick != null) {
             Icon(
                 Icons.AutoMirrored.Filled.KeyboardArrowRight,
                 contentDescription = null,
@@ -233,7 +258,8 @@ fun OverlapBanner(
                 IconButton(onClick = onDismiss) { Icon(Icons.Filled.Close, contentDescription = "Hide this warning") }
             }
             Text(
-                "Usually a room from a later scan. Select it, then drag it into place with Move or tap Snap to neighbour.",
+                "Usually a room from a later scan. Select it, turn it with Square to floor if it's at an angle, then " +
+                    "drag it into place with Move or tap Snap to neighbour.",
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(end = 12.dp),
             )

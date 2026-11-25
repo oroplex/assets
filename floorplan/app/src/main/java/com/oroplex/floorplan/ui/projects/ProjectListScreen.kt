@@ -5,6 +5,7 @@ package com.oroplex.floorplan.ui.projects
 import android.text.format.DateUtils
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -63,6 +64,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
@@ -70,9 +72,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.oroplex.floorplan.core.measure.AreaSummary
+import com.oroplex.floorplan.core.measure.Measurements
 import com.oroplex.floorplan.core.measure.Units
 import com.oroplex.floorplan.core.model.Project
 import com.oroplex.floorplan.core.model.UnitSystem
+import com.oroplex.floorplan.core.render.PlanColors
 import com.oroplex.floorplan.data.ProjectSummary
 import com.oroplex.floorplan.data.appContainer
 import com.oroplex.floorplan.ui.common.ConfirmDialog
@@ -274,14 +279,16 @@ private fun ProjectCard(
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 12.dp)) {
+            // Plans are drawn on white paper in both themes; a subtle outline keeps the tile from glaring in dark mode.
             Surface(
                 shape = RoundedCornerShape(12.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                color = Color(PlanColors.BACKGROUND),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
                 modifier = Modifier.size(64.dp),
             ) {
                 PlanThumbnail(project, Modifier.fillMaxSize()) {
                     Box(contentAlignment = Alignment.Center) {
-                        Icon(Icons.Filled.Home, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Icon(Icons.Filled.Home, contentDescription = null, tint = Color(PlanColors.SELECTION))
                     }
                 }
             }
@@ -296,8 +303,9 @@ private fun ProjectCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
+                val areas = remember(project) { project?.let { p -> runCatching { Measurements.areaSummary(p) }.getOrNull() } }
                 Text(
-                    projectDetails(summary, unitSystem),
+                    projectDetails(summary, unitSystem, areas),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
@@ -379,7 +387,11 @@ private fun EmptyProjects(onCreate: () -> Unit, onOpenSample: () -> Unit, onImpo
     }
 }
 
-private fun projectDetails(summary: ProjectSummary, unitSystem: UnitSystem): String {
+/**
+ * "Updated 5 min ago · 7 rooms · 2 floors · 1,880 sq ft". When some rooms do not count as living area (garage,
+ * porch...), the figure is the living area ("Living area 1,450 sq ft") so it is never mistaken for it.
+ */
+private fun projectDetails(summary: ProjectSummary, unitSystem: UnitSystem, areas: AreaSummary? = null): String {
     val parts = ArrayList<String>(4)
     parts += "Updated " + DateUtils.getRelativeTimeSpanString(
         summary.updatedAt,
@@ -389,8 +401,18 @@ private fun projectDetails(summary: ProjectSummary, unitSystem: UnitSystem): Str
     )
     parts += if (summary.roomCount == 1) "1 room" else "${summary.roomCount} rooms"
     if (summary.floorCount > 1) parts += "${summary.floorCount} floors"
-    if (summary.totalArea > 0 && summary.totalArea.isFinite()) parts += Units.formatArea(summary.totalArea, unitSystem)
+    areaDetail(summary, unitSystem, areas)?.let { parts += it }
     return parts.joinToString(" · ")
+}
+
+/** The card's area figure: living area when some rooms are not living space, else the net total; null for none. */
+internal fun areaDetail(summary: ProjectSummary, unitSystem: UnitSystem, areas: AreaSummary?): String? {
+    val others = areas?.let { it.nonLiving + it.exterior + it.excluded } ?: 0.0
+    return when {
+        areas != null && others > 1e-9 && areas.living.isFinite() -> "Living area " + Units.formatArea(areas.living, unitSystem)
+        summary.totalArea > 0 && summary.totalArea.isFinite() -> Units.formatArea(summary.totalArea, unitSystem)
+        else -> null
+    }
 }
 
 /** A file-system friendly suggested name for a backup, e.g. "12 Oak Street.floorplan.json". */

@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -39,7 +40,9 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
@@ -55,6 +58,8 @@ import com.oroplex.floorplan.core.render.PlanRenderer
 import com.oroplex.floorplan.core.render.RenderOptions
 import com.oroplex.floorplan.core.render.ViewTransform
 import com.oroplex.floorplan.render.PlanPainter
+import kotlin.math.ln
+import kotlin.math.pow
 
 private const val TAG = "PlanCanvas"
 
@@ -101,7 +106,9 @@ private val RightAngleSize = 10.dp
  *  * tap: select corner handle > wall-length label > wall > room > nothing; double tap: zoom to fit.
  *
  * Drawing is clipped to the canvas, so neither the white background nor panned walls ever paint over the
- * floor tabs above it. View changes requested by the ViewModel (fit, focus a room) are animated unless the
+ * floor tabs above it. While a whole scan is moved every room of it is previewed (and its snap landing ghosted).
+ * For TalkBack and Switch Access the canvas describes every room with its size and offers actions to select a
+ * room, then its walls and corners. View changes requested by the ViewModel (fit, focus a room) are animated unless the
  * system's animations are turned off; any gesture takes over immediately.
  */
 @Composable
@@ -118,11 +125,17 @@ fun PlanCanvas(
 ) {
     val density = LocalDensity.current
     val pxPerPt = density.density * 160.0 / 72.0
+    // Overall dimensions are sized for the current zoom. Derived (and bucketed) so pan/zoom only recompose
+    // the canvas when the zoom moves to another step, not on every frame of a pinch.
+    val pointsPerMeter by remember(viewModel, floorId) {
+        derivedStateOf { viewModel.viewFor(floorId)?.let { quantizedPointsPerMeter(it) } }
+    }
     val options = RenderOptions(
         selectedRoomId = selection?.roomId,
         showCornerHandles = selection != null,
         selectedWall = (selection as? Selection.Wall)?.wallIndex,
         highlightRoomIds = highlightRoomIds,
+        pointsPerMeter = pointsPerMeter,
     )
     val render = remember(rooms, settings, options) { renderSafely(rooms, settings, options) }
     val drawList = render ?: EMPTY_DRAW_LIST
@@ -136,8 +149,9 @@ fun PlanCanvas(
     // updates (which only change the transform) redraw the canvas without recomposing it.
     val needsFit by remember(viewModel, floorId) { derivedStateOf { viewModel.viewFor(floorId) == null } }
     LaunchedEffect(needsFit, canvasSize, floorId, drawList.bounds) {
-        if (needsFit && canvasSize.width > 0 && canvasSize.height > 0) {
-            viewModel.setView(floorId, fitView(drawList.bounds, canvasSize, fitMarginPx, pxPerPt))
+        // Checked again here: a focus request may already have placed the view in this frame.
+        if (needsFit && viewModel.viewFor(floorId) == null && canvasSize.width > 0 && canvasSize.height > 0) {
+            viewModel.setView(floorId, settledFit(rooms, settings, options, drawList.bounds, canvasSize, fitMarginPx, pxPerPt))
         }
     }
 
@@ -152,7 +166,7 @@ fun PlanCanvas(
         if (canvasSize.width <= 0 || canvasSize.height <= 0) return@LaunchedEffect
         val w = canvasSize.width.toDouble()
         val h = canvasSize.height.toDouble()
-        val fit = fitView(drawList.bounds, canvasSize, fitMarginPx, pxPerPt)
+        val fit = settledFit(rooms, settings, options, drawList.bounds, canvasSize, fitMarginPx, pxPerPt)
         val from = viewModel.viewFor(floorId)
         val target = when (r) {
             is ViewRequest.Fit -> fit
@@ -182,7 +196,7 @@ fun PlanCanvas(
     LaunchedEffect(selectedRoomId, canvasSize, floorId) {
         val id = selectedRoomId ?: return@LaunchedEffect
         // Never pan under a finger that is dragging, and leave a pending fit / focus to do its own job.
-        if (viewModel.state.value.preview != null || viewModel.viewRequest(floorId) != null) return@LaunchedEffect
+        if (viewModel.state.value.previewRooms.isNotEmpty() || viewModel.viewRequest(floorId) != null) return@LaunchedEffect
         val view = viewModel.viewFor(floorId) ?: return@LaunchedEffect
         val room = latestRooms.firstOrNull { it.id == id } ?: return@LaunchedEffect
         val dy = revealShift(room, view, canvasSize.height.toDouble(), fitMarginPx)
@@ -200,7 +214,20 @@ fun PlanCanvas(
         GestureInputs(viewModel, floorId, rooms, drawList, settings, selection, moveMode, canvasSize, pxPerPt, fitMarginPx),
     )
     val textMeasurer = remember { LabelMeasurer() }
-    val description = canvasDescription(rooms, selection)
+    val description = remember(rooms, selection, settings) { canvasDescription(rooms, selection, settings) }
+    // TalkBack / Switch Access: select any room, then its walls and corners, without precise pointing.
+    val a11yActions = remember(rooms, selection, settings, viewModel) {
+        canvasActions(rooms, selection, settings).map { action ->
+            CustomAccessibilityAction(action.label) {
+                when (action) {
+                    is CanvasAction.FocusRoom -> viewModel.focusRoom(action.roomId)
+                    is CanvasAction.Select -> viewModel.select(action.selection)
+                    is CanvasAction.Clear -> viewModel.clearSelection()
+                }
+                true
+            }
+        }
+    }
 
     Box(modifier) {
         Canvas(
@@ -208,7 +235,10 @@ fun PlanCanvas(
                 .fillMaxSize()
                 .clipToBounds()
                 .onSizeChanged { canvasSize = it }
-                .semantics { contentDescription = description }
+                .semantics {
+                    contentDescription = description
+                    customActions = a11yActions
+                }
                 .pointerInput(floorId) { detectPlanGestures(gestureState::value, textMeasurer) },
         ) {
             val view = viewModel.viewFor(floorId) ?: return@Canvas
@@ -221,13 +251,20 @@ fun PlanCanvas(
             }
         }
         if (render == null && rooms.isNotEmpty()) {
-            Text(
-                "This floor couldn't be drawn. Its data may be damaged; try undoing the last change.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.error,
-                textAlign = TextAlign.Center,
+            // On its own themed card: the plan paper is always white, so theme text colours need a backing.
+            Surface(
+                shape = MaterialTheme.shapes.large,
+                color = MaterialTheme.colorScheme.errorContainer,
+                contentColor = MaterialTheme.colorScheme.onErrorContainer,
                 modifier = Modifier.align(Alignment.Center).padding(32.dp),
-            )
+            ) {
+                Text(
+                    "This floor couldn't be drawn. Its data may be damaged; try undoing the last change.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(16.dp),
+                )
+            }
         }
     }
 }
@@ -241,6 +278,27 @@ private fun renderSafely(rooms: List<Room>, settings: PlanSettings, options: Ren
     null
 }
 
+/**
+ * Fit to [bounds], then once more to the bounds the plan has when rendered for that zoom: overall dimension
+ * lines are sized in points (RenderOptions.pointsPerMeter), so their extent in meters depends on the zoom.
+ */
+private fun settledFit(
+    rooms: List<Room>,
+    settings: PlanSettings,
+    options: RenderOptions,
+    bounds: Bounds,
+    size: IntSize,
+    marginPx: Double,
+    pxPerPt: Double,
+): ViewTransform {
+    val first = fitView(bounds, size, marginPx, pxPerPt)
+    if (rooms.isEmpty()) return first
+    val ppm = quantizedPointsPerMeter(first) ?: return first
+    if (ppm == options.pointsPerMeter) return first
+    val again = renderSafely(rooms, settings, options.copy(pointsPerMeter = ppm)) ?: return first
+    return if (again.bounds.isEmpty) first else fitView(again.bounds, size, marginPx, pxPerPt)
+}
+
 private fun fitView(bounds: Bounds, size: IntSize, marginPx: Double, pxPerPt: Double): ViewTransform =
     ViewTransform.fit(bounds, size.width.toDouble(), size.height.toDouble(), marginPx, pxPerPt)
 
@@ -251,10 +309,16 @@ private fun animatorScale(context: android.content.Context): Float = try {
     1f
 }
 
-private fun canvasDescription(rooms: List<Room>, selection: Selection?): String {
-    val count = if (rooms.size == 1) "1 room" else "${rooms.size} rooms"
-    val selected = selection?.let { s -> rooms.firstOrNull { it.id == s.roomId }?.name }
-    return if (selected != null) "Floor plan, $count, $selected selected" else "Floor plan, $count"
+/**
+ * Points per plan meter of [view] (what RenderOptions.pointsPerMeter expects), rounded to quarter steps on a
+ * log2 scale (about 19 % apart) so the plan is only re-rendered when the zoom changes noticeably. Null for an
+ * unusable view.
+ */
+internal fun quantizedPointsPerMeter(view: ViewTransform): Double? {
+    val ppm = view.pxPerMeter / view.pxPerPt
+    if (!ppm.isFinite() || ppm <= 0.0) return null
+    val step = Math.round(ln(ppm) / ln(2.0) * 4.0) / 4.0
+    return 2.0.pow(step)
 }
 
 /**
@@ -265,7 +329,8 @@ private fun canvasDescription(rooms: List<Room>, selection: Selection?): String 
 internal fun guideOps(guides: DragGuides, view: ViewTransform, overshootPx: Double, rightAnglePx: Double): List<DrawOp> {
     if (!(view.pxPerMeter > 0) || !view.pxPerMeter.isFinite()) return emptyList()
     val ops = ArrayList<DrawOp>()
-    guides.snapOutline?.takeIf { it.size >= 3 && it.all { p -> p.isFinite() } }?.let { outline ->
+    for (outline in guides.snapOutlines) {
+        if (outline.size < 3 || !outline.all { p -> p.isFinite() }) continue
         ops += DrawOp.FillPolygon(outline, GHOST_FILL)
         ops += DrawOp.Polyline(outline, closed = true, widthPt = GHOST_PT, color = PlanColors.SELECTION, dashPt = GHOST_DASH_PT)
     }

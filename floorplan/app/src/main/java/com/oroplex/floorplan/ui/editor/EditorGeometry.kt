@@ -5,14 +5,16 @@ import com.oroplex.floorplan.core.geometry.Line2
 import com.oroplex.floorplan.core.geometry.Polygons
 import com.oroplex.floorplan.core.geometry.Segment2
 import com.oroplex.floorplan.core.geometry.Vec2
+import com.oroplex.floorplan.core.model.CaptureMethod
 import com.oroplex.floorplan.core.model.Floor
+import com.oroplex.floorplan.core.model.HandSetWall
 import com.oroplex.floorplan.core.model.Room
-import com.oroplex.floorplan.core.model.RoomType
 import com.oroplex.floorplan.core.render.DrawList
 import com.oroplex.floorplan.core.render.DrawOp
 import com.oroplex.floorplan.core.render.TextAlign
 import com.oroplex.floorplan.core.render.ViewTransform
 import com.oroplex.floorplan.core.solve.RoomSolver
+import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
@@ -147,18 +149,28 @@ object EditorHitTest {
     }
 }
 
-/** Placement and naming helpers for rooms created in the editor. */
+/** Placement of rooms created in the editor (names come from [com.oroplex.floorplan.core.model.RoomNames]). */
 object RoomPlacement {
     /** Gap between the existing floor and a newly drawn room, meters (outer wall face to outer wall face). */
     const val NEW_ROOM_GAP = 0.5
 
     /**
-     * Corners (CCW) of a [width] (x) by [length] (y) rectangle placed to the right of everything on the
-     * floor: its left interior face sits [NEW_ROOM_GAP] plus both wall bands to the right of the floor's
-     * rightmost interior face, top-aligned with the floor. An empty floor gets the rectangle at the origin.
+     * Corners (CCW) of a [width] by [length] rectangle placed to the right of everything on the floor, built in
+     * the floor's own axis frame: [axisAngle] (radians) is the direction of the floor's walls, so on a plan that
+     * is turned (ARCore's heading is arbitrary) the new room comes out parallel to its neighbours and Snap can
+     * line it up. In that frame [width] runs along the walls' x direction and [length] across; the rectangle's
+     * left interior face sits [NEW_ROOM_GAP] plus both wall bands right of the floor's rightmost interior face,
+     * top-aligned with the floor. An empty floor gets the rectangle at the origin.
      */
-    fun rectangleRightOf(existing: List<Room>, width: Double, length: Double, wallThickness: Double): List<Vec2> {
-        val bounds = Bounds.of(existing.flatMap { r -> r.corners.filter { it.isFinite() } })
+    fun rectangleRightOf(
+        existing: List<Room>,
+        width: Double,
+        length: Double,
+        wallThickness: Double,
+        axisAngle: Double = 0.0,
+    ): List<Vec2> {
+        val axis = if (axisAngle.isFinite()) axisAngle else 0.0
+        val bounds = Bounds.of(existing.flatMap { r -> r.corners.filter { it.isFinite() }.map { it.rotated(-axis) } })
         val x0: Double
         val y0: Double
         if (bounds.isEmpty) {
@@ -169,25 +181,17 @@ object RoomPlacement {
             y0 = bounds.maxY - length
         }
         return listOf(Vec2(x0, y0), Vec2(x0 + width, y0), Vec2(x0 + width, y0 + length), Vec2(x0, y0 + length))
+            .map { it.rotated(axis) }
     }
 
-    /** "Bedroom", or "Bedroom 2", "Bedroom 3"... when that name is taken on the floor. */
-    fun uniqueName(type: RoomType, existing: List<Room>): String {
-        val base = type.displayName
-        val taken = existing.map { it.name.trim().lowercase() }.toSet()
-        if (base.lowercase() !in taken) return base
-        var n = 2
-        while ("$base $n".lowercase() in taken) n++
-        return "$base $n"
-    }
-
-    /** True when [name] is a default name for [type] ("Bedroom" or "Bedroom 3"). */
-    fun isDefaultName(name: String, type: RoomType): Boolean {
-        val base = type.displayName
-        val trimmed = name.trim()
-        if (trimmed.equals(base, ignoreCase = true)) return true
-        if (!trimmed.startsWith("$base ", ignoreCase = true)) return false
-        return trimmed.substring(base.length + 1).toIntOrNull() != null
+    /**
+     * Direction (radians, in (-PI/4, PI/4]) a room drawn on a floor holding [rooms] should follow: the floor's
+     * robust shared wall direction ([RoomSolver.sharedAxis]) folded to the turn nearest the page axes, so the
+     * typed width stays "left to right". 0 for an empty floor or one without usable walls.
+     */
+    fun drawingAxis(rooms: List<Room>): Double {
+        val axis = ScanGroups.axisOf(rooms) ?: return 0.0
+        return if (axis > PI / 4) axis - PI / 2 else axis
     }
 }
 
@@ -425,6 +429,8 @@ object SnapNeighbour {
         wallThickness: Double,
         gapTolerance: Double = 0.03,
         angleToleranceDeg: Double = 2.0,
+        /** Rooms never named as the neighbour (e.g. the other rooms of a scan that was snapped as one block). */
+        exclude: Set<String> = emptySet(),
     ): Room? {
         val room = floor.rooms.firstOrNull { it.id == roomId } ?: return null
         if (!wallThickness.isFinite()) return null
@@ -433,7 +439,7 @@ object SnapNeighbour {
         var bestOverlap = 1e-3
         val ownEdges = usableEdges(room)
         for (other in floor.rooms) {
-            if (other.id == roomId) continue
+            if (other.id == roomId || other.id in exclude) continue
             for (e in ownEdges) {
                 val outward = -e.direction.perp()
                 for (f in usableEdges(other)) {
@@ -499,15 +505,46 @@ object ViewAnimation {
 }
 
 /**
- * Squaring axis hint for re-solving [roomId] (radians, mod 90 degrees): the length-weighted dominant wall
- * direction of the other rooms on [floor], so a re-solved room comes out parallel to its neighbours. Null
- * when there are no other usable rooms.
+ * Squaring axis hint for re-solving [roomId] (radians, mod 90 degrees), so a re-solved room comes out parallel to
+ * the rooms it was scanned with. Only rooms of the SAME scan session share its coordinate frame (rooms of other
+ * sessions or drawn rooms may sit at any angle until they are lined up), so the hint is the robust shared wall
+ * direction ([RoomSolver.sharedAxis], which angled walls do not pull) of the other rooms with the same non-null
+ * [Room.sessionId]. Null for drawn rooms, rooms without a session and rooms without session peers on [floor].
  */
 fun floorAxisHint(floor: Floor, roomId: String): Double? {
-    val edges = floor.rooms
-        .filter { it.id != roomId && it.corners.size >= 3 && it.corners.all { c -> c.isFinite() } }
-        .flatMap { Polygons.edges(it.corners) }
-        .filter { it.length > 0.05 }
-    if (edges.isEmpty()) return null
-    return RoomSolver.dominantAngle(edges.map { (it.b - it.a).angle() }, edges.map { it.length })
+    val room = floor.rooms.firstOrNull { it.id == roomId } ?: return null
+    if (room.captureMethod == CaptureMethod.MANUAL) return null
+    val session = room.sessionId ?: return null
+    val peers = floor.rooms.filter { it.id != roomId && it.sessionId == session && it.captureMethod != CaptureMethod.MANUAL }
+    if (peers.isEmpty()) return null
+    return ScanGroups.axisOf(peers)
+}
+
+/** A hand-set wall matches an edge within this angle... */
+private val HAND_SET_COS = cos(Math.toRadians(15.0))
+
+/** ...when the edge's midpoint is within this distance (m) of the hand-set segment's line and within its extent. */
+private const val HAND_SET_DISTANCE = 0.15
+
+/**
+ * The [HandSetWall] edge [wallIndex] of [room] matches (the user typed its length or dragged it): parallel within
+ * 15 degrees, with the edge's midpoint within 15 cm of the hand-set segment's line and within its extent, the
+ * same test RoomQuality uses. The most recent match wins. Null when the wall was not set by hand.
+ */
+fun handSetWall(room: Room, wallIndex: Int): HandSetWall? {
+    val c = room.corners
+    if (c.size < 3 || wallIndex !in c.indices) return null
+    val edge = Segment2(c[wallIndex], c[(wallIndex + 1) % c.size])
+    if (!edge.a.isFinite() || !edge.b.isFinite() || edge.length < 1e-6) return null
+    val mid = edge.midpoint
+    val dir = edge.direction
+    return room.handSetWalls.lastOrNull { h ->
+        val s = h.segment
+        if (!s.a.isFinite() || !s.b.isFinite() || s.length < 1e-6) return@lastOrNull false
+        val sd = s.direction
+        if (abs(dir dot sd) < HAND_SET_COS) return@lastOrNull false
+        val rel = mid - s.a
+        val t = rel dot sd
+        abs(rel cross sd) <= HAND_SET_DISTANCE && t >= -1e-6 && t <= s.length + 1e-6
+    }
 }

@@ -4,7 +4,12 @@ import com.oroplex.floorplan.core.geometry.Bounds
 import com.oroplex.floorplan.core.geometry.Polygons
 import com.oroplex.floorplan.core.geometry.Segment2
 import com.oroplex.floorplan.core.geometry.Vec2
+import com.oroplex.floorplan.core.model.Calibration
+import com.oroplex.floorplan.core.model.CaptureMethod
 import com.oroplex.floorplan.core.model.Floor
+import com.oroplex.floorplan.core.model.HandSetWall
+import com.oroplex.floorplan.core.model.Opening
+import com.oroplex.floorplan.core.model.OpeningType
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.Room
 import com.oroplex.floorplan.core.model.UnitSystem
@@ -213,15 +218,99 @@ class EditorGuidesTest {
 
     // ---- Small helpers ----
 
+    private fun scanned(room: Room, session: String?) = room.copy(captureMethod = CaptureMethod.WALLS, sessionId = session)
+
+    private fun Room.rotated(angle: Double) = copy(corners = corners.map { it.rotated(angle) })
+
     @Test
-    fun axisHintFollowsTheOtherRoomsOnTheFloor() {
+    fun axisHintComesOnlyFromRoomsOfTheSameScanSession() {
         val angle = Math.toRadians(10.0)
-        val a = rect("a", 0.0, 0.0, 4.0, 3.0).let { r -> r.copy(corners = r.corners.map { it.rotated(angle) }) }
-        val b = rect("b", 5.0, 0.0, 3.0, 3.0).let { r -> r.copy(corners = r.corners.map { it.rotated(angle) }) }
-        val c = rect("c", 0.0, 5.0, 2.0, 2.0)
-        val floor = Floor("f", "F", listOf(a, b, c))
-        assertEquals(angle, floorAxisHint(floor, "c") ?: Double.NaN, 1e-9)
+        val a = scanned(rect("a", 0.0, 0.0, 4.0, 3.0).rotated(angle), "s1")
+        val b = scanned(rect("b", 5.0, 0.0, 3.0, 3.0).rotated(angle), "s1")
+        val c = scanned(rect("c", 0.0, 5.0, 2.0, 2.0), "s1")
+        // A later, not yet lined-up scan at 22° and a drawn room at 30° must not pull the hint.
+        val later = scanned(rect("d", 10.0, 0.0, 4.0, 3.0).rotated(Math.toRadians(22.0)), "s2")
+        val drawn = rect("e", -6.0, 0.0, 5.0, 5.0).rotated(Math.toRadians(30.0))
+        val floor = Floor("f", "F", listOf(a, b, c, later, drawn))
+        assertEquals(angle, floorAxisHint(floor, "c") ?: Double.NaN, 1e-6)
+        assertNull("no session peers", floorAxisHint(floor, "d"))
+        assertNull("drawn rooms get no hint", floorAxisHint(floor, "e"))
+        assertNull("rooms without a session get no hint", floorAxisHint(floor.copy(rooms = listOf(a, b, c.copy(sessionId = null))), "c"))
         assertNull(floorAxisHint(Floor("f", "F", listOf(c)), "c"))
+        assertNull(floorAxisHint(floor, "missing"))
+    }
+
+    @Test
+    fun axisHintIgnoresAnAngledWallOfAPeer() {
+        // Session room 1 is 6 x 5 m with a chamfered 2.3 m wall at about 30°: the plain 4θ mean is pulled ~1.6°.
+        val chamfered = scanned(
+            Room("a", "A", corners = listOf(Vec2(0.0, 0.0), Vec2(6.0, 0.0), Vec2(6.0, 3.845), Vec2(4.0, 5.0), Vec2(0.0, 5.0))),
+            "s1",
+        )
+        val next = scanned(rect("b", 7.0, 0.0, 4.0, 3.5), "s1")
+        val hint = floorAxisHint(Floor("f", "F", listOf(chamfered, next)), "b") ?: Double.NaN
+        assertEquals(0.0, Math.toDegrees(minOf(hint, Math.PI / 2 - hint)), 0.75)
+    }
+
+    @Test
+    fun handSetWallsMatchTheirEdgeOnly() {
+        val room = rect("a", 0.0, 0.0, 4.0, 3.0).copy(
+            handSetWalls = listOf(HandSetWall(Segment2(Vec2(0.0, 0.0), Vec2(4.0, 0.0)), typedLength = 4.0)),
+        )
+        assertEquals(4.0, handSetWall(room, 0)?.typedLength ?: Double.NaN, 0.0)
+        assertNull("the opposite wall is parallel but far away", handSetWall(room, 2))
+        assertNull("a perpendicular wall never matches", handSetWall(room, 1))
+        // Still recognised after a small nudge (within 15 cm), not after a big move.
+        val nudged = room.copy(corners = room.corners.map { if (it.y == 0.0) it + Vec2(0.0, 0.1) else it })
+        assertNotNull(handSetWall(nudged, 0))
+        val moved = room.copy(corners = room.corners.map { if (it.y == 0.0) it + Vec2(0.0, -0.4) else it })
+        assertNull(handSetWall(moved, 0))
+        assertNull(handSetWall(room, 7))
+        assertNull(handSetWall(rect("b", 0.0, 0.0, 4.0, 3.0), 0))
+    }
+
+    @Test
+    fun wallNotesFollowWhatCalibrationCovers() {
+        val calibration = Calibration(1.02, "a", 0, 4.0, 4.08, 0L)
+        assertEquals("Drawn room — sizes are as typed.", wallNote(drawn = true, calibration = calibration))
+        assertEquals("Drawn room — sizes are as typed.", wallNote(drawn = true, calibration = null))
+        assertEquals("Floor calibrated ×1.0200 from a tape measurement.", wallNote(drawn = false, calibration = calibration))
+        assertNull(wallNote(drawn = false, calibration = null))
+    }
+
+    @Test
+    fun calibrationTextCountsScannedAndDrawnRooms() {
+        val text = calibrationExplanation("Kitchen", 1, scannedRooms = 5, drawnRooms = 2)
+        assertTrue(text.startsWith("Measure wall 2 of Kitchen"))
+        assertTrue(text.contains("The 5 scanned rooms on this floor are scaled"))
+        assertTrue(text.contains("The 2 drawn rooms keep their typed sizes and move with the plan."))
+        assertTrue(text.endsWith("Lengths, ceilings and door sizes you typed are kept."))
+        val single = calibrationExplanation("Kitchen", 0, scannedRooms = 1, drawnRooms = 0)
+        assertTrue(single.contains("The scanned room on this floor is scaled"))
+        assertFalse(single.contains("drawn"))
+        assertTrue(calibrationExplanation("K", 0, 3, 1).contains("The drawn room keeps its typed size"))
+    }
+
+    @Test
+    fun roomFiguresShowPerimeterWallAreaAndVolume() {
+        val metric = PlanSettings(unitSystem = UnitSystem.METRIC)
+        val room = rect("a", 0.0, 0.0, 4.0, 3.0)
+        val none = roomFigures(room, safeStats(room), metric)
+        assertEquals("14.00 m", none.perimeter)
+        assertEquals("—", none.wallArea)
+        assertEquals("—", none.volume)
+        val withCeiling = room.copy(
+            ceilingHeight = 2.5,
+            openings = listOf(Opening("d", OpeningType.DOOR, 0, 1.0, 1.0, 2.0)),
+        )
+        val measured = roomFigures(withCeiling, safeStats(withCeiling), metric)
+        assertEquals("33.0 m²", measured.wallArea) // 14 x 2.5 - 1 x 2
+        assertEquals("30.0 m³", measured.volume)
+        val estimated = withCeiling.copy(ceilingEstimated = true)
+        val est = roomFigures(estimated, safeStats(estimated), metric)
+        assertEquals("33.0 m² (est.)", est.wallArea)
+        assertEquals("30.0 m³ (est.)", est.volume)
+        assertEquals(RoomFigures("—", "—", "—"), roomFigures(room, null, metric))
     }
 
     @Test
@@ -249,12 +338,12 @@ class EditorGuidesTest {
         val guides = DragGuides(
             lines = listOf(Segment2(Vec2(0.0, 0.0), Vec2(1.0, 0.0))),
             rightAngles = listOf(RightAngleMark(Vec2(1.0, 0.0), Vec2(-1.0, 0.0), Vec2(0.0, 1.0))),
-            snapOutline = rect("a", 0.0, 0.0, 1.0, 1.0).corners,
+            snapOutlines = listOf(rect("a", 0.0, 0.0, 1.0, 1.0).corners, rect("b", 2.0, 0.0, 1.0, 1.0).corners),
         )
         val ops = guideOps(guides, view, overshootPx = 20.0, rightAnglePx = 10.0)
-        assertEquals(1, ops.count { it is DrawOp.FillPolygon })
+        assertEquals("one ghost per moved room", 2, ops.count { it is DrawOp.FillPolygon })
         val polylines = ops.filterIsInstance<DrawOp.Polyline>()
-        assertEquals(3, polylines.size)
+        assertEquals(4, polylines.size)
         // The guide line overshoots both ends by 20 px = 0.2 m.
         val guide = polylines.first { !it.closed && it.points.size == 2 }
         assertNear(Vec2(-0.2, 0.0), guide.points[0])

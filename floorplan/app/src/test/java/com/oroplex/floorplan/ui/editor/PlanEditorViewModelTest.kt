@@ -77,8 +77,14 @@ class PlanEditorViewModelTest {
         var checkCalls = 0
         var qualityFn: (Room) -> RoomQualityReport = { RoomQualityReport(QualityLevel.GOOD, 1.0, emptyList()) }
 
-        override fun snapRoom(floor: Floor, roomId: String, wallThickness: Double, maxDistance: Double, maxAngleDeg: Double) =
-            snap(floor, roomId, wallThickness, maxDistance, maxAngleDeg)
+        override fun snapGroup(
+            floor: Floor,
+            roomId: String,
+            groupIds: Set<String>,
+            wallThickness: Double,
+            maxDistance: Double,
+            maxAngleDeg: Double,
+        ) = snap(floor, roomId, wallThickness, maxDistance, maxAngleDeg)
         override fun straighten(floor: Floor) = straightenFn(floor)
         override fun rotate(floor: Floor, angle: Double): Floor {
             rotations += angle
@@ -89,17 +95,24 @@ class PlanEditorViewModelTest {
             return checksFn(floor, settings)
         }
         override fun overlaps(floor: Floor) = overlapsFn(floor)
-        override fun quality(room: Room) = qualityFn(room)
+        override fun quality(room: Room, unitSystem: UnitSystem) = qualityFn(room)
     }
 
     /** Tools that fail on every call, like a core bug on unexpected data would. */
     private class BrokenTools : PlanTools {
-        override fun snapRoom(floor: Floor, roomId: String, wallThickness: Double, maxDistance: Double, maxAngleDeg: Double): Floor? = error("boom")
+        override fun snapGroup(
+            floor: Floor,
+            roomId: String,
+            groupIds: Set<String>,
+            wallThickness: Double,
+            maxDistance: Double,
+            maxAngleDeg: Double,
+        ): Floor? = error("boom")
         override fun straighten(floor: Floor): Floor = error("boom")
         override fun rotate(floor: Floor, angle: Double): Floor = error("boom")
         override fun checks(floor: Floor, settings: PlanSettings): List<FloorIssue> = error("boom")
         override fun overlaps(floor: Floor): List<Pair<String, String>> = error("boom")
-        override fun quality(room: Room): RoomQualityReport = error("boom")
+        override fun quality(room: Room, unitSystem: UnitSystem): RoomQualityReport = error("boom")
     }
 
     private fun rect(id: String, x: Double, y: Double, w: Double, h: Double, name: String = id) = Room(
@@ -394,8 +407,8 @@ class PlanEditorViewModelTest {
 
         vm.updateMove(Vec2(-0.8, 0.0), snapDistance = 0.3)
         val guides = vm.state.value.dragGuides
-        assertNotNull(guides?.snapOutline)
-        assertEquals(4.0 + thickness, guides!!.snapOutline!!.minOf { it.x }, 1e-9)
+        assertEquals(1, guides?.snapOutlines?.size)
+        assertEquals(4.0 + thickness, guides!!.snapOutlines.single().minOf { it.x }, 1e-9)
         assertEquals("Hallway", guides.snapTargetName)
         assertEquals(4.2, vm.state.value.preview!!.corners.minOf { it.x }, 1e-9)
 
@@ -657,6 +670,7 @@ class PlanEditorViewModelTest {
         vm.setCeilingHeight("a", 2.7)
         assertEquals(2.7, vm.room("a").ceilingHeight ?: 0.0, 0.0)
         assertFalse(vm.room("a").ceilingEstimated)
+        assertTrue("a typed ceiling is kept under tape calibration", vm.room("a").ceilingTyped)
 
         // Confirming the default as-is also makes it the user's own value.
         vm.undo()
@@ -665,6 +679,7 @@ class PlanEditorViewModelTest {
 
         vm.setCeilingHeight("a", null)
         assertNull(vm.room("a").ceilingHeight)
+        assertFalse(vm.room("a").ceilingTyped)
         vm.setCeilingHeight("a", Double.NaN)
         assertNull(vm.room("a").ceilingHeight)
     }
@@ -679,6 +694,7 @@ class PlanEditorViewModelTest {
             ),
         )
         val door = vm.addOpening("a", 0, OpeningType.DOOR)!!
+        assertTrue("editor openings keep their width under calibration", door.typed)
         assertEquals(0.9, door.width, 1e-12)
         assertEquals((4.0 - 0.9) / 2, door.offset, 1e-12)
         assertEquals(settings.defaultDoorHeight, door.height, 0.0)

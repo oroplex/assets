@@ -16,11 +16,15 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.Undo
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.FactCheck
+import androidx.compose.material.icons.automirrored.outlined.List
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material.icons.filled.IosShare
@@ -61,6 +65,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,7 +77,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.oroplex.floorplan.core.measure.AreaSummary
 import com.oroplex.floorplan.core.measure.Measurements
+import com.oroplex.floorplan.core.model.CaptureMethod
 import com.oroplex.floorplan.core.model.Floor
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.data.appContainer
@@ -91,8 +98,9 @@ fun PlanEditorScreen(
     /** Open the 3D dollhouse view of a floor (route view3d/{projectId}/{floorId}). */
     onOpen3d: (projectId: String, floorId: String) -> Unit = { _, _ -> },
     /**
-     * A room to select and zoom to (e.g. tapped in the export pre-flight list); switches floors as needed.
-     * Call [onFocusRoomConsumed] once handled so the request is not repeated. Round-3 contract: not used yet.
+     * A room to select and zoom to (e.g. tapped in the export pre-flight list); switches floors as needed (a
+     * floor never shown before fits first, then focuses the room). [onFocusRoomConsumed] is called once the
+     * request was handled, so it is not repeated.
      */
     focusRoomId: String? = null,
     onFocusRoomConsumed: () -> Unit = {},
@@ -106,6 +114,7 @@ fun PlanEditorScreen(
     val snackbar = remember { SnackbarHostState() }
     var dialog by remember { mutableStateOf<EditorDialog?>(null) }
     var showFloorCheck by remember { mutableStateOf(false) }
+    var showRooms by remember { mutableStateOf(false) }
     // The overlap set the user hid the banner for; it comes back when the overlaps change.
     var dismissedOverlaps by remember { mutableStateOf<List<Pair<String, String>>?>(null) }
 
@@ -126,6 +135,16 @@ fun PlanEditorScreen(
         }
     }
     BackHandler(enabled = state.selection != null) { viewModel.clearSelection() }
+
+    // A room another screen asked to show: handled once the project is loaded, then consumed.
+    val consumeFocus by rememberUpdatedState(onFocusRoomConsumed)
+    val ready = state.status != EditorStatus.LOADING
+    LaunchedEffect(focusRoomId, ready) {
+        val id = focusRoomId ?: return@LaunchedEffect
+        if (!ready) return@LaunchedEffect
+        viewModel.showRequestedRoom(id)
+        consumeFocus()
+    }
 
     val project = state.project
     val floor = state.floor
@@ -188,6 +207,8 @@ fun PlanEditorScreen(
                             onSelect = viewModel::selectFloor,
                             onAdd = { dialog = EditorDialog.AddFloor },
                             onCheck = { showFloorCheck = true },
+                            onRooms = { showRooms = true },
+                            onMove = viewModel::moveFloor,
                             onStraighten = viewModel::straightenFloor,
                             onRotate = { viewModel.rotateFloor(clockwise = true) },
                             onRename = { id -> dialog = EditorDialog.RenameFloor(id) },
@@ -207,7 +228,7 @@ fun PlanEditorScreen(
                                     modifier = Modifier.fillMaxSize(),
                                 )
                                 if (floor.rooms.isEmpty()) {
-                                    EmptyFloor(Modifier.align(Alignment.Center))
+                                    EmptyFloor(Modifier.align(Alignment.Center).padding(24.dp))
                                 }
                                 Column(
                                     Modifier.align(Alignment.TopCenter).fillMaxWidth().padding(12.dp),
@@ -215,14 +236,14 @@ fun PlanEditorScreen(
                                 ) {
                                     val overlaps = state.insights.overlaps
                                     AnimatedVisibility(
-                                        visible = overlaps.isNotEmpty() && overlaps != dismissedOverlaps && state.preview == null,
+                                        visible = overlaps.isNotEmpty() && overlaps != dismissedOverlaps && state.previewRooms.isEmpty(),
                                         enter = fadeIn() + slideInVertically(),
                                         exit = fadeOut() + slideOutVertically(),
                                     ) {
                                         OverlapBanner(
                                             floor = floor,
                                             overlaps = overlaps,
-                                            onShow = viewModel::focusRoom,
+                                            onShow = { viewModel.focusRoom(it) },
                                             onDetails = { showFloorCheck = true },
                                             onDismiss = { dismissedOverlaps = overlaps },
                                         )
@@ -253,8 +274,24 @@ fun PlanEditorScreen(
             FloorCheckSheet(
                 floor = checked,
                 issues = state.insights.issues,
-                onSelectRoom = viewModel::focusRoom,
+                onSelectRoom = { viewModel.focusRoom(it) },
                 onDismiss = { showFloorCheck = false },
+                onAction = viewModel::runIssueAction,
+            )
+        }
+    }
+
+    if (showRooms) {
+        val shown = floor
+        if (shown == null) {
+            LaunchedEffect(Unit) { showRooms = false }
+        } else {
+            RoomsSheet(
+                floor = shown,
+                settings = settings,
+                selectedRoomId = state.selection?.roomId,
+                onSelectRoom = { viewModel.focusRoom(it) },
+                onDismiss = { showRooms = false },
             )
         }
     }
@@ -337,6 +374,8 @@ private fun FloorTabs(
     onSelect: (String) -> Unit,
     onAdd: () -> Unit,
     onCheck: () -> Unit,
+    onRooms: () -> Unit,
+    onMove: (floorId: String, delta: Int) -> Unit,
     onStraighten: () -> Unit,
     onRotate: () -> Unit,
     onRename: (String) -> Unit,
@@ -385,6 +424,10 @@ private fun FloorTabs(
                         Icon(Icons.Outlined.Edit, contentDescription = "Floor options")
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        MenuItem("Rooms", Icons.AutoMirrored.Outlined.List, enabled = hasRooms) {
+                            menuOpen = false
+                            onRooms()
+                        }
                         MenuItem("Floor check", Icons.AutoMirrored.Outlined.FactCheck) {
                             menuOpen = false
                             onCheck()
@@ -400,6 +443,16 @@ private fun FloorTabs(
                         MenuItem("Rename floor", Icons.Outlined.DriveFileRenameOutline) {
                             menuOpen = false
                             selectedFloorId?.let(onRename)
+                        }
+                        if (floors.size > 1) {
+                            MenuItem("Move left", Icons.AutoMirrored.Outlined.ArrowBack, enabled = selectedIndex > 0) {
+                                menuOpen = false
+                                selectedFloorId?.let { onMove(it, -1) }
+                            }
+                            MenuItem("Move right", Icons.AutoMirrored.Outlined.ArrowForward, enabled = selectedIndex < floors.lastIndex) {
+                                menuOpen = false
+                                selectedFloorId?.let { onMove(it, 1) }
+                            }
                         }
                         HorizontalDivider()
                         MenuItem("Delete floor", Icons.Outlined.Delete, enabled = floors.size > 1, destructive = true) {
@@ -442,13 +495,17 @@ private fun SelectionPanel(state: EditorUiState, viewModel: PlanEditorViewModel,
             is Selection.Room -> {
                 // Graded from the committed room, so a drag does not re-grade it on every frame.
                 val committed = state.floor?.rooms?.firstOrNull { it.id == room.id } ?: room
-                val quality = remember(committed) { viewModel.quality(committed) }
+                val quality = remember(committed, settings.unitSystem) { viewModel.quality(committed) }
+                val scanSize = state.scanGroupIds.size
                 RoomPanel(
                     room = room,
                     settings = settings,
                     moveMode = state.moveMode,
                     quality = quality,
                     snapTarget = state.dragGuides?.snapTargetName,
+                    wholeScan = state.wholeScan,
+                    scanSize = scanSize,
+                    canSquare = (state.floor?.rooms?.size ?: 0) > (if (state.wholeScan) scanSize else 1),
                     actions = RoomPanelActions(
                         onEditDetails = { openDialog(EditorDialog.RoomDetails(room.id)) },
                         onEditCeiling = { openDialog(EditorDialog.CeilingHeight(room.id)) },
@@ -459,6 +516,8 @@ private fun SelectionPanel(state: EditorUiState, viewModel: PlanEditorViewModel,
                         onResolve = { openDialog(EditorDialog.Resolve(room.id)) },
                         onDelete = { openDialog(EditorDialog.DeleteRoom(room.id)) },
                         onClose = viewModel::clearSelection,
+                        onWholeScan = viewModel::setWholeScan,
+                        onSquare = { viewModel.squareToFloor(room.id) },
                     ),
                 )
             }
@@ -509,7 +568,12 @@ private fun EditorDialogHost(
     when (dialog) {
         EditorDialog.ProjectSettings -> if (project != null) {
             shown = true
-            ProjectSettingsDialog(settings, onConfirm = viewModel::updateSettings, onDismiss = onDismiss)
+            ProjectSettingsDialog(
+                settings = settings,
+                estimatedCeilingRooms = estimatedCeilingRooms(project, settings.defaultCeilingHeight),
+                onConfirm = { newSettings, apply -> viewModel.updateSettings(newSettings, applyCeilingToEstimated = apply) },
+                onDismiss = onDismiss,
+            )
         }
         EditorDialog.RenameProject -> if (project != null) {
             shown = true
@@ -562,7 +626,13 @@ private fun EditorDialogHost(
         }
         is EditorDialog.RoomDetails -> room(dialog.roomId)?.let { room ->
             shown = true
-            RoomDetailsDialog(room, onConfirm = { name, type -> viewModel.renameRoom(room.id, name, type) }, onDismiss = onDismiss)
+            val floorRooms = project?.floors?.firstOrNull { f -> f.rooms.any { it.id == room.id } }?.rooms.orEmpty()
+            RoomDetailsDialog(
+                room = room,
+                floorRooms = floorRooms,
+                onConfirm = { name, type, category -> viewModel.updateRoomDetails(room.id, name, type, category) },
+                onDismiss = onDismiss,
+            )
         }
         is EditorDialog.CeilingHeight -> room(dialog.roomId)?.let { room ->
             shown = true
@@ -612,7 +682,8 @@ private fun EditorDialogHost(
             CalibrateDialog(
                 room = room,
                 wallIndex = dialog.wallIndex,
-                roomCount = floor?.rooms?.size ?: 1,
+                scannedRooms = floor?.rooms?.count { it.captureMethod != CaptureMethod.MANUAL } ?: 1,
+                drawnRooms = floor?.rooms?.count { it.captureMethod == CaptureMethod.MANUAL } ?: 0,
                 settings = settings,
                 previous = floor?.calibration,
                 onApply = { viewModel.calibrate(room.id, dialog.wallIndex, it) },
@@ -623,36 +694,52 @@ private fun EditorDialogHost(
     if (!shown) LaunchedEffect(dialog) { onDismiss() }
 }
 
+/**
+ * Guidance on an empty floor. It sits on its own themed card: the plan paper behind it is always white, so
+ * theme text colours (light in dark mode) would be unreadable directly on it.
+ */
 @Composable
 private fun EmptyFloor(modifier: Modifier = Modifier) {
-    Column(
-        modifier = modifier.padding(horizontal = 40.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+    Surface(
+        shape = MaterialTheme.shapes.extraLarge,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        shadowElevation = 2.dp,
+        modifier = modifier.widthIn(max = 480.dp),
     ) {
-        Surface(shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.primaryContainer, modifier = Modifier.size(80.dp)) {
-            Box(contentAlignment = Alignment.Center) {
-                Icon(
-                    Icons.Outlined.SquareFoot,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.size(40.dp),
-                )
+        Column(
+            modifier = Modifier.padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Surface(
+                shape = MaterialTheme.shapes.extraLarge,
+                color = MaterialTheme.colorScheme.primaryContainer,
+                modifier = Modifier.size(80.dp),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        Icons.Outlined.SquareFoot,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.size(40.dp),
+                    )
+                }
             }
+            Text(
+                "No rooms on this floor yet",
+                style = MaterialTheme.typography.titleMedium,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            Text(
+                "Tap Scan room to measure a room with your camera, or Draw room to type in its size. " +
+                    "Scan the whole floor in one go and the rooms line up by themselves.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
         }
-        Text(
-            "No rooms on this floor yet",
-            style = MaterialTheme.typography.titleMedium,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.padding(top = 8.dp),
-        )
-        Text(
-            "Tap Scan room to measure a room with your camera, or Draw room to type in its size. " +
-                "Scan the whole floor in one go and the rooms line up by themselves.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-        )
     }
 }
 
@@ -684,16 +771,26 @@ private fun MissingProject(onBack: () -> Unit, modifier: Modifier = Modifier) {
     }
 }
 
-private fun floorSummary(floor: Floor, settings: PlanSettings): String {
+/**
+ * Top bar subtitle: "Main Floor · 5 rooms · 1,450 sq ft", or "· Living area 1,450 sq ft" when some rooms do not
+ * count as living area (garage, porch...), so the headline figure never includes them.
+ */
+internal fun floorSummary(floor: Floor, settings: PlanSettings): String {
     val rooms = floor.rooms.size
     val roomText = "$rooms ${if (rooms == 1) "room" else "rooms"}"
     if (rooms == 0) return "${floor.name} · no rooms"
-    val area = try {
-        Measurements.floorArea(floor)
+    val summary = try {
+        Measurements.areaSummary(floor.rooms)
     } catch (e: Exception) {
         return "${floor.name} · $roomText"
     }
-    return "${floor.name} · $roomText · ${settings.formatArea(area)}"
+    return "${floor.name} · $roomText · ${areaHeadline(summary, settings)}"
+}
+
+/** The headline area: the plain net total when every room is living space, else "Living area …". */
+internal fun areaHeadline(summary: AreaSummary, settings: PlanSettings): String {
+    val others = summary.nonLiving + summary.exterior + summary.excluded
+    return if (others > 1e-9) "Living area ${settings.formatArea(summary.living)}" else settings.formatArea(summary.living)
 }
 
 private fun defaultFloorName(existingFloors: Int): String = when (existingFloors) {

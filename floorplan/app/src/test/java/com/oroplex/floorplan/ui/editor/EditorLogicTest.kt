@@ -150,14 +150,37 @@ class EditorLogicTest {
     }
 
     @Test
-    fun uniqueNamesAndDefaultNameDetection() {
-        val rooms = listOf(rect("1", 0.0, 0.0, 1.0, 1.0).copy(name = "Bedroom"), rect("2", 0.0, 0.0, 1.0, 1.0).copy(name = "Bedroom 2"))
-        assertEquals("Bedroom 3", RoomPlacement.uniqueName(RoomType.BEDROOM, rooms))
-        assertEquals("Kitchen", RoomPlacement.uniqueName(RoomType.KITCHEN, rooms))
-        assertTrue(RoomPlacement.isDefaultName("Bedroom 2", RoomType.BEDROOM))
-        assertTrue(RoomPlacement.isDefaultName("bedroom", RoomType.BEDROOM))
-        assertFalse(RoomPlacement.isDefaultName("Kid's bedroom", RoomType.BEDROOM))
-        assertFalse(RoomPlacement.isDefaultName("Bedroom east", RoomType.BEDROOM))
+    fun aRectangleDrawnOnATurnedFloorFollowsItsWalls() {
+        val turn = Math.toRadians(23.0)
+        val existing = listOf(rect("a", 0.0, 0.0, 4.0, 3.0).let { r -> r.copy(corners = r.corners.map { it.rotated(turn) }) })
+        val axis = RoomPlacement.drawingAxis(existing)
+        assertEquals(turn, axis, 1e-6)
+        val corners = RoomPlacement.rectangleRightOf(existing, width = 2.0, length = 1.5, wallThickness = 0.1, axisAngle = axis)
+        assertTrue(Polygons.isCounterClockwise(corners))
+        assertEquals(3.0, Polygons.area(corners), 1e-9)
+        // Its first wall runs along the floor's walls, and it sits right of the floor in the floor's own frame.
+        assertEquals(turn, (corners[1] - corners[0]).angle(), 1e-9)
+        val local = corners.map { it.rotated(-turn) }
+        assertEquals(4.0 + 0.2 + RoomPlacement.NEW_ROOM_GAP, local.minOf { it.x }, 1e-9)
+        assertEquals(3.0, local.maxOf { it.y }, 1e-9)
+        // A floor turned by more than 45° folds to the nearest page direction (width stays "left to right").
+        val steep = listOf(rect("b", 0.0, 0.0, 4.0, 3.0).let { r -> r.copy(corners = r.corners.map { it.rotated(Math.toRadians(80.0)) }) })
+        assertEquals(Math.toRadians(-10.0), RoomPlacement.drawingAxis(steep), 1e-6)
+        assertEquals(0.0, RoomPlacement.drawingAxis(emptyList()), 0.0)
+    }
+
+    @Test
+    fun typeChangesRenameOnlyDefaultNames() {
+        val rooms = listOf(
+            rect("1", 0.0, 0.0, 1.0, 1.0).copy(name = "Bedroom", type = RoomType.BEDROOM),
+            rect("2", 0.0, 0.0, 1.0, 1.0).copy(name = "Bedroom 2", type = RoomType.BEDROOM),
+            rect("3", 0.0, 0.0, 1.0, 1.0).copy(name = "Room 3"),
+        )
+        assertEquals("Bedroom 3", nameAfterTypeChange("Room 3", RoomType.OTHER, RoomType.BEDROOM, rooms, "3"))
+        assertEquals("Office", nameAfterTypeChange("Room 3", RoomType.OTHER, RoomType.OFFICE, rooms, "3"))
+        assertEquals("Kid's room", nameAfterTypeChange(" Kid's room ", RoomType.OTHER, RoomType.BEDROOM, rooms, "3"))
+        assertEquals("Bedroom 3", nameAfterTypeChange("", RoomType.OTHER, RoomType.BEDROOM, rooms, "3"))
+        assertEquals("Room 3", nameAfterTypeChange("Room 3", RoomType.OTHER, RoomType.OTHER, rooms, "3"))
     }
 
     // ---- Corner snapping ----

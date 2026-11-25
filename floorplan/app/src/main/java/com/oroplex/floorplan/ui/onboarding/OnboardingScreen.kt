@@ -5,6 +5,7 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,7 +42,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,6 +60,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.oroplex.floorplan.core.io.SampleProjects
 import com.oroplex.floorplan.core.model.UnitSystem
+import com.oroplex.floorplan.core.model.PlanSettings
+import com.oroplex.floorplan.core.model.Room
 import com.oroplex.floorplan.core.render.DrawList
 import com.oroplex.floorplan.core.render.PlanColors
 import com.oroplex.floorplan.core.render.PlanRenderer
@@ -67,9 +70,7 @@ import com.oroplex.floorplan.core.render.ViewTransform
 import com.oroplex.floorplan.data.LocaleDefaults
 import com.oroplex.floorplan.data.appContainer
 import com.oroplex.floorplan.render.PlanPainter
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * Four-page welcome tour (see [Onboarding]): swipe or tap Next; Skip or "Get started" calls [onFinish].
@@ -273,37 +274,19 @@ private fun IconArt(icon: ImageVector) {
  */
 @Composable
 private fun SamplePlanArt() {
-    val drawList by produceState<DrawList?>(initialValue = null) {
-        value = withContext(Dispatchers.Default) {
-            try {
-                val project = SampleProjects.demo(0L)
-                val rooms = project.floors.firstOrNull()?.rooms.orEmpty()
-                if (rooms.isEmpty()) {
-                    null
-                } else {
-                    PlanRenderer.render(
-                        rooms,
-                        project.settings,
-                        RenderOptions(
-                            showRoomDimensions = false,
-                            showAreas = false,
-                            showWallLengths = false,
-                            showOverallDimensions = false,
-                            textScale = 0.8,
-                        ),
-                    )
-                }
-            } catch (e: Exception) {
-                null
-            }
+    val sample = remember {
+        try {
+            SampleProjects.demo(0L)
+        } catch (e: Exception) {
+            null
         }
     }
-    val plan = drawList
-    if (plan == null || plan.bounds.isEmpty) {
+    val rooms = sample?.floors?.firstOrNull()?.rooms.orEmpty()
+    if (sample == null || rooms.isEmpty()) {
         IconArt(Icons.Outlined.ViewInAr)
         return
     }
-    val pxPerPt = with(LocalDensity.current) { 1.dp.toPx() } * 160f / 72f
+    val pxPerPt = with(LocalDensity.current) { 1.dp.toPx() } * 160.0 / 72.0
     Surface(
         shape = MaterialTheme.shapes.large,
         color = Color(PlanColors.BACKGROUND),
@@ -312,16 +295,48 @@ private fun SamplePlanArt() {
             .fillMaxWidth()
             .height(220.dp),
     ) {
-        Canvas(
-            Modifier
-                .fillMaxSize()
-                .padding(12.dp)
-                .semantics { contentDescription = "Example floor plan" },
-        ) {
-            val view = ViewTransform.fit(plan.bounds, size.width.toDouble(), size.height.toDouble(), 4.0, pxPerPt.toDouble())
-            drawIntoCanvas { PlanPainter.draw(it.nativeCanvas, plan, view) }
+        BoxWithConstraints(Modifier.fillMaxSize().padding(12.dp), contentAlignment = Alignment.Center) {
+            val widthPx = constraints.maxWidth.toDouble()
+            val heightPx = constraints.maxHeight.toDouble()
+            val plan = remember(widthPx, heightPx, pxPerPt) {
+                samplePlan(rooms, sample.settings, widthPx, heightPx, pxPerPt)
+            }
+            if (plan == null) {
+                Icon(Icons.Outlined.ViewInAr, contentDescription = null, tint = Color(PlanColors.TEXT_SECONDARY), modifier = Modifier.size(84.dp))
+            } else {
+                Canvas(Modifier.fillMaxSize().semantics { contentDescription = "Example floor plan" }) {
+                    val view = ViewTransform.fit(plan.bounds, size.width.toDouble(), size.height.toDouble(), SAMPLE_PLAN_MARGIN_PX, pxPerPt)
+                    drawIntoCanvas { PlanPainter.draw(it.nativeCanvas, plan, view) }
+                }
+            }
         }
     }
+}
+
+private const val SAMPLE_PLAN_MARGIN_PX = 4.0
+
+/**
+ * The sample house's room names only, fitted to an illustration of [widthPx] x [heightPx]: the plan is laid
+ * out once without labels to find its scale, then rendered at that scale so only names that fit their rooms
+ * are drawn (a fixed layout piles them on top of each other at this size). Null when nothing can be drawn.
+ */
+private fun samplePlan(rooms: List<Room>, settings: PlanSettings, widthPx: Double, heightPx: Double, pxPerPt: Double): DrawList? = try {
+    val options = RenderOptions(
+        showRoomDimensions = false,
+        showAreas = false,
+        showWallLengths = false,
+        showOverallDimensions = false,
+        textScale = 0.8,
+    )
+    val outline = PlanRenderer.render(rooms, settings, options.copy(showRoomNames = false))
+    if (outline.bounds.isEmpty || widthPx <= 0.0 || heightPx <= 0.0) {
+        null
+    } else {
+        val view = ViewTransform.fit(outline.bounds, widthPx, heightPx, SAMPLE_PLAN_MARGIN_PX, pxPerPt)
+        PlanRenderer.render(rooms, settings, options.copy(pointsPerMeter = view.pxPerMeter / view.pxPerPt))
+    }
+} catch (e: Exception) {
+    null
 }
 
 @Composable

@@ -22,7 +22,9 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AddCircleOutline
 import androidx.compose.material.icons.filled.AutoFixHigh
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CropRotate
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DoorFront
 import androidx.compose.material.icons.filled.Draw
@@ -30,6 +32,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.OpenWith
 import androidx.compose.material.icons.filled.Rotate90DegreesCcw
 import androidx.compose.material.icons.filled.Rotate90DegreesCw
+import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.SquareFoot
 import androidx.compose.material.icons.filled.Straighten
 import androidx.compose.material.icons.filled.Verified
@@ -55,6 +58,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -71,6 +75,7 @@ import com.oroplex.floorplan.core.solve.QualityLevel
 import com.oroplex.floorplan.core.solve.RoomQualityReport
 import com.oroplex.floorplan.ui.common.formatArea
 import com.oroplex.floorplan.ui.common.formatLength
+import com.oroplex.floorplan.ui.common.formatVolume
 import java.util.Locale
 
 /** Bottom sheet-like surface hosting the selection panels; scrolls when its content is tall. */
@@ -104,11 +109,17 @@ class RoomPanelActions(
     val onResolve: () -> Unit,
     val onDelete: () -> Unit,
     val onClose: () -> Unit,
+    /** Switch "Whole scan" on or off (only offered when the room shares its scan with other rooms). */
+    val onWholeScan: (Boolean) -> Unit = {},
+    /** "Square to floor": turn the room (or its whole scan) to run like the rest of the floor. */
+    val onSquare: () -> Unit = {},
 )
 
 /**
  * Details and actions of the selected room. [quality] is its trust grade (null when it could not be graded);
- * [snapTarget] names the room a move in progress would snap to.
+ * [snapTarget] names the room a move in progress would snap to. [scanSize] is the number of rooms sharing the
+ * room's scan (0 or 1: no "Whole scan" choice); with [wholeScan] on, Move, the turn buttons, Square to floor and
+ * Snap act on all of them. [canSquare]: the floor has other rooms to square to.
  */
 @Composable
 fun RoomPanel(
@@ -118,6 +129,9 @@ fun RoomPanel(
     actions: RoomPanelActions,
     quality: RoomQualityReport? = null,
     snapTarget: String? = null,
+    wholeScan: Boolean = false,
+    scanSize: Int = 0,
+    canSquare: Boolean = true,
 ) {
     val stats = remember(room) { safeStats(room) }
     PanelHeader(
@@ -155,15 +169,28 @@ fun RoomPanel(
             editable = true,
         )
     }
+    val figures = roomFigures(room, stats, settings)
+    // Equal columns that wrap, so "1,234 sq ft (est.)" never runs off a narrow phone.
+    Row(
+        Modifier.fillMaxWidth().padding(bottom = 4.dp, end = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        val style = MaterialTheme.typography.titleSmall
+        StatCell("Perimeter", figures.perimeter, Modifier.weight(1f), valueStyle = style)
+        StatCell("Wall area", figures.wallArea, Modifier.weight(1f), valueStyle = style)
+        StatCell("Volume", figures.volume, Modifier.weight(1f), valueStyle = style)
+    }
     // Drawn rooms have no scan evidence to grade (the subtitle already says "drawn").
     if (quality != null && quality.level != QualityLevel.MANUAL) QualitySummary(quality, room.warnings)
+    val block = wholeScan && scanSize > 1
     if (moveMode) {
         // Two lines either way, so the panel (and with it the plan) does not change height mid-drag.
         Text(
-            if (snapTarget != null) {
-                "Let go to snap to $snapTarget.\nThe dashed outline shows where it lands."
-            } else {
-                "Drag anywhere on the plan to move this room. Let go next to another room and it snaps into place."
+            when {
+                snapTarget != null -> "Let go to snap to $snapTarget.\nThe dashed outline shows where it lands."
+                block -> "Drag anywhere to move all $scanSize rooms of this scan. Let go next to another room and they snap into place."
+                else -> "Drag anywhere on the plan to move this room. Let go next to another room and it snaps into place."
             },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.primary,
@@ -172,6 +199,32 @@ fun RoomPanel(
         )
     }
     Warnings(room.warnings)
+    if (scanSize > 1) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
+            FilterChip(
+                selected = wholeScan,
+                onClick = { actions.onWholeScan(!wholeScan) },
+                label = { Text("Whole scan ($scanSize rooms)") },
+                leadingIcon = {
+                    Icon(
+                        if (wholeScan) Icons.Filled.Check else Icons.Filled.SelectAll,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                },
+                modifier = Modifier.semantics {
+                    contentDescription = "Whole scan, $scanSize rooms, ${if (wholeScan) "on" else "off"}"
+                },
+            )
+            Text(
+                if (wholeScan) "Move, turn and snap act on every room of this scan." else "Only ${room.name} moves.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 8.dp, end = 8.dp),
+            )
+        }
+    }
+    val what = if (block) "this scan" else room.name
     ActionRow {
         FilterChip(
             selected = moveMode,
@@ -180,10 +233,11 @@ fun RoomPanel(
             leadingIcon = { Icon(Icons.Filled.OpenWith, contentDescription = null, Modifier.size(18.dp)) },
         )
         ActionChip("Snap to neighbour", Icons.AutoMirrored.Filled.AlignHorizontalLeft, null, onClick = actions.onSnap)
-        ActionChip("90°", Icons.Filled.Rotate90DegreesCw, "Rotate 90° clockwise") { actions.onRotate(-90.0) }
-        ActionChip("1°", null, "Rotate 1° clockwise", prefix = "−") { actions.onRotate(-1.0) }
-        ActionChip("1°", null, "Rotate 1° counter-clockwise", prefix = "+") { actions.onRotate(1.0) }
-        ActionChip("90°", Icons.Filled.Rotate90DegreesCcw, "Rotate 90° counter-clockwise") { actions.onRotate(90.0) }
+        if (canSquare) ActionChip("Square to floor", Icons.Filled.CropRotate, null, onClick = actions.onSquare)
+        ActionChip("90°", Icons.Filled.Rotate90DegreesCw, "Rotate $what 90° clockwise") { actions.onRotate(-90.0) }
+        ActionChip("1°", null, "Rotate $what 1° clockwise", prefix = "−") { actions.onRotate(-1.0) }
+        ActionChip("1°", null, "Rotate $what 1° counter-clockwise", prefix = "+") { actions.onRotate(1.0) }
+        ActionChip("90°", Icons.Filled.Rotate90DegreesCcw, "Rotate $what 90° counter-clockwise") { actions.onRotate(90.0) }
         ActionChip("Re-solve", Icons.Filled.AutoFixHigh, null, onClick = actions.onResolve)
         ActionChip("Delete", Icons.Filled.Delete, null, destructive = true, onClick = actions.onDelete)
     }
@@ -214,9 +268,15 @@ class WallPanelActions(
     val onClose: () -> Unit,
 )
 
+/**
+ * The selected wall: its length (and whether it was set by hand), its doors and windows, and wall actions.
+ * Calibration applies to scanned rooms only, so drawn rooms say their sizes are as typed instead.
+ */
 @Composable
 fun WallPanel(room: Room, wallIndex: Int, settings: PlanSettings, calibration: Calibration?, actions: WallPanelActions) {
     val length = edgeLength(room, wallIndex)
+    val handSet = remember(room, wallIndex) { handSetWall(room, wallIndex) }
+    val drawn = room.captureMethod == CaptureMethod.MANUAL
     PanelHeader(
         title = "Wall ${wallIndex + 1} of ${room.corners.size}",
         subtitle = room.name,
@@ -232,6 +292,23 @@ fun WallPanel(room: Room, wallIndex: Int, settings: PlanSettings, calibration: C
         Column(Modifier.weight(1f)) {
             Text("Length (interior)", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text(settings.formatLength(length), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+            if (handSet != null) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 2.dp)) {
+                    Icon(
+                        Icons.Filled.Straighten,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Text(
+                        handSet.typedLength?.takeIf { it.isFinite() && it > 0 }
+                            ?.let { "Set by hand (typed ${settings.formatLength(it)})" } ?: "Set by hand",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(start = 4.dp),
+                    )
+                }
+            }
         }
         AssistChip(
             onClick = actions.onSetLength,
@@ -245,21 +322,33 @@ fun WallPanel(room: Room, wallIndex: Int, settings: PlanSettings, calibration: C
         ActionChip("Add window", Icons.Filled.Window, null) { actions.onAddOpening(OpeningType.WINDOW) }
         ActionChip("Add opening", Icons.Outlined.SensorDoor, null) { actions.onAddOpening(OpeningType.OPENING) }
         ActionChip("Insert corner", Icons.Filled.AddCircleOutline, null, onClick = actions.onInsertCorner)
-        ActionChip("Calibrate floor", Icons.Filled.SquareFoot, null, onClick = actions.onCalibrate)
+        // Calibration corrects AR scale error, so it is measured from a wall of a scanned room.
+        if (!drawn) ActionChip("Calibrate floor", Icons.Filled.SquareFoot, null, onClick = actions.onCalibrate)
     }
     val onWall = room.openings.filter { it.wallIndex == wallIndex }.sortedBy { it.offset }
     if (onWall.isNotEmpty()) {
         HorizontalDivider(Modifier.padding(vertical = 8.dp))
         onWall.forEach { OpeningRow(it, settings, onClick = { actions.onOpenOpening(it) }) }
     }
-    calibration?.let {
+    wallNote(drawn, calibration)?.let {
         Text(
-            "Floor calibrated ×${"%.4f".format(Locale.US, it.factor)} from a tape measurement.",
+            it,
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 8.dp),
         )
     }
+}
+
+/**
+ * Note under a wall's details: drawn rooms keep their typed sizes ("Drawn room — sizes are as typed."); a
+ * scanned room on a tape-calibrated floor shows the calibration; null otherwise.
+ */
+internal fun wallNote(drawn: Boolean, calibration: Calibration?): String? = when {
+    drawn -> "Drawn room — sizes are as typed."
+    calibration != null && calibration.factor.isFinite() ->
+        "Floor calibrated ×${"%.4f".format(Locale.US, calibration.factor)} from a tape measurement."
+    else -> null
 }
 
 @Composable
@@ -318,11 +407,17 @@ private fun PanelHeader(
 }
 
 @Composable
-private fun StatCell(label: String, value: String, modifier: Modifier = Modifier, editable: Boolean = false) {
-    Column(modifier, verticalArrangement = Arrangement.Center) {
+private fun StatCell(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    editable: Boolean = false,
+    valueStyle: TextStyle = MaterialTheme.typography.titleMedium,
+) {
+    Column(modifier.semantics(mergeDescendants = true) {}, verticalArrangement = Arrangement.Center) {
         Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(value, style = MaterialTheme.typography.titleMedium)
+            Text(value, style = valueStyle)
             if (editable) {
                 Icon(
                     Icons.Filled.Edit,
@@ -505,8 +600,23 @@ private fun OpeningRow(opening: Opening, settings: PlanSettings, onClick: () -> 
     }
 }
 
+/** The room panel's second row of figures, formatted ("—" when unknown). */
+internal data class RoomFigures(val perimeter: String, val wallArea: String, val volume: String)
+
+/**
+ * Perimeter, wall area (net of doors and windows) and volume of [room] from [stats]. Wall area and volume need a
+ * ceiling height ("—" without one) and are marked "(est.)" when the ceiling is an assumed default.
+ */
+internal fun roomFigures(room: Room, stats: RoomStats?, settings: PlanSettings): RoomFigures {
+    val est = if (room.ceilingEstimated) " (est.)" else ""
+    val perimeter = stats?.perimeter?.takeIf { it.isFinite() && it > 0 }?.let { settings.formatLength(it) } ?: "—"
+    val wallArea = stats?.wallArea?.takeIf { it.isFinite() }?.let { settings.formatArea(it) + est } ?: "—"
+    val volume = stats?.volume?.takeIf { it.isFinite() }?.let { settings.formatVolume(it) + est } ?: "—"
+    return RoomFigures(perimeter, wallArea, volume)
+}
+
 /** Measurements can only fail on corrupt geometry; the panel then shows dashes instead of crashing. */
-private fun safeStats(room: Room): RoomStats? = try {
+internal fun safeStats(room: Room): RoomStats? = try {
     Measurements.room(room)
 } catch (e: Exception) {
     null

@@ -171,12 +171,13 @@ object RoomOps {
         return room.copy(corners = corners, openings = openings)
     }
 
-    /** Rigidly move/rotate the room: corners, observations (lines, extents, viewer) and taps. */
+    /** Rigidly move/rotate the room: corners, observations (lines, extents, viewer), taps and hand-set walls. */
     fun transform(room: Room, t: RigidTransform2): Room {
         if (!t.angle.isFinite() || !t.translation.isFinite()) return room
         return room.copy(
             corners = room.corners.map { t.apply(it) },
             cornerTaps = room.cornerTaps.map { t.apply(it) },
+            handSetWalls = room.handSetWalls.map { it.copy(segment = Segment2(t.apply(it.segment.a), t.apply(it.segment.b))) },
             observations = room.observations.map { o ->
                 o.copy(
                     line = t.apply(o.line),
@@ -199,6 +200,9 @@ object RoomOps {
         return room.copy(
             corners = room.corners.map(::s),
             cornerTaps = room.cornerTaps.map(::s),
+            handSetWalls = room.handSetWalls.map {
+                it.copy(segment = Segment2(s(it.segment.a), s(it.segment.b)), typedLength = it.typedLength?.let { l -> l * factor })
+            },
             ceilingHeight = room.ceilingHeight?.let { it * factor },
             openings = room.openings.map {
                 it.copy(
@@ -627,14 +631,35 @@ object FloorOps {
      * * Null also for an unknown room, a room or neighbours without a usable outline, and invalid parameters.
      *   Only the room's pose changes (see [RoomOps.transform]); its shape, openings and the calibration stay.
      */
-    fun snapRoom(floor: Floor, roomId: String, wallThickness: Double, maxDistance: Double = 0.6, maxAngleDeg: Double = 12.0): Floor? {
+    fun snapRoom(floor: Floor, roomId: String, wallThickness: Double, maxDistance: Double = 0.6, maxAngleDeg: Double = 12.0): Floor? =
+        snapGroup(floor, roomId, setOf(roomId), wallThickness, maxDistance, maxAngleDeg)
+
+    /**
+     * [snapRoom] for a group of rooms moved as one rigid block (typically every room of one scan session, which
+     * share a frame and are already aligned with each other). The best pair is searched between the edges of
+     * [roomId] (the room the user selected) and the edges of rooms NOT in [groupIds]; the resulting rigid
+     * transform is applied to every room in [groupIds] (plus [roomId]). The overlap rule compares the moved
+     * group with non-group rooms only, so members never "snap" to or block each other.
+     * `snapGroup(floor, id, setOf(id), ...)` is exactly [snapRoom]. Null when no pair qualifies (also when every
+     * other room is in the group); the same instance when already in place.
+     */
+    fun snapGroup(
+        floor: Floor,
+        roomId: String,
+        groupIds: Set<String>,
+        wallThickness: Double,
+        maxDistance: Double = 0.6,
+        maxAngleDeg: Double = 12.0,
+    ): Floor? {
         val room = floor.rooms.firstOrNull { it.id == roomId } ?: return null
         if (!wallThickness.isFinite() || wallThickness < 0.0 || !maxDistance.isFinite() || maxDistance < 0.0 ||
             !maxAngleDeg.isFinite() || maxAngleDeg < 0.0
         ) return null
+        val group = groupIds + roomId
         val outline = WallPairs.ccwOutline(room.corners) ?: return null
         val maxAngle = Math.toRadians(maxAngleDeg.coerceAtMost(45.0))
-        val others = floor.rooms.filter { it.id != roomId }.mapNotNull { r -> WallPairs.ccwOutline(r.corners)?.let { r.id to it } }
+        val others = floor.rooms.filter { it.id !in group }.mapNotNull { r -> WallPairs.ccwOutline(r.corners)?.let { r.id to it } }
+        val members = floor.rooms.filter { it.id in group }.mapNotNull { r -> WallPairs.ccwOutline(r.corners) }
 
         class Candidate(val pair: FacingWalls, val gapError: Double, val score: Double)
         val candidates = others.flatMap { (_, poly) -> WallPairs.facing(outline, poly, maxAngle) }
@@ -648,7 +673,8 @@ object FloorOps {
             .sortedWith(compareByDescending<Candidate> { it.score }.thenBy { it.gapError }.thenBy { it.pair.angleError })
         if (candidates.isEmpty()) return null
 
-        val overlapBefore = others.associate { (id, poly) -> id to PolygonClipping.intersectionArea(outline, poly) }
+        fun overlapWith(polys: List<List<Vec2>>, poly: List<Vec2>) = polys.sumOf { PolygonClipping.intersectionArea(it, poly) }
+        val overlapBefore = others.associate { (id, poly) -> id to overlapWith(members, poly) }
         for (candidate in candidates) {
             val p = candidate.pair
             val turn = Polygons.normalizeAngle(p.targetDirection.angle() - p.direction.angle())
@@ -656,14 +682,23 @@ object FloorOps {
             if (abs(turn) < SNAP_IDENTITY_ANGLE && shift.length < SNAP_IDENTITY_SHIFT) return floor
             val rotation = RigidTransform2.rotationAround(p.pivot, turn)
             val t = RigidTransform2(rotation.angle, rotation.translation + shift)
-            val moved = outline.map { t.apply(it) }
+            val moved = members.map { poly -> poly.map { t.apply(it) } }
             val createsOverlap = others.any { (id, poly) ->
-                PolygonClipping.intersectionArea(moved, poly) > overlapBefore.getValue(id) + SNAP_OVERLAP_TOLERANCE
+                overlapWith(moved, poly) > overlapBefore.getValue(id) + SNAP_OVERLAP_TOLERANCE
             }
             if (createsOverlap) continue
-            return upsertRoom(floor, RoomOps.transform(room, t))
+            return transformRooms(floor, group, t)
         }
         return null
+    }
+
+    /**
+     * Apply [t] ([RoomOps.transform]) to every room whose id is in [ids]; other rooms and the calibration are
+     * unchanged. Used to move / rotate a whole scan session as one block.
+     */
+    fun transformRooms(floor: Floor, ids: Set<String>, t: RigidTransform2): Floor {
+        if (ids.isEmpty() || floor.rooms.none { it.id in ids }) return floor
+        return floor.copy(rooms = floor.rooms.map { if (it.id in ids) RoomOps.transform(it, t) else it })
     }
 
     /**

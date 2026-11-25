@@ -330,14 +330,15 @@ object DollhousePalette {
     const val DIFFUSE = 0.26
 
     fun floorColor(type: RoomType?): Int = when (type) {
-        RoomType.LIVING, RoomType.FAMILY -> 0xFFEBE4D9.toInt()
-        RoomType.KITCHEN, RoomType.DINING -> 0xFFEDE6D5.toInt()
+        RoomType.LIVING, RoomType.FAMILY, RoomType.DEN, RoomType.BONUS, RoomType.SUNROOM -> 0xFFEBE4D9.toInt()
+        RoomType.KITCHEN, RoomType.DINING, RoomType.PANTRY -> 0xFFEDE6D5.toInt()
         RoomType.BEDROOM, RoomType.PRIMARY_BEDROOM -> 0xFFEAE2DC.toInt()
         RoomType.BATHROOM, RoomType.HALF_BATH, RoomType.LAUNDRY -> 0xFFE0E7EB.toInt()
         RoomType.OFFICE -> 0xFFE5E7DF.toInt()
-        RoomType.GARAGE -> 0xFFDEDEDC.toInt()
-        RoomType.HALLWAY, RoomType.ENTRY, RoomType.STAIRS -> 0xFFE7E4DF.toInt()
+        RoomType.GARAGE, RoomType.WORKSHOP, RoomType.BASEMENT -> 0xFFDEDEDC.toInt()
+        RoomType.HALLWAY, RoomType.ENTRY, RoomType.MUDROOM, RoomType.STAIRS -> 0xFFE7E4DF.toInt()
         RoomType.CLOSET, RoomType.STORAGE, RoomType.UTILITY -> 0xFFE4E2DE.toInt()
+        RoomType.PORCH, RoomType.DECK, RoomType.BALCONY, RoomType.PATIO -> 0xFFE3E0D6.toInt()
         RoomType.OTHER, null -> FLOOR
     }
 

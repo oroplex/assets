@@ -102,3 +102,23 @@ swing arc, blue window symbols, bold room names, secondary text for dimensions a
   / `highlightRoomIds`, `Dollhouse` (3D model faces).
 * App: `AppContainer.branding` (`BrandingRepository`: company name/contact/logo, one-time flags),
   `ui/view3d/DollhouseScreen`, `PlanEditorScreen(onOpen3d)`; route `view3d/{projectId}/{floorId}`.
+
+## Round 3 additions (contracts)
+Driven by `docs/REVIEW-2.md` (finding ids SEAM-n, ARX-n, MATH-n, CAPX-n, APPX-n, PREM-n).
+* Model: `PlanSettings.exteriorWallThickness` (null = wallThickness), `AreaCategory` + `RoomType.defaultArea`
+  + `Room.areaCategory` / `Room.effectiveAreaCategory`, new room types (den, pantry, bonus room, sunroom,
+  mudroom, workshop, basement, porch, deck, balcony, patio), `Opening.typed`, `Room.ceilingTyped`,
+  `Room.handSetWalls` (`HandSetWall(segment, typedLength)`), `RoomNames.unique/isDefaultName` (one numbering
+  rule for capture, editor and type changes).
+* Provenance rule for calibration (tape scale correction): only AR-measured values scale. Typed values
+  (`ceilingTyped`, `Opening.typed` widths, `HandSetWall.typedLength`) and estimated ceilings keep their
+  values; drawn (MANUAL) rooms keep their size but move with the scaled plan.
+* Core: `RoomQuality.assess(room, numbering = OUTLINE|CAPTURE, unitSystem)` (capture review must use CAPTURE
+  numbers, which match the wall chips), `FloorIssue.action` (`STRAIGHTEN_FLOOR`, `SNAP_ROOM`),
+  `Measurements.areaSummary` (living / non-living / outdoor; never call it GLA), `DxfExporter.export(...,
+  showAreas, showOverallDimensions)`, `RenderOptions.pointsPerMeter`, `RoomSolver.sharedAxis(outlines)`
+  (robust shared squaring axis; never use the plain `dominantAngle` mean as a hint), `FloorOps.snapGroup` /
+  `transformRooms` (move a whole scan session as one block).
+* AR: `ArFrameState.localFloorY` (floor under the user; another level seen through a doorway never wins),
+  `floorAutoLockable`, `cameraForward`; `ArCaptureController.setReferenceFloor(y)` (default no-op).
+* App: `PlanEditorScreen(focusRoomId, onFocusRoomConsumed)`, `ExportScreen(onOpenRoom)`.

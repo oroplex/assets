@@ -51,7 +51,17 @@ object DxfExporter {
      * Text is written as ASCII ("×" becomes "x", "²" becomes "2", other non-ASCII characters become
      * \U+XXXX escapes).
      */
-    fun export(rooms: List<Room>, settings: PlanSettings): String {
+    fun export(
+        rooms: List<Room>,
+        settings: PlanSettings,
+        /** Room areas in the TEXT labels (the export screen's switch); defaults to the project setting. */
+        showAreas: Boolean = settings.showRoomAreas,
+        /** The DIMENSIONS layer (the export screen's switch); defaults to the project setting. */
+        showOverallDimensions: Boolean = settings.showOverallDimensions,
+    ): String {
+        if (showAreas != settings.showRoomAreas || showOverallDimensions != settings.showOverallDimensions) {
+            return export(rooms, settings.copy(showRoomAreas = showAreas, showOverallDimensions = showOverallDimensions))
+        }
         val scale = if (settings.unitSystem == UnitSystem.IMPERIAL) INCHES_PER_METER else MILLIMETERS_PER_METER
         val insUnits = if (settings.unitSystem == UnitSystem.IMPERIAL) 1 else 4
         val thickness = PlanGeometry.wallThickness(settings)

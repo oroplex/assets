@@ -56,6 +56,22 @@ data class ArFrameState(
     val horizontalPlanes: Int = 0,
     val verticalPlanes: Int = 0,
     val timestampNs: Long = 0L,
+    /**
+     * Height (world Y) of the floor UNDER THE USER: the lowest qualifying upward plane whose polygon contains, or
+     * lies within about 1 m of, the camera's ground point, and whose height was never vetoed as furniture.
+     * Unlike [floorY] (global, any plane in view), another level seen through a doorway (sunken living room,
+     * step-down garage) never wins here. null when no such plane is tracked. Use it for auto-lock and for
+     * raised-surface / wrong-level checks.
+     */
+    val localFloorY: Double? = null,
+    /**
+     * True when the AR layer is confident enough in [localFloorY] to lock it without the user: large enough,
+     * under the user, never vetoed, and not contradicted by floor-like hits below it. Auto-lock only when true;
+     * a manual Lock floor is always possible.
+     */
+    val floorAutoLockable: Boolean = false,
+    /** Unit view direction of the camera in world space (for angular-speed coaching); null when not tracking. */
+    val cameraForward: Vec3? = null,
 ) {
     // FloatArray breaks data-class equality; compare by timestamp so StateFlow emits each frame.
     override fun equals(other: Any?): Boolean = other is ArFrameState && other.timestampNs == timestampNs && other.tracking == tracking && other.problem == problem
@@ -122,4 +138,11 @@ interface ArCaptureController {
      * Apply with RoomOps.transform before the final save.
      */
     fun anchorCorrections(): Map<String, RigidTransform2>
+
+    /**
+     * The floor height the capture flow has LOCKED (null = none). The AR layer uses it for the reticle's
+     * featureless-floor fallback, so the reticle agrees with the lock. Cheap; may be called every frame.
+     * [ArFrameState.floorY] / [ArFrameState.localFloorY] stay the tracker's independent estimates.
+     */
+    fun setReferenceFloor(y: Double?) {}
 }

@@ -1,6 +1,7 @@
 package com.oroplex.floorplan.core.model
 
 import com.oroplex.floorplan.core.geometry.Line2
+import com.oroplex.floorplan.core.geometry.Segment2
 import com.oroplex.floorplan.core.geometry.Vec2
 import kotlinx.serialization.Serializable
 
@@ -34,27 +35,57 @@ data class PlanSettings(
     val defaultWindowWidth: Double = 0.9144, // 36 in
     /** Draw overall exterior dimension lines (width / depth of the whole floor) around the plan. */
     val showOverallDimensions: Boolean = true,
+    /**
+     * Thickness drawn for EXTERIOR walls (room walls with no other room's wall facing them across a partition
+     * gap), and therefore what overall dimensions measure to. null = use [wallThickness] for every wall.
+     */
+    val exteriorWallThickness: Double? = null,
 )
 
+/** What a room's floor area counts toward in area summaries (see Measurements.areaSummary). */
 @Serializable
-enum class RoomType(val displayName: String) {
+enum class AreaCategory(val displayName: String) {
+    /** Finished, heated interior space ("net living area"). */
+    LIVING("Living area"),
+    /** Enclosed but not living space: garage, unfinished storage / utility, basement. */
+    NON_LIVING("Garage & unfinished"),
+    /** Outdoor space: porch, deck, balcony, patio. */
+    EXTERIOR("Outdoor"),
+    /** Not counted in any total. */
+    EXCLUDED("Not counted"),
+}
+
+@Serializable
+enum class RoomType(val displayName: String, val defaultArea: AreaCategory = AreaCategory.LIVING) {
+    // Serialized by NAME: entries may be reordered or added freely, never renamed.
     LIVING("Living Room"),
     FAMILY("Family Room"),
+    DEN("Den"),
     KITCHEN("Kitchen"),
     DINING("Dining Room"),
+    PANTRY("Pantry"),
     BEDROOM("Bedroom"),
     PRIMARY_BEDROOM("Primary Bedroom"),
     BATHROOM("Bathroom"),
     HALF_BATH("Half Bath"),
+    OFFICE("Office"),
+    BONUS("Bonus Room"),
+    SUNROOM("Sunroom"),
     HALLWAY("Hallway"),
     ENTRY("Entry"),
+    MUDROOM("Mudroom"),
+    STAIRS("Stairs"),
     CLOSET("Closet"),
     LAUNDRY("Laundry"),
-    OFFICE("Office"),
-    GARAGE("Garage"),
-    UTILITY("Utility"),
-    STORAGE("Storage"),
-    STAIRS("Stairs"),
+    UTILITY("Utility", AreaCategory.NON_LIVING),
+    STORAGE("Storage", AreaCategory.NON_LIVING),
+    GARAGE("Garage", AreaCategory.NON_LIVING),
+    WORKSHOP("Workshop", AreaCategory.NON_LIVING),
+    BASEMENT("Basement", AreaCategory.NON_LIVING),
+    PORCH("Porch", AreaCategory.EXTERIOR),
+    DECK("Deck", AreaCategory.EXTERIOR),
+    BALCONY("Balcony", AreaCategory.EXTERIOR),
+    PATIO("Patio", AreaCategory.EXTERIOR),
     OTHER("Room"),
 }
 
@@ -80,6 +111,11 @@ data class Opening(
     val height: Double,
     val sillHeight: Double = 0.0,
     val swing: DoorSwing = DoorSwing.LEFT_IN,
+    /**
+     * True when the width / position were typed or defaulted in the editor rather than marked edge-to-edge in
+     * AR. Tape calibration keeps a typed opening's width and only moves its centre with the scaled wall.
+     */
+    val typed: Boolean = false,
 )
 
 @Serializable
@@ -124,6 +160,8 @@ data class Room(
      * UI and exports must mark such heights as estimated, and calibration must not rescale them.
      */
     val ceilingEstimated: Boolean = false,
+    /** True when [ceilingHeight] was typed by the user (e.g. tape-measured): calibration must not rescale it. */
+    val ceilingTyped: Boolean = false,
     val openings: List<Opening> = emptyList(),
     val captureMethod: CaptureMethod = CaptureMethod.MANUAL,
     /** Raw capture data (walls mode), in the same order the user captured them. */
@@ -133,7 +171,26 @@ data class Room(
     /** AR session the room was captured in; rooms from one session share a coordinate frame. */
     val sessionId: String? = null,
     val warnings: List<String> = emptyList(),
+    /** What this room's area counts toward; null = its type's default ([RoomType.defaultArea]). */
+    val areaCategory: AreaCategory? = null,
+    /** Walls the user set by hand in the editor (typed length, dragged / inserted / deleted corner). */
+    val handSetWalls: List<HandSetWall> = emptyList(),
 )
+
+/** The area category this room counts toward: [Room.areaCategory], or its type's default. */
+val Room.effectiveAreaCategory: AreaCategory get() = areaCategory ?: type.defaultArea
+
+/**
+ * A wall edge the user set by hand in the editor, stored as the edge's plan [segment] so it survives corner
+ * index shifts. An outline edge MATCHES a hand-set wall when it is parallel within 15° and its midpoint lies
+ * within 15 cm of the segment's line and within its extent (the same test RoomQuality uses for observations).
+ *
+ * [typedLength] is the length the user typed (a tape measurement), or null when the wall was only dragged.
+ * RoomOps.transform and calibration transform [segment] with the room, and calibration restores [typedLength]
+ * on the matching edge after scaling; re-solving a room from its observations clears the list.
+ */
+@Serializable
+data class HandSetWall(val segment: Segment2, val typedLength: Double? = null)
 
 /** Scale calibration applied to a floor from a tape-measured reference length. */
 @Serializable

@@ -28,6 +28,13 @@ data class RenderOptions(
     val showOverallDimensions: Boolean? = null,
     /** Rooms to flag (e.g. overlapping rooms) with a WARNING-colored outline. */
     val highlightRoomIds: Set<String> = emptySet(),
+    /**
+     * Output scale in points per plan meter when the caller knows it (a PDF at a fixed architectural scale, the
+     * editor at its current zoom). Overall-dimension offsets, ticks and label gaps are then sized exactly in
+     * points. null = assume the plan spans about 560 pt (fit-to-page).
+     * Round-3 contract: not honoured yet.
+     */
+    val pointsPerMeter: Double? = null,
 )
 
 object PlanRenderer {

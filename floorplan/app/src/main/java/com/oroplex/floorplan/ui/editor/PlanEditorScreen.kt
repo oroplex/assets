@@ -90,6 +90,12 @@ fun PlanEditorScreen(
     onBack: () -> Unit,
     /** Open the 3D dollhouse view of a floor (route view3d/{projectId}/{floorId}). */
     onOpen3d: (projectId: String, floorId: String) -> Unit = { _, _ -> },
+    /**
+     * A room to select and zoom to (e.g. tapped in the export pre-flight list); switches floors as needed.
+     * Call [onFocusRoomConsumed] once handled so the request is not repeated. Round-3 contract: not used yet.
+     */
+    focusRoomId: String? = null,
+    onFocusRoomConsumed: () -> Unit = {},
 ) {
     val container = appContainer()
     val viewModel: PlanEditorViewModel = viewModel(

@@ -45,7 +45,7 @@ class ProjectJsonTest {
 
     @Test fun decodeIsLenientAboutNewerFiles() {
         val minimal = """{"id":"p","name":"P","createdAt":1,"updatedAt":2,"futureField":{"a":[1,2]},
-            |"floors":[{"id":"f","name":"F","rooms":[{"id":"r","name":"R","type":"SUNROOM","corners":[],"extra":true}]}]}""".trimMargin()
+            |"floors":[{"id":"f","name":"F","rooms":[{"id":"r","name":"R","type":"WINE_CELLAR_XYZ","corners":[],"extra":true}]}]}""".trimMargin()
         val p = ProjectJson.decode(minimal)
         assertEquals("P", p.name)
         assertEquals(RoomType.OTHER, p.floors.single().rooms.single().type, "unknown enum falls back to the default")

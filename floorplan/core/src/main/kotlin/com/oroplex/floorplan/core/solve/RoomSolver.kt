@@ -278,6 +278,16 @@ object RoomSolver {
     }
 
     /**
+     * Robust shared squaring axis (mod 90°, in [0, PI/2)) of several closed room [outlines], for
+     * [SolverOptions.axisHint]: angled walls (bays, chamfers, a 30° wall) must not pull it, so it is a
+     * consensus over the edges (support = edges within the squaring tolerance, refined with supporters only),
+     * not the plain 4θ mean of [dominantAngle]. Returns null when there is no usable edge or when the
+     * supporting length is less than half of the total (no coherent axis).
+     * Round-3 contract: currently the FloorAxis refinement (mean, then 10° and 5° windows).
+     */
+    fun sharedAxis(outlines: List<List<Vec2>>): Double? = FloorAxis.ofOutlines(outlines)
+
+    /**
      * Weighted dominant direction mod 90deg, in [0, PI/2). Uses the 4θ circular-mean trick so that
      * perpendicular walls reinforce each other. [weights] default to 1.
      *

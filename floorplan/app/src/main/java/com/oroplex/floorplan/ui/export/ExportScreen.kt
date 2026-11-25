@@ -84,7 +84,12 @@ private const val TAG = "ExportScreen"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ExportScreen(projectId: String, onBack: () -> Unit) {
+fun ExportScreen(
+    projectId: String,
+    onBack: () -> Unit,
+    /** Show a room in the editor (tapped pre-flight item): the caller pops back to the editor and focuses it. */
+    onOpenRoom: (roomId: String) -> Unit = {},
+) {
     val container = appContainer()
     val context = LocalContext.current
     val appContext = context.applicationContext

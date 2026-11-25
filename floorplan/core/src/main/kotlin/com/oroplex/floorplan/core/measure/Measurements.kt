@@ -6,9 +6,33 @@ import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.model.Floor
 import com.oroplex.floorplan.core.model.Opening
 import com.oroplex.floorplan.core.model.Project
+import com.oroplex.floorplan.core.model.AreaCategory
 import com.oroplex.floorplan.core.model.Room
+import com.oroplex.floorplan.core.model.effectiveAreaCategory
 import kotlin.math.max
 import kotlin.math.min
+
+/**
+ * Net (interior) floor areas by [AreaCategory], m². "Living" is the sum of interior net areas of living rooms:
+ * label it "Net living area (interior)", never "GLA" (ANSI Z765 GLA is measured to exterior faces, finished
+ * above-grade space only, typically 8-10 % more than the interior sum).
+ */
+data class AreaSummary(
+    val living: Double,
+    val nonLiving: Double,
+    val exterior: Double,
+    val excluded: Double,
+) {
+    /** Enclosed floor area: living + non-living (outdoor and excluded rooms are not part of it). */
+    val enclosed: Double get() = living + nonLiving
+
+    operator fun plus(other: AreaSummary) =
+        AreaSummary(living + other.living, nonLiving + other.nonLiving, exterior + other.exterior, excluded + other.excluded)
+
+    companion object {
+        val ZERO = AreaSummary(0.0, 0.0, 0.0, 0.0)
+    }
+}
 
 data class RoomStats(
     val area: Double,
@@ -64,6 +88,29 @@ object Measurements {
 
     /** Sum of the net areas of all floors. */
     fun projectArea(project: Project): Double = project.floors.sumOf { floorArea(it) }
+
+    /** Net areas of [rooms] split by each room's [effectiveAreaCategory]. */
+    fun areaSummary(rooms: List<Room>): AreaSummary {
+        var living = 0.0
+        var nonLiving = 0.0
+        var exterior = 0.0
+        var excluded = 0.0
+        for (r in rooms) {
+            val a = room(r).area
+            if (!a.isFinite()) continue
+            when (r.effectiveAreaCategory) {
+                AreaCategory.LIVING -> living += a
+                AreaCategory.NON_LIVING -> nonLiving += a
+                AreaCategory.EXTERIOR -> exterior += a
+                AreaCategory.EXCLUDED -> excluded += a
+            }
+        }
+        return AreaSummary(living, nonLiving, exterior, excluded)
+    }
+
+    /** [areaSummary] of every floor of [project]. */
+    fun areaSummary(project: Project): AreaSummary =
+        project.floors.fold(AreaSummary.ZERO) { acc, f -> acc + areaSummary(f.rooms) }
 
     private fun openingArea(o: Opening, ceiling: Double): Double {
         val width = if (o.width.isFinite()) max(o.width, 0.0) else 0.0

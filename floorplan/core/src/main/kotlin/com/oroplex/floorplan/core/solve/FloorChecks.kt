@@ -10,8 +10,24 @@ import kotlin.math.abs
 
 enum class IssueSeverity { ERROR, WARNING, INFO }
 
-/** A pre-export / editor check result. [roomId] is null for floor-wide issues. Messages are short and actionable. */
-data class FloorIssue(val severity: IssueSeverity, val roomId: String?, val message: String)
+/** A one-tap fix the UI can offer next to a [FloorIssue]. */
+enum class FloorIssueAction {
+    /** Straighten the whole floor (FloorOps.straighten); floor-wide, [FloorIssue.roomId] is null. */
+    STRAIGHTEN_FLOOR,
+    /** Snap the issue's room (and the rest of its scan session) to a neighbour (FloorOps.snapGroup). */
+    SNAP_ROOM,
+}
+
+/**
+ * A pre-export / editor check result. [roomId] is null for floor-wide issues. Messages are short and actionable.
+ * [action] is an optional one-tap fix the UI may offer (a button or a tappable row).
+ */
+data class FloorIssue(
+    val severity: IssueSeverity,
+    val roomId: String?,
+    val message: String,
+    val action: FloorIssueAction? = null,
+)
 
 object FloorChecks {
     /** Two rooms count as aligned when facing walls are parallel within this angle... */

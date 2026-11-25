@@ -16,6 +16,15 @@ import kotlin.math.min
 /** MANUAL = drawn/typed, no AR evidence to grade. */
 enum class QualityLevel { GOOD, FAIR, POOR, MANUAL }
 
+/**
+ * How [RoomQuality.assess] numbers walls and corners in its reasons.
+ * * [OUTLINE]: 1-based edge / corner numbers of the room's current outline, as the editor shows them.
+ * * [CAPTURE]: 1-based capture numbers (the index of the wall observation / corner tap the user took, as the
+ *   capture screen's wall chips and AR badges show them), so "Wall 4" is the capture to redo. Edges no capture
+ *   supports are described by their neighbours ("the wall between walls 3 and 4").
+ */
+enum class WallNumbering { OUTLINE, CAPTURE }
+
 data class RoomQualityReport(
     val level: QualityLevel,
     /** 0..1, higher is better (1.0 for MANUAL). */
@@ -88,7 +97,13 @@ object RoomQuality {
      * Reasons use 1-based wall / corner numbers of the room's current outline (as the editor shows them),
      * most important first, at most four.
      */
-    fun assess(room: Room): RoomQualityReport {
+    fun assess(
+        room: Room,
+        numbering: WallNumbering = WallNumbering.OUTLINE,
+        /** Units for lengths in reasons (e.g. noise "±1.2 in"); null = both systems, as before. */
+        unitSystem: UnitSystem? = null,
+    ): RoomQualityReport {
+        // Round-3 contract: [numbering] and [unitSystem] are not honoured yet (OUTLINE numbering, both units).
         if (room.captureMethod == CaptureMethod.MANUAL) return RoomQualityReport(QualityLevel.MANUAL, 1.0, emptyList())
         val outline = WallPairs.ccwOutline(room.corners)
             ?: return RoomQualityReport(QualityLevel.POOR, 0.0, listOf("The outline is broken — fix its corners or scan the room again"))

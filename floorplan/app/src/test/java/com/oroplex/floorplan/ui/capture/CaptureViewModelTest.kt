@@ -14,6 +14,7 @@ import com.oroplex.floorplan.core.fit.WallFit
 import com.oroplex.floorplan.core.fit.WallFitFailure
 import com.oroplex.floorplan.core.geometry.Bounds
 import com.oroplex.floorplan.core.geometry.Line2
+import com.oroplex.floorplan.core.geometry.Polygons
 import com.oroplex.floorplan.core.geometry.RigidTransform2
 import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.geometry.Vec3
@@ -24,6 +25,7 @@ import com.oroplex.floorplan.core.model.Opening
 import com.oroplex.floorplan.core.model.OpeningType
 import com.oroplex.floorplan.core.model.Project
 import com.oroplex.floorplan.core.model.Room
+import com.oroplex.floorplan.core.model.RoomNames
 import com.oroplex.floorplan.core.model.RoomType
 import com.oroplex.floorplan.core.model.WallObservation
 import com.oroplex.floorplan.core.model.WallSource
@@ -46,6 +48,10 @@ import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Capture state machine with a fake AR controller and an in-memory repository: floor locking, ceiling,
@@ -81,14 +87,21 @@ class CaptureViewModelTest {
             val c = requireNotNull(floor.calibration)
             RoomOps.scale(room, c.factor, c.origin)
         },
-    ) = CaptureViewModel(repo, project.id, floorId, OneTimeFlag.InMemory(tipsSeen), calibrate)
+        store: CaptureSnapshotStore = CaptureSnapshotStore.None,
+    ) = CaptureViewModel(repo, project.id, floorId, OneTimeFlag.InMemory(tipsSeen), calibrate, store)
 
+    /**
+     * A tracking frame. By default the AR layer reports the floor under the user at [floorY] and calls it
+     * auto-lockable (the round-3 AR contract); [localFloorY] / [lockable] override that.
+     */
     private fun trackingFrame(
         floorY: Double? = 0.0,
         floorArea: Double = 2.0,
         camera: Vec3? = Vec3(0.0, 1.4, 0.0),
         reticle: ReticleHit? = null,
         t: Long = 0L,
+        localFloorY: Double? = floorY,
+        lockable: Boolean = localFloorY != null,
     ) = ArFrameState(
         tracking = TrackingStatus.TRACKING,
         problem = TrackingProblem.NONE,
@@ -97,6 +110,8 @@ class CaptureViewModelTest {
         cameraPosition = camera,
         reticle = reticle,
         timestampNs = t,
+        localFloorY = localFloorY,
+        floorAutoLockable = lockable,
     )
 
     /** Lock the floor at y = 0 via the auto-lock path and return the VM in CEILING. */
@@ -189,7 +204,7 @@ class CaptureViewModelTest {
         vm.onFrame(trackingFrame(floorY = 0.2), controller, nowNs = 900_000_000L) // jump: restart timer
         vm.onFrame(trackingFrame(floorY = 0.2), controller, nowNs = 1_500_000_000L)
         assertEquals(CaptureStep.FIND_FLOOR, vm.state.value.step)
-        vm.onFrame(trackingFrame(floorY = 0.2, floorArea = 0.5), controller, nowNs = 2_000_000_000L) // too small
+        vm.onFrame(trackingFrame(floorY = 0.2, floorArea = 0.5, lockable = false), controller, nowNs = 2_000_000_000L) // not lockable
         vm.onFrame(trackingFrame(floorY = 0.2), controller, nowNs = 2_100_000_000L)
         assertEquals(CaptureStep.FIND_FLOOR, vm.state.value.step)
         vm.onFrame(trackingFrame(floorY = 0.2), controller, nowNs = 3_100_000_000L)
@@ -208,7 +223,7 @@ class CaptureViewModelTest {
     }
 
     @Test
-    fun manualLockRejectsRaisedSurface() {
+    fun manualLockQuestionsARaisedSurfaceAndASecondTapKeepsIt() {
         val controller = FakeController()
         controller.frames.value = trackingFrame(floorY = 0.0, floorArea = 3.0, camera = Vec3(0.0, 1.5, 0.0))
         controller.results += MeasureResult.FloorLocked(0.75) // a table
@@ -218,8 +233,93 @@ class CaptureViewModelTest {
         assertEquals(CaptureStep.FIND_FLOOR, vm.state.value.step)
         assertNull(vm.state.value.floorY)
         assertFalse(vm.state.value.busy)
-        assertTrue(vm.state.value.messages.isNotEmpty())
+        assertTrue(vm.state.value.messages.last().text, vm.state.value.messages.last().text.contains("raised surface"))
+        assertTrue(vm.state.value.messages.last().text.contains("Lock floor again"))
         assertEquals(FeedbackKind.FAILED, vm.state.value.feedback?.kind)
+
+        // A different raised height is a new question; the same height again is the user's decision.
+        controller.results += MeasureResult.FloorLocked(0.45)
+        vm.lockFloor(controller)
+        assertEquals(CaptureStep.FIND_FLOOR, vm.state.value.step)
+        controller.results += MeasureResult.FloorLocked(0.47)
+        vm.lockFloor(controller)
+        assertEquals(CaptureStep.CEILING, vm.state.value.step)
+        assertEquals(0.47, vm.state.value.floorY ?: Double.NaN, 0.0)
+    }
+
+    @Test
+    fun manualLockComparesWithTheFloorUnderTheUserNotTheLowestLevelInView() {
+        // Split level: a sunken living room at -0.45 is in view (the tracker's global floor), the user stands on
+        // the kitchen floor at 0. Locking the kitchen floor must not be refused as a "raised surface".
+        val controller = FakeController()
+        controller.frames.value = trackingFrame(floorY = -0.45, floorArea = 6.0, localFloorY = 0.0, lockable = false)
+        controller.results += MeasureResult.FloorLocked(0.0)
+        val vm = newVm()
+        vm.attach(controller)
+        vm.lockFloor(controller)
+        assertEquals(CaptureStep.CEILING, vm.state.value.step)
+        assertEquals(0.0, vm.state.value.floorY ?: Double.NaN, 0.0)
+    }
+
+    @Test
+    fun withoutALocalFloorTheGlobalFloorIsOnlyAQuestion() {
+        // No floor under the user is known; the lowest plane in view is 0.45 m lower. One extra tap unblocks it.
+        val controller = FakeController()
+        controller.frames.value = trackingFrame(floorY = -0.45, floorArea = 6.0, localFloorY = null)
+        val vm = newVm()
+        vm.attach(controller)
+        controller.results += MeasureResult.FloorLocked(0.0)
+        vm.lockFloor(controller)
+        assertEquals(CaptureStep.FIND_FLOOR, vm.state.value.step)
+        controller.results += MeasureResult.FloorLocked(0.0)
+        vm.lockFloor(controller)
+        assertEquals(CaptureStep.CEILING, vm.state.value.step)
+    }
+
+    @Test
+    fun autoLockNeedsTheArLayersLockableFloorUnderTheUser() {
+        val controller = FakeController()
+        val vm = newVm()
+        vm.attach(controller)
+        // A large floor is tracked, but the AR layer doesn't call it lockable (e.g. once vetoed as furniture).
+        for (i in 0..30) vm.onFrame(trackingFrame(floorY = 0.0, floorArea = 5.0, lockable = false), controller, nowNs = i * 100_000_000L)
+        assertEquals(CaptureStep.FIND_FLOOR, vm.state.value.step)
+        assertNull(vm.state.value.floorY)
+
+        // Lockable: the floor under the user locks, not the lower level elsewhere in view.
+        val frame = trackingFrame(floorY = -0.45, floorArea = 5.0, localFloorY = 0.0, lockable = true)
+        vm.onFrame(frame, controller, nowNs = 4_000_000_000L)
+        vm.onFrame(frame, controller, nowNs = 5_100_000_000L)
+        assertEquals(CaptureStep.CEILING, vm.state.value.step)
+        assertEquals(0.0, vm.state.value.floorY ?: Double.NaN, 0.0)
+    }
+
+    @Test
+    fun autoLockStillNeedsThePhoneWellAboveTheFloor() {
+        val controller = FakeController()
+        val vm = newVm()
+        vm.attach(controller)
+        // Lockable but only 0.9 m below the phone (phone held low): manual Lock floor only, and the copy says so.
+        val low = trackingFrame(floorY = 0.0, camera = Vec3(0.0, 0.9, 0.0))
+        for (i in 0..30) vm.onFrame(low, controller, nowNs = i * 100_000_000L)
+        assertEquals(CaptureStep.FIND_FLOOR, vm.state.value.step)
+        assertEquals(FloorStatus.MANUAL_ONLY, floorStatus(low))
+        assertEquals("Floor found. Tap Lock floor.", stepInstruction(vm.state.value, floorStatus(low)))
+    }
+
+    @Test
+    fun theLockedFloorIsSentToTheArLayerEveryFrame() {
+        val controller = FakeController()
+        val vm = newVm()
+        vm.attach(controller)
+        vm.onFrame(trackingFrame(), controller, nowNs = 0L)
+        assertEquals(listOf<Double?>(null), controller.referenceFloors)
+        vm.onFrame(trackingFrame(), controller, nowNs = 1_100_000_000L) // locks
+        vm.onFrame(trackingFrame(), controller, nowNs = 1_200_000_000L)
+        assertEquals(listOf(null, null, 0.0), controller.referenceFloors)
+        vm.relockFloor()
+        vm.onFrame(trackingFrame(), controller, nowNs = 1_300_000_000L)
+        assertNull(controller.referenceFloors.last())
     }
 
     @Test
@@ -617,7 +717,9 @@ class CaptureViewModelTest {
 
     @Test
     fun finishAppliesAnchorCorrectionsMatchedToTheCalibrationScale() {
-        val repo = FakeRepository(calibratedProject())
+        // A room from an earlier scan is on the floor, so the floor is not straightened at finish.
+        val earlier = room("old", "Hall", RoomType.HALLWAY).copy(sessionId = "earlier", captureMethod = CaptureMethod.WALLS)
+        val repo = FakeRepository(project.copy(floors = listOf(Floor(id = floorId, name = "Main Floor", rooms = listOf(earlier), calibration = calibration))))
         val controller = FakeController()
         val vm = vmInReview(controller, repo)
         val raw = requireNotNull(vm.state.value.draftRoom)
@@ -625,21 +727,70 @@ class CaptureViewModelTest {
         controller.corrections = mapOf(raw.id to t, "unrelated" to RigidTransform2(1.0, Vec2(5.0, 5.0)))
         vm.saveAndFinish(controller)
         assertTrue(vm.state.value.finished)
-        val saved = savedRooms(repo).single()
+        val saved = savedRooms(repo).single { it.id == raw.id }
         // Corrected in the raw AR frame, then scaled like every other room of the floor.
         val expected = RoomOps.scale(RoomOps.transform(raw, t), calibration.factor, calibration.origin)
         assertCornersEqual(expected.corners, saved.corners)
+        assertEquals(earlier, savedRooms(repo).single { it.id == "old" })
     }
 
     @Test
-    fun axisHintComesFromTheSessionsSavedRooms() {
+    fun reviewShowsTheRoomAsItWillBeSavedOnACalibratedFloor() {
+        val repo = FakeRepository(calibratedProject())
+        val controller = FakeController()
+        val vm = vmInReview(controller, repo)
+        val raw = requireNotNull(vm.state.value.draftRoom)
+        val preview = requireNotNull(vm.roomAsSaved())
+        assertCornersEqual(RoomOps.scale(raw, calibration.factor, calibration.origin).corners, preview.corners)
+        // Same stats as the saved room (4 × 3 m scaled by 1.02), not the raw draft's.
+        val metric = vm.state.value.settings.copy(unitSystem = com.oroplex.floorplan.core.model.UnitSystem.METRIC)
+        assertEquals(reviewStats(RoomOps.scale(raw, 1.02, calibration.origin), metric), reviewStats(preview, metric))
+        vm.saveAndScanNext(controller)
+        assertCornersEqual(preview.corners, savedRooms(repo).single().corners)
+    }
+
+    @Test
+    fun uncalibratedReviewRoomIsTheDraft() {
+        val controller = FakeController()
+        val vm = vmInReview(controller)
+        assertEquals(vm.state.value.draftRoom, vm.roomAsSaved())
+    }
+
+    @Test
+    fun firstSavedRoomSetsTheSessionAxisAndLaterRoomsUseIt() {
         val repo = FakeRepository(project)
         val controller = FakeController()
         val vm = vmInReview(controller, repo)
+        val first = requireNotNull(vm.state.value.draft.solve)
+        val firstId = vm.state.value.draft.id
         vm.saveAndScanNext(controller)
-        val s = vm.state.value
-        assertEquals(1, s.sessionRooms.size)
-        assertEquals(0.0, sessionAxisHint(s.sessionRooms) ?: Double.NaN, 1e-9)
+        assertEquals(SessionAxis(canonicalAxis(first.dominantAngle), firstId), vm.state.value.sessionAxis)
+
+        // ARCore refined the map: the first room's frame turned by 0.004 rad since it was captured, the new
+        // room's anchor by 0.001 rad. The next room is squared to the shared axis in its own frame.
+        vm.skipCeiling(controller)
+        val draftId = vm.state.value.draft.id
+        controller.corrections = mapOf(firstId to RigidTransform2(0.004, Vec2.ZERO), draftId to RigidTransform2(0.001, Vec2.ZERO))
+        vm.onBackground(controller)
+        rectangleWalls().forEach { capture(vm, controller, it) }
+        val second = requireNotNull(vm.state.value.draft.solve)
+        assertEquals(0.0, axisDistance(second.dominantAngle, first.dominantAngle + 0.004 - 0.001), 1e-9)
+
+        // A third room still uses the first room's axis, not a re-estimate.
+        vm.closeRoom()
+        vm.finishOpenings()
+        vm.saveAndScanNext(controller)
+        assertEquals(firstId, vm.state.value.sessionAxis?.roomId)
+    }
+
+    @Test
+    fun sessionAxisIsClearedWhenTheSessionResets() {
+        val first = FakeController(sessionId = "s1")
+        val vm = vmInReview(first)
+        vm.saveAndScanNext(first)
+        assertNotNull(vm.state.value.sessionAxis)
+        vm.attach(FakeController(sessionId = "s2"))
+        assertNull(vm.state.value.sessionAxis)
     }
 
     // ---- exiting / session ----
@@ -743,7 +894,11 @@ class CaptureViewModelTest {
         assertNull(s.floorY)
         assertFalse(s.draft.hasCaptures)
         assertEquals("s2", s.sessionId)
-        assertTrue(s.messages.last().text.contains("restarted"))
+        // A persistent notice explains it (one wall can't be saved on its own).
+        assertEquals(InterruptedScan(savedRoomCount = 0, lostRoom = true, restorable = null), s.interrupted)
+        assertTrue(interruptedScanText(requireNotNull(s.interrupted)).contains("needs to be scanned again"))
+        vm.dismissInterrupted()
+        assertNull(vm.state.value.interrupted)
     }
 
     @Test
@@ -827,20 +982,377 @@ class CaptureViewModelTest {
         assertEquals(CoachKind.AIM_HIGHER, vm.coaching.value?.kind)
     }
 
+    // ---- Back / leaving the scan ----
+
+    @Test
+    fun backInWallsWithNothingCapturedStepsBackToTheCeiling() {
+        val controller = FakeController()
+        controller.frames.value = trackingFrame()
+        val vm = vmInCeiling(controller)
+        controller.results += MeasureResult.Height(2.6, samples = 15, spread = 0.01)
+        vm.measureCeiling(controller)
+        assertEquals(CaptureStep.WALLS, vm.state.value.step)
+
+        vm.onBack(controller)
+        val s = vm.state.value
+        assertEquals(CaptureStep.CEILING, s.step)
+        assertEquals(2.6, s.draft.ceilingHeight ?: Double.NaN, 1e-12)
+        assertTrue(s.draft.ceilingMeasured)
+        assertTrue(s.canRelockFloor)
+        assertFalse(s.confirmEndSession)
+        assertFalse(s.finished)
+        assertTrue(stepInstruction(s, FloorStatus.CONFIDENT).contains("Keep it"))
+
+        vm.keepCeiling(controller)
+        assertEquals(CaptureStep.WALLS, vm.state.value.step)
+        assertEquals(2.6, vm.state.value.draft.ceilingHeight ?: Double.NaN, 1e-12)
+
+        // Once something is captured, Back asks instead of stepping back.
+        capture(vm, controller, wall())
+        vm.onBack(controller)
+        assertEquals(CaptureStep.WALLS, vm.state.value.step)
+        assertTrue(vm.state.value.confirmDiscard)
+    }
+
+    @Test
+    fun relockingKeepsAMeasuredCeilingWhereItIs() {
+        val controller = FakeController()
+        controller.frames.value = trackingFrame()
+        val vm = vmInCeiling(controller)
+        controller.results += MeasureResult.Height(2.6, samples = 15, spread = 0.01)
+        vm.measureCeiling(controller)
+        vm.onBack(controller)
+        vm.relockFloor()
+        // The room is a step down: its floor is 0.2 m lower, so the same ceiling is 2.8 m above it.
+        controller.results += MeasureResult.FloorLocked(-0.2)
+        vm.lockFloor(controller)
+        val s = vm.state.value
+        assertEquals(CaptureStep.CEILING, s.step)
+        assertEquals(2.8, s.draft.ceilingHeight ?: Double.NaN, 1e-12)
+        assertTrue(s.draft.ceilingMeasured)
+    }
+
+    @Test
+    fun backRightAfterRelockKeepsThePreviousFloor() {
+        val controller = FakeController()
+        controller.frames.value = trackingFrame()
+        val vm = vmInCeiling(controller)
+        vm.relockFloor()
+        assertEquals(CaptureStep.FIND_FLOOR, vm.state.value.step)
+        vm.onBack(controller)
+        val s = vm.state.value
+        assertEquals(CaptureStep.CEILING, s.step)
+        assertEquals(0.0, s.floorY ?: Double.NaN, 0.0)
+        assertNull(s.rejectedFloorY)
+        assertFalse(s.confirmEndSession)
+        // From the ceiling step, Back now asks before ending the scan.
+        vm.onBack(controller)
+        assertTrue(vm.state.value.confirmEndSession)
+    }
+
+    @Test
+    fun backBetweenRoomsAsksBeforeEndingTheScan() {
+        val repo = FakeRepository(project)
+        val controller = FakeController()
+        val vm = vmInReview(controller, repo)
+        val raw = requireNotNull(vm.state.value.draftRoom)
+        vm.saveAndScanNext(controller)
+        assertEquals(CaptureStep.CEILING, vm.state.value.step)
+
+        vm.onBack(controller)
+        assertTrue(vm.state.value.confirmEndSession)
+        assertFalse(vm.state.value.confirmDiscard)
+        assertFalse(vm.state.value.finished)
+        vm.dismissEndSession()
+        assertFalse(vm.state.value.confirmEndSession)
+
+        // The close button and the AR host's error screen ask the same way.
+        vm.requestExit(controller)
+        assertTrue(vm.state.value.confirmEndSession)
+        vm.dismissEndSession()
+        vm.requestExit(null)
+        assertTrue(vm.state.value.confirmEndSession)
+
+        val t = RigidTransform2(0.0, Vec2(0.1, 0.0))
+        controller.corrections = mapOf(raw.id to t)
+        vm.endSession(controller)
+        assertTrue(vm.state.value.finished)
+        assertCornersEqual(RoomOps.transform(raw, t).corners, savedRooms(repo).single().corners)
+    }
+
+    @Test
+    fun backOnTheFirstRoomAsksOnlyOnceAFloorIsLocked() {
+        val controller = FakeController()
+        controller.frames.value = trackingFrame()
+        val vm = vmInCeiling(controller)
+        vm.onBack(controller)
+        assertTrue(vm.state.value.confirmEndSession)
+        assertFalse(vm.state.value.finished)
+
+        // Before anything is locked or saved there is nothing to lose: Back leaves right away.
+        val fresh = newVm()
+        fresh.attach(controller)
+        fresh.onBack(controller)
+        assertTrue(fresh.state.value.finished)
+        assertFalse(fresh.state.value.confirmEndSession)
+    }
+
+    @Test
+    fun discardRoomKeepsScanningInTheSameSession() {
+        val repo = FakeRepository(project)
+        val controller = FakeController()
+        val vm = vmInReview(controller, repo)
+        vm.saveAndScanNext(controller)
+        vm.skipCeiling(controller)
+        capture(vm, controller, wall())
+        val discardedId = vm.state.value.draft.id
+        vm.requestExit(controller)
+        assertTrue(vm.state.value.confirmDiscard)
+
+        vm.discardRoom()
+        val s = vm.state.value
+        assertFalse(s.confirmDiscard)
+        assertFalse(s.finished)
+        assertEquals(CaptureStep.CEILING, s.step)
+        assertFalse(s.draft.hasCaptures)
+        assertTrue(s.draft.id != discardedId)
+        assertEquals(1, s.sessionRoomIds.size)
+        assertEquals(0.0, s.floorY ?: Double.NaN, 0.0)
+        assertEquals("session", s.sessionId)
+        assertEquals(1, savedRooms(repo).size)
+    }
+
+    // ---- wall band ----
+
+    @Test
+    fun wallCapturesUseAGenerousBandTopUnlessTheCeilingIsMeasured() {
+        val controller = FakeController()
+        val vm = vmInWalls(controller) // ceiling skipped
+        capture(vm, controller, wall())
+        val default = vm.state.value.settings.defaultCeilingHeight
+        val skipped = controller.requests.filterIsInstance<MeasureRequest.Wall>().last()
+        assertEquals(max(default, 2.4) + 0.3, skipped.ceilingY ?: Double.NaN, 1e-12)
+
+        // The coach's "aim lower" uses the same band top.
+        val nearTop = ReticleHit(Vec3(0.0, (skipped.ceilingY ?: 0.0) - 0.1, -2.0), SurfaceKind.DEPTH, 2.0, null)
+        for (i in 0..30) vm.onFrame(trackingFrame(reticle = nearTop, t = i * 33_333_333L), controller)
+        assertEquals(CoachKind.AIM_LOWER, vm.coaching.value?.kind)
+
+        val measured = FakeController()
+        measured.frames.value = trackingFrame()
+        val vm2 = vmInCeiling(measured)
+        measured.results += MeasureResult.Height(2.61, samples = 15, spread = 0.01)
+        vm2.measureCeiling(measured)
+        capture(vm2, measured, wall())
+        assertEquals(2.61, measured.requests.filterIsInstance<MeasureRequest.Wall>().last().ceilingY ?: Double.NaN, 1e-12)
+    }
+
+    @Test
+    fun wallBandTop() {
+        val settings = project.settings.copy(defaultCeilingHeight = 2.0)
+        val d = RoomDraft(id = "d")
+        assertEquals(1.0 + 2.4 + 0.3, wallBandTopY(d, 1.0, settings), 1e-12) // default below 2.4 m
+        assertEquals(2.7 + 0.3, wallBandTopY(d, 0.0, settings.copy(defaultCeilingHeight = 2.7)), 1e-12)
+        assertEquals(2.9 + 0.3, wallBandTopY(d.copy(ceilingHeight = 2.9), 0.0, settings), 1e-12) // "Same as last room"
+        assertEquals(2.55, wallBandTopY(d.copy(ceilingHeight = 2.55, ceilingMeasured = true), 0.0, settings), 1e-12)
+        assertEquals(2.4 + 0.3, wallBandTopY(d.copy(ceilingHeight = Double.NaN), 0.0, settings.copy(defaultCeilingHeight = Double.NaN)), 1e-12)
+    }
+
+    // ---- straightening a finished scan ----
+
+    private fun WallObservation.rotated(a: Double) = copy(
+        line = Line2.of(line.point.rotated(a), line.direction.rotated(a)),
+        extentStart = extentStart.rotated(a),
+        extentEnd = extentEnd.rotated(a),
+        viewer = viewer.rotated(a),
+    )
+
+    /** Largest distance of the room's edge directions from the page axes (radians, mod 90°). */
+    private fun tiltOf(room: Room): Double = room.corners.indices.maxOf { i ->
+        val e = room.corners[(i + 1) % room.corners.size] - room.corners[i]
+        axisDistance(e.angle(), 0.0)
+    }
+
+    private fun scanTiltedRoom(vm: CaptureViewModel, controller: FakeController, angle: Double): Room {
+        rectangleWalls().forEach { capture(vm, controller, it.rotated(angle)) }
+        vm.closeRoom()
+        vm.finishOpenings()
+        return requireNotNull(vm.state.value.draftRoom)
+    }
+
+    @Test
+    fun finishSquaresAFirstScanToThePage() {
+        val repo = FakeRepository(project)
+        val controller = FakeController()
+        val vm = vmInWalls(controller, repo)
+        val raw = scanTiltedRoom(vm, controller, 0.2)
+        assertEquals(0.2, tiltOf(raw), 1e-6)
+        vm.saveAndFinish(controller)
+        val saved = savedRooms(repo).single()
+        assertEquals(0.0, tiltOf(saved), 1e-9)
+        assertEquals(Polygons.area(raw.corners), Polygons.area(saved.corners), 1e-9)
+    }
+
+    @Test
+    fun endingTheScanBetweenRoomsSquaresItToo() {
+        val repo = FakeRepository(project)
+        val controller = FakeController()
+        val vm = vmInWalls(controller, repo)
+        scanTiltedRoom(vm, controller, 0.2)
+        vm.saveAndScanNext(controller)
+        vm.requestExit(controller)
+        vm.endSession(controller)
+        assertTrue(vm.state.value.finished)
+        assertEquals(0.0, tiltOf(savedRooms(repo).single()), 1e-9)
+    }
+
+    @Test
+    fun finishKeepsTheHeadingOfAFloorWithOtherRooms() {
+        val drawn = room("drawn", "Closet", RoomType.CLOSET) // MANUAL, no session
+        val earlier = room("old", "Hall", RoomType.HALLWAY).copy(sessionId = "earlier", captureMethod = CaptureMethod.WALLS)
+        for (other in listOf(drawn, earlier)) {
+            val repo = FakeRepository(project.copy(floors = listOf(Floor(id = floorId, name = "Main Floor", rooms = listOf(other)))))
+            val controller = FakeController()
+            val vm = vmInWalls(controller, repo)
+            val raw = scanTiltedRoom(vm, controller, 0.2)
+            vm.saveAndFinish(controller)
+            val saved = savedRooms(repo)
+            assertEquals(other.name, 0.2, tiltOf(saved.single { it.id == raw.id }), 1e-6)
+            assertEquals(other, saved.single { it.id == other.id })
+        }
+    }
+
+    // ---- surviving process death ----
+
+    @Test
+    fun snapshotRestoresTheFlowAfterProcessDeath() {
+        val repo = FakeRepository(project)
+        val store = CaptureSnapshotStore.InMemory()
+        val first = FakeController(sessionId = "s1")
+        val vm = vmInReview(first, repo, newVm(repo, store = store))
+        val raw = requireNotNull(vm.state.value.draftRoom)
+        vm.saveAndScanNext(first)
+        vm.skipCeiling(first)
+        rectangleWalls().take(2).forEach { capture(vm, first, it) }
+        val t = RigidTransform2(0.01, Vec2(0.05, 0.0))
+        first.corrections = mapOf(raw.id to t)
+        vm.onBackground(first) // ON_STOP: corrections go into the snapshot
+        store.saveNow()
+        assertNotNull(store.saved)
+
+        // Android kills the process; navigation restores the screen with a new ViewModel...
+        val restored = newVm(repo, store = CaptureSnapshotStore.InMemory(store.saved))
+        val s = restored.state.value
+        assertEquals(CaptureStep.WALLS, s.step)
+        assertEquals("s1", s.sessionId)
+        assertEquals(setOf(raw.id), s.sessionRoomIds)
+        assertEquals(2, s.draft.observations.size)
+        assertEquals(0.0, s.floorY ?: Double.NaN, 0.0)
+        assertEquals(vm.state.value.sessionAxis, s.sessionAxis)
+
+        // ...and a new AR session, whose frame has nothing to do with the old one.
+        restored.attach(FakeController(sessionId = "s2"))
+        val after = restored.state.value
+        assertEquals(CaptureStep.FIND_FLOOR, after.step)
+        assertEquals("s2", after.sessionId)
+        assertTrue(after.sessionRoomIds.isEmpty())
+        assertEquals(InterruptedScan(savedRoomCount = 1, lostRoom = true, restorable = null), after.interrupted)
+        // The saved room got the corrections taken when the app went to the background.
+        assertCornersEqual(RoomOps.transform(raw, t).corners, savedRooms(repo).single().corners)
+        assertTrue(interruptedScanText(requireNotNull(after.interrupted)).contains("Snap to neighbour"))
+    }
+
+    @Test
+    fun aSolvedRoomInProgressCanBeSavedAfterProcessDeath() {
+        val repo = FakeRepository(project)
+        val store = CaptureSnapshotStore.InMemory()
+        val first = FakeController(sessionId = "s1")
+        val vm = vmInReview(first, repo, newVm(repo, store = store))
+        val raw = requireNotNull(vm.state.value.draftRoom)
+        val t = RigidTransform2(0.02, Vec2(0.1, -0.1))
+        first.corrections = mapOf(raw.id to t)
+        vm.onBackground(first)
+        store.saveNow()
+
+        val restored = newVm(repo, store = CaptureSnapshotStore.InMemory(store.saved))
+        assertEquals(CaptureStep.REVIEW, restored.state.value.step)
+        restored.attach(FakeController(sessionId = "s2"))
+        val notice = requireNotNull(restored.state.value.interrupted)
+        assertFalse(notice.lostRoom)
+        assertNotNull(notice.restorable)
+        assertTrue(interruptedScanText(notice).contains("can still be saved"))
+
+        restored.saveInterruptedRoom()
+        val saved = savedRooms(repo).single()
+        assertEquals("s1", saved.sessionId) // it shares the old session's frame
+        assertEquals("Room", saved.name)
+        assertCornersEqual(RoomOps.transform(raw, t).corners, saved.corners)
+        assertNull(restored.state.value.interrupted)
+        assertEquals(CaptureStep.FIND_FLOOR, restored.state.value.step)
+    }
+
+    @Test
+    fun leavingARestoredScanBeforeTheCameraIsBackStillAppliesItsCorrections() {
+        val repo = FakeRepository(project)
+        val store = CaptureSnapshotStore.InMemory()
+        val first = FakeController(sessionId = "s1")
+        val vm = vmInReview(first, repo, newVm(repo, store = store))
+        val raw = requireNotNull(vm.state.value.draftRoom)
+        vm.saveAndScanNext(first)
+        val t = RigidTransform2(0.0, Vec2(0.2, 0.1))
+        first.corrections = mapOf(raw.id to t)
+        vm.onBackground(first)
+        store.saveNow()
+
+        // Restored, but the user backs out of the camera-permission screen (no AR session attached).
+        val restored = newVm(repo, store = CaptureSnapshotStore.InMemory(store.saved))
+        restored.requestExit(null)
+        assertTrue(restored.state.value.confirmEndSession)
+        restored.endSession(null)
+        assertTrue(restored.state.value.finished)
+        assertCornersEqual(RoomOps.transform(raw, t).corners, savedRooms(repo).single().corners)
+    }
+
+    @Test
+    fun snapshotIsClearedWhenTheFlowEndsAndIgnoredForAnotherFloor() {
+        val repo = FakeRepository(project)
+        val store = CaptureSnapshotStore.InMemory()
+        val controller = FakeController()
+        val idle = newVm(repo, store = store)
+        store.saveNow()
+        assertNull(store.saved) // nothing started yet
+
+        val vm = vmInReview(controller, repo, newVm(repo, store = store))
+        store.saveNow()
+        val json = requireNotNull(store.saved)
+        vm.saveAndFinish(controller)
+        store.saveNow()
+        assertNull(store.saved)
+        assertFalse(idle.state.value.finished)
+
+        val other = CaptureViewModel(repo, project.id, "other-floor", OneTimeFlag.InMemory(true), snapshotStore = CaptureSnapshotStore.InMemory(json))
+        assertNull(other.state.value.sessionId)
+        val corrupt = newVm(repo, store = CaptureSnapshotStore.InMemory("{not json"))
+        assertNull(corrupt.state.value.sessionId)
+        assertEquals(CaptureStep.FIND_FLOOR, corrupt.state.value.step)
+    }
+
     // ---- pure helpers ----
 
     @Test
-    fun defaultRoomNameNumbersByType() {
-        assertEquals("Bedroom", defaultRoomName(RoomType.BEDROOM, emptyList(), null))
-        val rooms = listOf(room("a", "Bedroom", RoomType.BEDROOM))
-        assertEquals("Bedroom 2", defaultRoomName(RoomType.BEDROOM, rooms, null))
-        // The room being named doesn't count against itself.
-        assertEquals("Bedroom", defaultRoomName(RoomType.BEDROOM, rooms, "a"))
-        val more = rooms + room("b", "Bedroom 2", RoomType.BEDROOM) + room("c", "Bedroom 3", RoomType.OTHER)
-        assertEquals("Bedroom 4", defaultRoomName(RoomType.BEDROOM, more, null))
-        assertEquals("Kitchen", defaultRoomName(RoomType.KITCHEN, more, null))
-        // A custom-named room of the same type still bumps the number.
-        assertEquals("Office 2", defaultRoomName(RoomType.OFFICE, listOf(room("d", "Study", RoomType.OFFICE)), null))
+    fun reviewNamesRoomsWithTheSharedNumberingRule() {
+        val existing = listOf(room("a", "Bedroom", RoomType.BEDROOM), room("b", "Room", RoomType.OTHER))
+        val repo = FakeRepository(project.copy(floors = listOf(Floor(id = floorId, name = "Main Floor", rooms = existing))))
+        val controller = FakeController()
+        val vm = vmInReview(controller, repo)
+        assertEquals(RoomNames.unique(RoomType.OTHER, existing, vm.state.value.draft.id), vm.state.value.draft.name)
+        assertEquals("Room 2", vm.state.value.draft.name)
+        vm.setType(RoomType.BEDROOM)
+        assertEquals("Bedroom 2", vm.state.value.draft.name)
+        // A typed name is kept when the type changes.
+        vm.setName("Guest room")
+        vm.setType(RoomType.OFFICE)
+        assertEquals("Guest room", vm.state.value.draft.name)
     }
 
     @Test
@@ -896,9 +1408,17 @@ class CaptureViewModelTest {
     @Test
     fun floorStatusAndExpectedDurations() {
         assertEquals(FloorStatus.SEARCHING, floorStatus(ArFrameState()))
-        assertEquals(FloorStatus.FOUND, floorStatus(trackingFrame(floorArea = 0.4)))
+        assertEquals(FloorStatus.FOUND, floorStatus(trackingFrame(floorArea = 0.4, lockable = false)))
+        assertEquals(FloorStatus.FOUND, floorStatus(trackingFrame(floorY = 0.0, localFloorY = null)))
         assertEquals(FloorStatus.CONFIDENT, floorStatus(trackingFrame(floorArea = 1.5)))
-        assertEquals(FloorStatus.SEARCHING, floorStatus(trackingFrame(floorY = Double.NaN)))
+        assertEquals(FloorStatus.MANUAL_ONLY, floorStatus(trackingFrame(camera = Vec3(0.0, 0.85, 0.0), lockable = false)))
+        assertEquals(FloorStatus.SEARCHING, floorStatus(trackingFrame(floorY = Double.NaN, localFloorY = null)))
+        // The instruction only promises an auto-lock when one can happen.
+        val ui = CaptureUiState(draft = RoomDraft(id = "d"))
+        assertTrue(stepInstruction(ui, FloorStatus.CONFIDENT).contains("Hold still"))
+        assertFalse(stepInstruction(ui, FloorStatus.FOUND).contains("Hold still"))
+        assertTrue(stepInstruction(ui, FloorStatus.FOUND).contains("Tap Lock floor"))
+        assertEquals("Floor found. Tap Lock floor.", stepInstruction(ui, FloorStatus.MANUAL_ONLY))
         val d = RoomDraft(id = "d")
         assertTrue(expectedMeasureMillis(CaptureStep.WALLS, d) > expectedMeasureMillis(CaptureStep.CORNERS, d))
         assertEquals(expectedMeasureMillis(CaptureStep.CORNERS, d), expectedMeasureMillis(CaptureStep.WALLS, d.copy(baseline = BaselineCapture())))
@@ -980,6 +1500,12 @@ class CaptureViewModelTest {
         corners = listOf(Vec2(0.0, 0.0), Vec2(3.0, 0.0), Vec2(3.0, 3.0), Vec2(0.0, 3.0)),
     )
 
+    /** Distance between two squaring axes (mod 90°), radians. */
+    private fun axisDistance(a: Double, b: Double): Double {
+        val d = abs(canonicalAxis(a) - canonicalAxis(b))
+        return min(d, PI / 2 - d)
+    }
+
     private class FakeController(override val sessionId: String = "session") : ArCaptureController {
         val frames = MutableStateFlow(ArFrameState())
         override val frameState: StateFlow<ArFrameState> get() = frames
@@ -987,6 +1513,11 @@ class CaptureViewModelTest {
         val requests = mutableListOf<MeasureRequest>()
         val anchors = mutableListOf<Pair<String, Vec3>>()
         var corrections: Map<String, RigidTransform2> = emptyMap()
+        val referenceFloors = mutableListOf<Double?>()
+
+        override fun setReferenceFloor(y: Double?) {
+            referenceFloors += y
+        }
 
         override suspend fun measure(request: MeasureRequest): MeasureResult {
             requests += request

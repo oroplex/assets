@@ -129,7 +129,7 @@ internal data class OverlayGeometry(
                 Polygons.edges(r.corners).filter { it.length > 1e-6 }.map { e ->
                     // CCW outline: the left normal of an edge points into the room.
                     val inward = e.direction.perp()
-                    EdgeLine(e.a, e.b, e.midpoint + inward * 0.25, formatLengthSafe(e.length, settings))
+                    EdgeLine(e.a, e.b, e.midpoint + inward * 0.25, formatLengthSafe(ui.savedLength(e.length), settings))
                 }
             }.orEmpty()
             val placed = room?.let { r ->
@@ -183,7 +183,7 @@ internal fun CaptureOverlay(
     modifier: Modifier = Modifier,
 ) {
     val textMeasurer = rememberTextMeasurer(cacheSize = 48)
-    val geometry = remember(ui.draft, ui.settings, ui.step, ui.floorY, ui.sessionId) { OverlayGeometry.from(ui) }
+    val geometry = remember(ui.draft, ui.settings, ui.step, ui.floorY, ui.sessionId, ui.floorCalibration) { OverlayGeometry.from(ui) }
     val settings = ui.settings
     Canvas(modifier) {
         val f = frame()

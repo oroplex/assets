@@ -59,7 +59,7 @@ internal enum class TipArt { FLOOR, CEILING, WALLS, CLOSE }
 internal val SCAN_TIPS = listOf(
     ScanTip(
         "Find the floor",
-        "Point the phone at the floor and move it slowly until the floor locks.",
+        "Point the phone at open floor and move it slowly. It locks by itself, or tap Lock floor.",
         TipArt.FLOOR,
     ),
     ScanTip(

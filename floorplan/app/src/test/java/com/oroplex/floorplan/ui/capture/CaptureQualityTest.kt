@@ -3,14 +3,17 @@ package com.oroplex.floorplan.ui.capture
 import com.oroplex.floorplan.core.geometry.Line2
 import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.model.Calibration
+import com.oroplex.floorplan.core.model.CaptureMethod
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.Room
 import com.oroplex.floorplan.core.model.UnitSystem
 import com.oroplex.floorplan.core.model.WallObservation
 import com.oroplex.floorplan.core.model.WallSource
 import com.oroplex.floorplan.core.solve.QualityLevel
+import com.oroplex.floorplan.core.solve.RoomQuality
 import com.oroplex.floorplan.core.solve.RoomQualityReport
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -41,12 +44,49 @@ class CaptureQualityTest {
         assertEquals(CaptureGrade.POOR, wallGrade(observation(confidence = 0.2)))
     }
 
+    /** A depth fit of the wall at plan y = [range] seen head-on from the origin. */
+    private fun atRange(range: Double, rms: Double, confidence: Double = 0.85) = WallObservation(
+        line = Line2.of(Vec2(0.0, range), Vec2(-1.0, 0.0)),
+        extentStart = Vec2(1.0, range),
+        extentEnd = Vec2(-1.0, range),
+        source = WallSource.DEPTH_FIT,
+        rmsResidual = rms,
+        pointCount = 300,
+        confidence = confidence,
+        viewer = Vec2.ZERO,
+    )
+
     @Test
     fun wallGradeIsCappedByNoiseAndPointCount() {
-        assertEquals(CaptureGrade.POOR, wallGrade(observation(confidence = 0.9, rms = 0.06)))
+        assertEquals(CaptureGrade.POOR, wallGrade(atRange(1.0, rms = 0.06, confidence = 0.9)))
         assertEquals(CaptureGrade.FAIR, wallGrade(observation(confidence = 0.9, points = 30)))
         // A thin detected plane has no point count to speak of; it is graded by confidence only.
         assertEquals(CaptureGrade.GOOD, wallGrade(observation(confidence = 0.8, points = 0, rms = 0.0, source = WallSource.DETECTED_PLANE)))
+        assertEquals(CaptureGrade.GOOD, wallGrade(observation(confidence = 0.8, points = 0, rms = 0.08, source = WallSource.DETECTED_PLANE)))
+    }
+
+    @Test
+    fun noiseLimitGrowsWithRangeLikeTheReviewBadge() {
+        // ±3.1 cm per point is normal from 2.5 m (depth noise grows with range): a good, not noisy, wall.
+        val far = atRange(2.5, rms = 0.031)
+        assertEquals(CaptureGrade.GOOD, wallGrade(far))
+        assertFalse(isNoisy(far))
+        // The same noise from 1 m is noisy: at most FAIR, with the review's advice.
+        val near = atRange(1.0, rms = 0.031)
+        assertEquals(CaptureGrade.FAIR, wallGrade(near))
+        assertTrue(isNoisy(near))
+        assertTrue(wallQualityText(near, PlanSettings(unitSystem = UnitSystem.METRIC)).contains("Noisy"))
+        // 6 cm is normal at 4 m, rough at 1 m.
+        assertEquals(CaptureGrade.GOOD, wallGrade(atRange(4.0, rms = 0.06)))
+        assertEquals(CaptureGrade.POOR, wallGrade(atRange(1.0, rms = 0.06)))
+        // The chips use exactly the shared rule the review's quality reasons use.
+        for (range in listOf(0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0)) {
+            for (rms in listOf(0.01, 0.02, 0.025, 0.03, 0.04, 0.05, 0.07)) {
+                val o = atRange(range, rms)
+                assertEquals("$range m, $rms", rms > RoomQuality.noisyLimit(o), isNoisy(o))
+                assertEquals("$range m, $rms", isNoisy(o), wallGrade(o) != CaptureGrade.GOOD)
+            }
+        }
     }
 
     @Test
@@ -120,6 +160,15 @@ class CaptureQualityTest {
         val poor = reviewQuality(RoomQualityReport(QualityLevel.POOR, 0.3, listOf(" Wall 3 was noisy ", "", "Wall 3 was noisy", "a", "b", "c")))
         assertEquals("Needs a check", poor?.label)
         assertEquals(listOf("Wall 3 was noisy", "a", "b", "c"), poor?.reasons)
+    }
+
+    @Test
+    fun reviewQualityNumbersWallsByCaptureAndNeverThrows() {
+        // The badge is advisory: a broken room grades (or hides), it never throws.
+        val broken = Room(id = "b", name = "b", corners = listOf(Vec2.ZERO, Vec2(Double.NaN, 0.0), Vec2(1.0, 1.0)), captureMethod = CaptureMethod.WALLS)
+        safeAssess(broken, UnitSystem.METRIC) // no exception
+        val manual = safeAssess(square, UnitSystem.IMPERIAL)
+        assertEquals(QualityLevel.MANUAL, manual?.level)
     }
 
     @Test

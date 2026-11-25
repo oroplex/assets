@@ -6,13 +6,15 @@ import com.oroplex.floorplan.ar.TrackingProblem
 import com.oroplex.floorplan.ar.TrackingStatus
 import com.oroplex.floorplan.core.geometry.Vec3
 import com.oroplex.floorplan.core.model.UnitSystem
+import kotlin.math.abs
+import kotlin.math.acos
 
 /** What the live coaching banner is about. Declared from most to least important. */
 enum class CoachKind {
     TRACKING,
     HOLD_STILL,
     TOO_FAST,
-    LOWER_FLOOR,
+    FLOOR_LEVEL,
     TOO_FAR,
     TOO_CLOSE,
     AIM_HIGHER,
@@ -33,8 +35,13 @@ internal data class CoachInput(
     val step: CaptureStep,
     /** Locked floor height (world Y), if any. */
     val floorY: Double?,
-    /** Measured ceiling height in world Y (floorY + measured height), or null when not measured. */
-    val ceilingY: Double?,
+    /**
+     * Top of the wall-sampling height band in world Y (the same value the wall capture uses, see
+     * [wallBandTopY]), or null without a locked floor. Aim points near it are filtered out of a wall fit.
+     */
+    val bandTopY: Double?,
+    /** [bandTopY] is a measured ceiling (rather than an assumed band top). */
+    val ceilingMeasured: Boolean,
     val measuring: Boolean,
     /** The user is marking points on the floor (baseline taps, corners, door edges), not a wall surface. */
     val markingFloorPoints: Boolean,
@@ -45,16 +52,20 @@ internal data class CoachInput(
 
 /**
  * Turns the stream of AR frames into at most one short coaching hint at a time: tracking problems, moving
- * too fast (camera speed from successive camera positions and frame timestamps), being too far from or too
- * close to the wall, aiming at the floor or ceiling while capturing walls, and a few step-specific nudges.
+ * or turning too fast (camera speed from successive camera positions, angular speed from successive view
+ * directions, both over [SPEED_WINDOW_NS]), being too far from or too close to the wall, aiming outside the
+ * wall band while capturing walls, the room's floor being at another level than the lock, and a few
+ * step-specific nudges.
  *
  * Hints are debounced so the banner never flickers: a condition must persist for a short onset time
  * (per kind) before it shows, a shown hint is kept while its condition holds and for [HOLD_NS] after it
  * clears, and a more important hint replaces a less important one as soon as it is due. Feed every frame
  * to [update]; it is deterministic for a given frame sequence (time comes from [ArFrameState.timestampNs]).
+ *
+ * The thresholds are named constants in the companion so they can be tuned on the target device.
  */
 internal class CaptureCoach {
-    private class Sample(val t: Long, val p: Vec3)
+    private class Sample(val t: Long, val p: Vec3, val forward: Vec3?)
 
     private val samples = ArrayDeque<Sample>()
     private var nowNs = 0L
@@ -68,6 +79,10 @@ internal class CaptureCoach {
 
     /** Smoothed camera speed in m/s over the last [SPEED_WINDOW_NS], or null while unknown. */
     var speed: Double? = null
+        private set
+
+    /** Smoothed turning speed of the view direction in degrees per second, or null while unknown. */
+    var angularSpeed: Double? = null
         private set
 
     fun update(frame: ArFrameState, input: CoachInput): CoachingHint? {
@@ -91,12 +106,14 @@ internal class CaptureCoach {
         if (frame.tracking != TrackingStatus.TRACKING || p == null || !p.isFinite()) {
             samples.clear()
             speed = null
+            angularSpeed = null
             return
         }
+        val forward = frame.cameraForward?.takeIf { it.isFinite() && it.length > 0.5 }?.normalized()
         val last = samples.lastOrNull()
         if (last != null && frame.timestampNs == last.t) return // same camera image
         if (last != null && frame.timestampNs < last.t) samples.clear() // new timeline (session restarted)
-        samples.addLast(Sample(frame.timestampNs, p))
+        samples.addLast(Sample(frame.timestampNs, p, forward))
         while (samples.size > 1 && frame.timestampNs - samples.first().t > SPEED_WINDOW_NS) samples.removeFirst()
         val first = samples.first()
         val dt = (frame.timestampNs - first.t) / 1e9
@@ -104,10 +121,17 @@ internal class CaptureCoach {
         if (v != null && v > MAX_PLAUSIBLE_SPEED) {
             // A pose jump (ARCore relocalized), not real motion: start over from this pose.
             samples.clear()
-            samples.addLast(Sample(frame.timestampNs, p))
+            samples.addLast(Sample(frame.timestampNs, p, forward))
             speed = null
+            angularSpeed = null
+            return
+        }
+        speed = v
+        val f0 = first.forward
+        angularSpeed = if (dt >= MIN_SPEED_SPAN_S && f0 != null && forward != null) {
+            Math.toDegrees(acos((f0 dot forward).coerceIn(-1.0, 1.0))) / dt
         } else {
-            speed = v
+            null
         }
     }
 
@@ -122,11 +146,15 @@ internal class CaptureCoach {
         val out = ArrayList<CoachingHint>(3)
         val units = input.units
         val v = speed
+        val w = angularSpeed
         val scanning = input.step == CaptureStep.WALLS || input.step == CaptureStep.CORNERS || input.step == CaptureStep.OPENINGS
-        if (input.measuring && v != null && v > HOLD_STILL_SPEED) {
-            out += CoachingHint(CoachKind.HOLD_STILL, CoachTone.WARNING, "Hold still until the ring fills.")
-        } else if (v != null && v > (if (scanning) MAX_SCAN_SPEED else MAX_WALK_SPEED)) {
-            out += CoachingHint(
+        val maxSpeed = if (scanning) MAX_SCAN_SPEED else MAX_WALK_SPEED
+        when {
+            input.measuring && ((v != null && v > HOLD_STILL_SPEED) || (w != null && w > HOLD_STILL_TURN_DEG_S)) ->
+                out += CoachingHint(CoachKind.HOLD_STILL, CoachTone.WARNING, "Hold still until the ring fills.")
+            w != null && w > MAX_TURN_DEG_S ->
+                out += CoachingHint(CoachKind.TOO_FAST, CoachTone.WARNING, "Turn the phone more slowly so tracking keeps up.")
+            v != null && v > maxSpeed -> out += CoachingHint(
                 CoachKind.TOO_FAST,
                 CoachTone.WARNING,
                 if (scanning) "Slow down. Move the phone gently so tracking keeps up." else "Walk a little slower so tracking keeps up.",
@@ -134,16 +162,17 @@ internal class CaptureCoach {
         }
 
         val floorY = input.floorY
-        val trackedFloor = frame.floorY
-        if (input.step == CaptureStep.CEILING && input.canRelockFloor && floorY != null && trackedFloor != null &&
-            trackedFloor.isFinite() && frame.floorArea >= CaptureViewModel.AUTO_LOCK_MIN_AREA &&
-            floorY - trackedFloor > LOWER_FLOOR_MARGIN
-        ) {
-            out += CoachingHint(
-                CoachKind.LOWER_FLOOR,
-                CoachTone.WARNING,
-                "The floor may have locked onto furniture. Tap Re-lock floor and aim at open floor.",
-            )
+        val localFloor = frame.localFloorY?.takeIf { it.isFinite() }
+        if (input.step == CaptureStep.CEILING && input.canRelockFloor && floorY != null && localFloor != null) {
+            val difference = localFloor - floorY
+            if (abs(difference) > LEVEL_CHANGE_MARGIN) {
+                val direction = if (difference > 0) "higher" else "lower"
+                out += CoachingHint(
+                    CoachKind.FLOOR_LEVEL,
+                    CoachTone.WARNING,
+                    "This room's floor looks ${approxDistance(abs(difference), units)} $direction than the locked floor — re-lock?",
+                )
+            }
         }
 
         val hit = frame.reticle?.takeIf { it.world.isFinite() }
@@ -171,17 +200,22 @@ internal class CaptureCoach {
         if (wallSurface && hit != null && floorY != null) {
             val aboveFloor = hit.world.y - floorY
             val normalDown = hit.normal?.let { it.isFinite() && it.y < -FACING_NORMAL_Y } == true
-            val nearCeiling = input.ceilingY?.let { it - hit.world.y < CEILING_MARGIN } == true
+            val nearBandTop = input.bandTopY?.let { it.isFinite() && it - hit.world.y < CEILING_MARGIN } == true
             when {
                 hit.surface == SurfaceKind.FLOOR || aboveFloor < MIN_AIM_HEIGHT -> out += CoachingHint(
                     CoachKind.AIM_HIGHER,
                     CoachTone.INFO,
                     "Aim higher, at the wall above furniture.",
                 )
-                hit.surface == SurfaceKind.CEILING || normalDown || nearCeiling -> out += CoachingHint(
+                hit.surface == SurfaceKind.CEILING || normalDown || (nearBandTop && input.ceilingMeasured) -> out += CoachingHint(
                     CoachKind.AIM_LOWER,
                     CoachTone.INFO,
                     "Aim a little lower, at the wall below the ceiling.",
+                )
+                nearBandTop -> out += CoachingHint(
+                    CoachKind.AIM_LOWER,
+                    CoachTone.INFO,
+                    "Aim a little lower on the wall, just above furniture.",
                 )
             }
         }
@@ -196,7 +230,7 @@ internal class CaptureCoach {
             }
         }
 
-        if (input.step == CaptureStep.FIND_FLOOR && floorY == null && trackedFloor == null) {
+        if (input.step == CaptureStep.FIND_FLOOR && floorY == null && frame.floorY == null && frame.localFloorY == null) {
             val since = findFloorSinceNs ?: nowNs.also { findFloorSinceNs = it }
             if (nowNs - since >= FLOOR_SEARCH_HINT_NS) {
                 out += CoachingHint(
@@ -240,12 +274,12 @@ internal class CaptureCoach {
         CoachKind.HOLD_STILL -> 150_000_000L
         CoachKind.TOO_FAST -> 300_000_000L
         CoachKind.TOO_FAR, CoachKind.TOO_CLOSE -> 400_000_000L
-        CoachKind.LOWER_FLOOR, CoachKind.AIM_HIGHER, CoachKind.AIM_LOWER -> 500_000_000L
+        CoachKind.FLOOR_LEVEL, CoachKind.AIM_HIGHER, CoachKind.AIM_LOWER -> 500_000_000L
         CoachKind.NO_SURFACE, CoachKind.AIM_UP -> 700_000_000L
     }
 
     internal companion object {
-        /** Camera speed is measured over this window of frames. */
+        /** Camera speed and turning speed are measured over this window of frames. */
         const val SPEED_WINDOW_NS = 400_000_000L
 
         /** Speeds over less than this time span are too jittery to use. */
@@ -254,14 +288,30 @@ internal class CaptureCoach {
         /** Faster than this between two frames is a tracking jump, not motion. */
         const val MAX_PLAUSIBLE_SPEED = 4.0
 
-        /** While scanning walls / corners / openings: "slow down" above this camera speed (m/s). */
-        const val MAX_SCAN_SPEED = 0.6
+        /**
+         * While scanning walls / corners / openings (not measuring): "slow down" above this camera speed (m/s).
+         * Above a normal indoor walk (0.8–1.2 m/s is common between walls) only when clearly hurried.
+         * Tune on the target device.
+         */
+        const val MAX_SCAN_SPEED = 0.9
 
         /** Elsewhere (finding the floor, walking to the next room): "walk slower" above this (m/s). */
-        const val MAX_WALK_SPEED = 1.1
+        const val MAX_WALK_SPEED = 1.3
 
         /** During a measurement: "hold still" above this camera speed (m/s). */
         const val HOLD_STILL_SPEED = 0.25
+
+        /**
+         * During a measurement: "hold still" above this turning speed (°/s). A wall sample spans 0.5–0.8 s, so
+         * 20°/s smears the hit-test grid by ~10–15° across the wall. Tune on the target device.
+         */
+        const val HOLD_STILL_TURN_DEG_S = 20.0
+
+        /**
+         * Not measuring: "turn more slowly" above this turning speed (°/s); fast pans blur the camera image
+         * and are the usual cause of lost tracking. Tune on the target device.
+         */
+        const val MAX_TURN_DEG_S = 75.0
 
         /** Walls are sampled poorly from closer than this (meters). */
         const val MIN_WALL_DISTANCE = 0.5
@@ -272,7 +322,7 @@ internal class CaptureCoach {
         /** Wall aim points lower than this above the floor are floor, baseboard or furniture (meters). */
         const val MIN_AIM_HEIGHT = 0.5
 
-        /** Wall aim points this close below a measured ceiling are on the ceiling edge (meters). */
+        /** Wall aim points this close below the band top (a measured ceiling, or the assumed band top) (meters). */
         const val CEILING_MARGIN = 0.2
 
         /** A hit normal with y below minus this faces down (ceiling). */
@@ -281,8 +331,11 @@ internal class CaptureCoach {
         /** In CEILING the aim point must be at least this far above the camera (meters). */
         const val MIN_CEILING_AIM_RISE = 0.3
 
-        /** The tracked floor this far below the locked one suggests the lock is on furniture (meters). */
-        const val LOWER_FLOOR_MARGIN = 0.2
+        /**
+         * The floor under the user ([ArFrameState.localFloorY]) this far above or below the locked floor means
+         * the room is at another level (step-down, split level, garage) or the lock is on furniture (meters).
+         */
+        const val LEVEL_CHANGE_MARGIN = 0.10
 
         /** No floor after this long in FIND_FLOOR: suggest how to help ARCore find it. */
         const val FLOOR_SEARCH_HINT_NS = 6_000_000_000L

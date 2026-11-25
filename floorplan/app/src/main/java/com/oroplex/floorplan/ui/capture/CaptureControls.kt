@@ -89,6 +89,7 @@ internal interface CaptureActions {
     fun measureCeiling()
     fun skipCeiling()
     fun useLastCeiling()
+    fun keepCeiling()
     fun setMethod(method: CaptureMethod)
     fun captureWall()
     fun startBaseline()
@@ -108,12 +109,29 @@ internal interface CaptureActions {
 }
 
 /** Floor detection progress shown during FIND_FLOOR (derived from the AR frames). */
-internal enum class FloorStatus { SEARCHING, FOUND, CONFIDENT }
+internal enum class FloorStatus {
+    /** No floor seen yet. */
+    SEARCHING,
 
-internal fun floorStatus(frame: ArFrameState): FloorStatus = when {
-    frame.floorY?.isFinite() != true -> FloorStatus.SEARCHING
-    frame.floorArea < CaptureViewModel.AUTO_LOCK_MIN_AREA -> FloorStatus.FOUND
-    else -> FloorStatus.CONFIDENT
+    /** A floor is seen, but the AR layer isn't sure enough to lock it by itself (yet). */
+    FOUND,
+
+    /** A floor is seen, but the phone is too low for auto-lock ever to take it: only Lock floor can. */
+    MANUAL_ONLY,
+
+    /** Auto-lock will take this floor once it holds still for a moment ([autoLockHeight]). */
+    CONFIDENT,
+}
+
+/**
+ * What the floor detection looks like on [frame]. CONFIDENT exactly when auto-lock could take the floor
+ * ([autoLockHeight], same rule as the ViewModel), so the instruction never promises a lock that can't happen.
+ */
+internal fun floorStatus(frame: ArFrameState): FloorStatus {
+    val y = (frame.localFloorY ?: frame.floorY)?.takeIf { it.isFinite() } ?: return FloorStatus.SEARCHING
+    if (autoLockHeight(frame) != null) return FloorStatus.CONFIDENT
+    val camera = frame.cameraPosition?.takeIf { it.isFinite() }
+    return if (camera != null && camera.y - y < CaptureViewModel.AUTO_LOCK_MIN_CAMERA_DROP) FloorStatus.MANUAL_ONLY else FloorStatus.FOUND
 }
 
 internal fun stepTitle(step: CaptureStep): String = when (step) {
@@ -132,11 +150,21 @@ internal fun stepInstruction(ui: CaptureUiState, floorStatus: FloorStatus): Stri
         CaptureStep.FIND_FLOOR -> when {
             floorStatus == FloorStatus.SEARCHING -> "Point the phone at the floor and move it slowly."
             !ui.autoLockFloor -> "Aim at open floor, away from furniture, and tap Lock floor."
-            floorStatus == FloorStatus.FOUND -> "Floor found. Keep moving slowly to confirm it."
+            floorStatus == FloorStatus.MANUAL_ONLY -> "Floor found. Tap Lock floor."
+            floorStatus == FloorStatus.FOUND -> "Floor found. Tap Lock floor, or keep scanning slowly to confirm it."
             else -> "Floor found. Hold still for a moment, or tap Lock floor."
         }
-        CaptureStep.CEILING ->
-            "Aim straight up at a clear spot on the ceiling, or Skip to use ${formatLengthSafe(ui.settings.defaultCeilingHeight, ui.settings)} (est.)."
+        CaptureStep.CEILING -> {
+            val chosen = d.ceilingHeight?.takeIf { it.isFinite() && it > 0.0 }
+            when {
+                chosen != null && d.ceilingMeasured ->
+                    "Ceiling measured: ${formatLengthSafe(ui.savedLength(chosen), ui.settings)}. Keep it, measure again, or re-lock the floor."
+                chosen != null ->
+                    "Ceiling set to ${formatLengthSafe(chosen, ui.settings)} (est.). Keep it, or measure it now."
+                else ->
+                    "Aim straight up at a clear spot on the ceiling, or Skip to use ${formatLengthSafe(ui.settings.defaultCeilingHeight, ui.settings)} (est.)."
+            }
+        }
         CaptureStep.WALLS -> {
             val baseline = d.baseline
             val recapture = d.recaptureIndex?.takeIf { it in d.observations.indices }
@@ -290,8 +318,10 @@ internal fun CaptureControls(
                             InputChip(
                                 selected = false,
                                 onClick = { actions.deleteOpening(o.id) },
-                                label = { Text("${openingLabel(o.type)} ${formatLengthSafe(o.width, ui.settings)}") },
-                                trailingIcon = { Icon(Icons.Filled.Close, contentDescription = "Remove", Modifier.size(16.dp)) },
+                                label = { Text("${openingLabel(o.type)} ${formatLengthSafe(ui.savedLength(o.width), ui.settings)}") },
+                                trailingIcon = {
+                                    Icon(Icons.Filled.Close, contentDescription = "Remove ${openingLabel(o.type).lowercase()}", Modifier.size(16.dp))
+                                },
                                 enabled = enabled,
                             )
                         }
@@ -347,8 +377,14 @@ private fun SecondaryActions(ui: CaptureUiState, actions: CaptureActions, enable
         when (ui.step) {
             CaptureStep.FIND_FLOOR, CaptureStep.REVIEW -> Unit
             CaptureStep.CEILING -> {
+                d.ceilingHeight?.takeIf { it.isFinite() && it > 0.0 }?.let { h ->
+                    val shown = if (d.ceilingMeasured) ui.savedLength(h) else h
+                    FilledTonalButton(onClick = actions::keepCeiling, enabled = enabled) {
+                        Text("Keep ${formatLengthSafe(shown, ui.settings)}")
+                    }
+                }
                 OutlinedButton(onClick = actions::skipCeiling, enabled = enabled) { Text("Skip") }
-                ui.lastMeasuredCeiling?.let { h ->
+                ui.lastMeasuredCeiling?.takeIf { d.ceilingHeight == null }?.let { h ->
                     OutlinedButton(onClick = actions::useLastCeiling, enabled = enabled) {
                         Text("Same as last room (${formatLengthSafe(h, ui.settings)})")
                     }
@@ -570,7 +606,7 @@ private fun coachIcon(hint: CoachingHint): ImageVector = when (hint.kind) {
     CoachKind.TRACKING -> if (hint.tone == CoachTone.CRITICAL) Icons.Filled.WarningAmber else Icons.Outlined.Info
     CoachKind.HOLD_STILL -> Icons.Filled.PanTool
     CoachKind.TOO_FAST -> Icons.Filled.Speed
-    CoachKind.LOWER_FLOOR -> Icons.Filled.Layers
+    CoachKind.FLOOR_LEVEL -> Icons.Filled.Layers
     CoachKind.TOO_FAR -> Icons.AutoMirrored.Filled.DirectionsWalk
     CoachKind.TOO_CLOSE -> Icons.Filled.ZoomOut
     CoachKind.AIM_HIGHER, CoachKind.AIM_UP -> Icons.Filled.ArrowUpward
@@ -612,12 +648,12 @@ internal fun CoachingBanner(hint: CoachingHint?, modifier: Modifier = Modifier) 
     }
 }
 
-/** Round translucent button for the top corners of the camera view. */
+/** Round translucent button for the top corners of the camera view (48 dp touch target). */
 @Composable
 private fun CameraIconButton(icon: ImageVector, description: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
     IconButton(
         onClick = onClick,
-        modifier = modifier.size(44.dp),
+        modifier = modifier.size(48.dp),
         colors = IconButtonDefaults.iconButtonColors(containerColor = Color(0x99000000), contentColor = Color.White),
     ) {
         Icon(icon, contentDescription = description)

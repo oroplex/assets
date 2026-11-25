@@ -14,8 +14,10 @@ import com.oroplex.floorplan.core.solve.RoomOps
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
 
 /*
  * Plan-symbol geometry shared by PlanRenderer (DrawList) and DxfExporter (CAD entities), so a plan looks
@@ -67,6 +69,12 @@ internal data class DoorGeometry(
     val sweep: Double,
 )
 
+/**
+ * Stair symbol of a STAIRS room ([PlanGeometry.stairSymbol]): tread lines, the arrow's [shaft] along the run
+ * (null when the run's middle line misses the room) and its [head] polyline (empty without a shaft).
+ */
+internal data class StairSymbol(val treads: List<Segment2>, val shaft: Segment2?, val head: List<Vec2>)
+
 /** One line of a room label; [sizePt] already includes the text scale and small-room shrink. */
 internal data class LabelLine(val text: String, val sizePt: Double, val bold: Boolean, val color: Int)
 
@@ -108,10 +116,93 @@ internal object PlanGeometry {
     /** Rooms narrower than this (meters) and at least twice as long get their label along the long axis. */
     const val NARROW_ROOM_WIDTH = 1.5
 
+    /** Stair treads are spaced as close to this as the run allows, within [MIN_TREAD]..[MAX_TREAD] when possible (m). */
+    const val TREAD = 0.265
+    const val MIN_TREAD = 0.25
+    const val MAX_TREAD = 0.28
+
+    /** Stairs shorter / narrower than this (m) get no symbol. */
+    const val MIN_STAIR_RUN = 0.5
+    const val MIN_STAIR_WIDTH = 0.3
+
     /** The settings' wall thickness, or the default when it is not a usable positive number. */
     fun wallThickness(settings: PlanSettings): Double =
         settings.wallThickness.takeIf { it.isFinite() && it > 0.0 }?.coerceAtMost(MAX_WALL_THICKNESS)
             ?: PlanSettings().wallThickness
+
+    /**
+     * Thickness the overall dimensions measure exterior walls with: [PlanSettings.exteriorWallThickness], or the
+     * interior [wallThickness] when it is null or not a usable number (0 is allowed: interior extents). Capped at
+     * [MAX_WALL_THICKNESS] like the interior thickness.
+     */
+    fun exteriorWallThickness(settings: PlanSettings): Double =
+        settings.exteriorWallThickness?.takeIf { it.isFinite() && it >= 0.0 }?.coerceAtMost(MAX_WALL_THICKNESS)
+            ?: wallThickness(settings)
+
+    /**
+     * Plan symbol of a stair room: tread lines across the short side of its oriented bounding box, spaced about
+     * [TREAD] apart along the run (the count is chosen so the spacing stays within [MIN_TREAD]..[MAX_TREAD] when
+     * the run allows), and a direction arrow along the middle of the run pointing toward the box's long-axis
+     * direction (the walking direction is not recorded, so "up" is drawn toward +[OrientedBox.angle]). Every line
+     * is clipped to the room's outline, so L-shaped stair rooms stay clean. Null for a room too small for a symbol.
+     */
+    fun stairSymbol(room: DrawableRoom): StairSymbol? {
+        val corners = room.corners
+        val box = Polygons.orientedBoundingBox(corners)
+        if (!box.length.isFinite() || !box.width.isFinite() || !box.angle.isFinite()) return null
+        if (box.length < MIN_STAIR_RUN || box.width < MIN_STAIR_WIDTH) return null
+        val u = Vec2.fromAngle(box.angle)
+        val v = u.perp()
+        val run = box.length
+        val count = max(2, Math.round(run / TREAD).toInt())
+        val spacing = run / count
+        val across = box.width / 2 + 0.01
+        val treads = (1 until count).flatMap { k ->
+            val at = box.center + u * (-run / 2 + k * spacing)
+            clipToPolygon(corners, at - v * across, at + v * across)
+        }
+        val inset = min(max(spacing, 0.15), run * 0.2)
+        val shaft = clipToPolygon(corners, box.center - u * (run / 2 - inset), box.center + u * (run / 2 - inset))
+            .maxByOrNull { it.length } ?: return StairSymbol(treads, null, emptyList())
+        val head = min(min(0.25, 0.35 * box.width), 0.4 * shaft.length)
+        val tip = shaft.b
+        val back = u * (head * cos(PI / 6))
+        val side = v * (head * sin(PI / 6))
+        return StairSymbol(treads, shaft, listOf(tip - back + side, tip, tip - back - side))
+    }
+
+    /**
+     * The parts of segment [a]-[b] inside [polygon] (any orientation), in order from [a]: the segment is cut at
+     * every edge crossing and the pieces whose midpoints are inside are kept.
+     */
+    fun clipToPolygon(polygon: List<Vec2>, a: Vec2, b: Vec2): List<Segment2> {
+        val d = b - a
+        val length = d.length
+        if (polygon.size < 3 || !(length > 1e-9) || !a.isFinite() || !b.isFinite()) return emptyList()
+        val cuts = mutableListOf(0.0, 1.0)
+        for (edge in Polygons.edges(polygon)) {
+            val e = edge.b - edge.a
+            val denom = d cross e
+            if (abs(denom) < 1e-12) continue
+            val ap = edge.a - a
+            val t = (ap cross e) / denom
+            val s = (ap cross d) / denom
+            if (t > 0.0 && t < 1.0 && s >= -1e-9 && s <= 1 + 1e-9) cuts += t
+        }
+        cuts.sort()
+        val out = ArrayList<Segment2>()
+        for (k in 0 until cuts.size - 1) {
+            val t0 = cuts[k]
+            val t1 = cuts[k + 1]
+            if (t1 - t0 < 1e-9) continue
+            if (!Polygons.contains(polygon, a + d * ((t0 + t1) / 2))) continue
+            val p0 = a + d * t0
+            val p1 = a + d * t1
+            val last = out.lastOrNull()
+            if (last != null && last.b.distanceTo(p0) < 1e-9) out[out.size - 1] = Segment2(last.a, p1) else out += Segment2(p0, p1)
+        }
+        return out
+    }
 
     /** [room] as a [DrawableRoom], or null when its outline is unusable (see [DrawableRoom]). */
     fun drawable(room: Room): DrawableRoom? {

@@ -11,12 +11,15 @@ import com.oroplex.floorplan.core.measure.Units
 import com.oroplex.floorplan.core.model.Calibration
 import com.oroplex.floorplan.core.model.CaptureMethod
 import com.oroplex.floorplan.core.model.Floor
+import com.oroplex.floorplan.core.model.HandSetWall
 import com.oroplex.floorplan.core.model.Opening
 import com.oroplex.floorplan.core.model.OpeningType
 import com.oroplex.floorplan.core.model.Room
 import com.oroplex.floorplan.core.model.UnitSystem
+import com.oroplex.floorplan.core.model.placementFrame
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.sqrt
 
@@ -27,10 +30,23 @@ import kotlin.math.sqrt
  * (0 <= offset, offset + width <= edge length). Operations that would turn a valid outline (simple and
  * counter-clockwise) into an invalid one are rejected by returning the room unchanged (same instance),
  * so callers can detect a no-op with `===`.
+ *
+ * Hand-set walls ([Room.handSetWalls]): [setWallLength], [moveCorner], [insertCorner] and [deleteCorner]
+ * record every edge they create or move as set by hand (the typed edge with its typed length), keep a typed
+ * length only on an edge that still measures it, and drop records that no longer match any edge (matching rule
+ * in [HandSetWall]); [transform] and [scale] carry them with the room and [resolve] clears them, since a
+ * re-solve restores the scanned geometry.
  */
 object RoomOps {
     /** Edits never create walls shorter than this (meters). */
     const val MIN_WALL_LENGTH = 0.05
+
+    /** [HandSetWall] matching: parallel within 15°, edge midpoint within 15 cm of the wall's line. */
+    private val HAND_SET_COS = cos(Math.toRadians(15.0))
+    private const val HAND_SET_DISTANCE = 0.15
+
+    /** A typed length still "holds" on an edge when it matches within this relative tolerance. */
+    private const val TYPED_LENGTH_TOLERANCE = 1e-6
 
     /** [placeOpening]: a marked point may be at most this far from the wall it is placed on (meters). */
     const val MAX_OPENING_DISTANCE = 0.5
@@ -57,13 +73,20 @@ object RoomOps {
      * Move one corner. Openings on the two adjacent edges are clamped to stay inside their edge.
      * Each such opening stays anchored to the edge's OTHER (unmoved) corner, so doors and windows do not
      * slide along the wall while a corner is dragged. Rejected when [index] or [position] is invalid or
-     * the move would make a valid outline self-intersecting or inside-out.
+     * the move would make a valid outline self-intersecting or inside-out. The two walls meeting at the corner
+     * are recorded as set by hand (see [RoomOps]).
      */
     fun moveCorner(room: Room, index: Int, position: Vec2): Room {
         if (index !in room.corners.indices || !position.isFinite()) return room
         val corners = room.corners.toMutableList().also { it[index] = position }
         if (!acceptable(room.corners, corners)) return room
-        return room.copy(corners = corners, openings = reanchorOpenings(room.corners, corners, room.openings))
+        val n = corners.size
+        val changed = if (n < 2) emptyMap() else listOf((index - 1 + n) % n, index).associateWith { it }
+        return room.copy(
+            corners = corners,
+            openings = reanchorOpenings(room.corners, corners, room.openings),
+            handSetWalls = handSetAfterEdit(room, corners, changed),
+        )
     }
 
     /**
@@ -86,6 +109,11 @@ object RoomOps {
      * degenerate edges, rooms with non-finite corners, and edits that would make a valid outline
      * self-intersecting or create a wall shorter than [MIN_WALL_LENGTH]. Openings stay anchored to an
      * unmoved corner of their edge (see [moveCorner]).
+     *
+     * The edge is recorded as a hand-set wall with [newLength] as its typed (tape) length, and every other edge
+     * the edit moved as set by hand. Typing the length the wall already has changes no corner but still records
+     * it as tape-checked (calibration then keeps it); only when that record already exists is the same instance
+     * returned.
      */
     fun setWallLength(room: Room, wallIndex: Int, newLength: Double): Room {
         val c = room.corners
@@ -96,7 +124,13 @@ object RoomOps {
         val b = c[(wallIndex + 1) % n]
         val oldLength = a.distanceTo(b)
         if (!oldLength.isFinite() || oldLength < 0.01) return room
-        if (abs(newLength - oldLength) < 1e-12) return room
+        if (abs(newLength - oldLength) <= 1e-9 * max(1.0, newLength)) {
+            val existing = handSetWallFor(room, wallIndex)
+            if (existing?.typedLength != null && abs(existing.typedLength - newLength) <= TYPED_LENGTH_TOLERANCE * max(1.0, newLength)) {
+                return room
+            }
+            return room.copy(handSetWalls = handSetAfterEdit(room, c, mapOf(wallIndex to wallIndex), typed = wallIndex to newLength))
+        }
         val candidates = stretchCandidates(c, wallIndex, newLength) +
             listOfNotNull(
                 offsetCandidate(c, wallIndex, newLength),
@@ -114,14 +148,24 @@ object RoomOps {
             }
         }
         val corners = best ?: return room
-        return room.copy(corners = corners, openings = reanchorOpenings(c, corners, room.openings))
+        val changed = HashMap<Int, Int?>()
+        changed[wallIndex] = wallIndex
+        for (k in 0 until n) {
+            if (c[k] != corners[k] || c[(k + 1) % n] != corners[(k + 1) % n]) changed[k] = k
+        }
+        return room.copy(
+            corners = corners,
+            openings = reanchorOpenings(c, corners, room.openings),
+            handSetWalls = handSetAfterEdit(room, corners, changed, typed = wallIndex to newLength),
+        )
     }
 
     /**
      * Split edge [wallIndex] at the projection of [at]; openings re-assigned to the correct sub-edge.
      * The new corner becomes corners[wallIndex + 1]; later edges shift up by one. An opening on the split
      * edge goes to the sub-edge containing its midpoint and is clamped (shrunk only if wider than it).
-     * Rejected when either sub-edge would be shorter than [MIN_WALL_LENGTH].
+     * Rejected when either sub-edge would be shorter than [MIN_WALL_LENGTH]. Both sub-edges are recorded as set
+     * by hand (a typed length of the split wall no longer applies to either half).
      */
     fun insertCorner(room: Room, wallIndex: Int, at: Vec2): Room {
         val c = room.corners
@@ -144,14 +188,16 @@ object RoomOps {
                 else -> clampToEdge(o.copy(wallIndex = wallIndex + 1, offset = o.offset - t), length - t)
             }
         }
-        return room.copy(corners = corners, openings = openings)
+        val changed = mapOf<Int, Int?>(wallIndex to wallIndex, wallIndex + 1 to wallIndex)
+        return room.copy(corners = corners, openings = openings, handSetWalls = handSetAfterEdit(room, corners, changed))
     }
 
     /**
      * Remove a corner (min 3 remain). Openings on removed edges are re-projected onto the merged edge.
      * The merged edge runs corners[index-1] -> corners[index+1]; edges after [index] shift down by one.
      * Each affected opening keeps its absolute midpoint (projected onto the merged edge), then is clamped.
-     * Rejected when the result would make a valid outline self-intersecting or inside-out.
+     * Rejected when the result would make a valid outline self-intersecting or inside-out. The merged edge is
+     * recorded as set by hand.
      */
     fun deleteCorner(room: Room, index: Int): Room {
         val c = room.corners
@@ -168,7 +214,7 @@ object RoomOps {
                 else -> o.copy(wallIndex = if (o.wallIndex > index) o.wallIndex - 1 else o.wallIndex)
             }
         }
-        return room.copy(corners = corners, openings = openings)
+        return room.copy(corners = corners, openings = openings, handSetWalls = handSetAfterEdit(room, corners, mapOf(merged to null)))
     }
 
     /** Rigidly move/rotate the room: corners, observations (lines, extents, viewer), taps and hand-set walls. */
@@ -231,8 +277,9 @@ object RoomOps {
      * A WALLS/CORNERS room without enough raw data is treated like a MANUAL room. Openings keep their
      * absolute midpoint; the nearest edge wins, with a small penalty for edges at an angle to the
      * opening's old wall so a door near a corner does not jump onto the perpendicular wall. The room's
-     * warnings are replaced by the solver's. When nothing can be solved (or a MANUAL room is resolved
-     * without squaring) the room is returned unchanged (same instance).
+     * warnings are replaced by the solver's, and its hand-set walls are cleared (the outline is the scan's
+     * again). When nothing can be solved (or a MANUAL room is resolved without squaring) the room is returned
+     * unchanged (same instance).
      */
     fun resolve(room: Room, options: SolverOptions): Room {
         val squareManual = { if (options.squareAngles) RoomSolver.solveCorners(room.corners, options) else null }
@@ -244,7 +291,7 @@ object RoomOps {
             CaptureMethod.MANUAL -> squareManual()
         } ?: return room
         val openings = room.openings.mapNotNull { remapToNearestEdge(room.corners, it, result.corners) }
-        return room.copy(corners = result.corners, openings = openings, warnings = result.warnings)
+        return room.copy(corners = result.corners, openings = openings, warnings = result.warnings, handSetWalls = emptyList())
     }
 
     /**
@@ -307,7 +354,79 @@ object RoomOps {
         return segmentOnEdge(c, opening)
     }
 
+    /**
+     * The hand-set record of edge [edge] of [room] (the latest one that matches it, see [HandSetWall]), or null when
+     * the wall comes from the scan (or the index / edge is unusable). A non-null [HandSetWall.typedLength] means
+     * the user typed this wall's length (usually a tape measurement).
+     */
+    fun handSetWallFor(room: Room, edge: Int): HandSetWall? {
+        if (room.handSetWalls.isEmpty()) return null
+        return room.handSetWalls.lastOrNull { matchesHandSet(room.corners, edge, it) }
+    }
+
+    /**
+     * True when edge [edge] of [corners] matches [wall] (see [HandSetWall]): parallel within 15°, and the edge's
+     * midpoint lies within 15 cm of the wall's line and within its extent. False for unusable input.
+     */
+    internal fun matchesHandSet(corners: List<Vec2>, edge: Int, wall: HandSetWall): Boolean {
+        if (corners.size < 2 || edge !in corners.indices) return false
+        val a = corners[edge]
+        val b = corners[(edge + 1) % corners.size]
+        val s = wall.segment
+        if (!a.isFinite() || !b.isFinite() || !s.a.isFinite() || !s.b.isFinite()) return false
+        val length = s.length
+        val edgeLength = a.distanceTo(b)
+        if (length < 1e-9 || edgeLength < 1e-9) return false
+        val dir = (s.b - s.a) / length
+        if (abs(dir dot ((b - a) / edgeLength)) < HAND_SET_COS) return false
+        val mid = Vec2.lerp(a, b, 0.5)
+        val t = (mid - s.a) dot dir
+        val slack = 1e-6
+        return abs((mid - s.a) cross dir) <= HAND_SET_DISTANCE && t >= -slack && t <= length + slack
+    }
+
     // ---------------------------------------------------------------------------------------------
+
+    /**
+     * [room]'s hand-set walls after an edit that produced [corners]. Every edge in [changed] (its index in [corners]
+     * -> the index of the edge of room.corners it came from, or null for a new or merged edge) is recorded as set
+     * by hand; it keeps a typed length only when it came from an edge with one and still measures it. [typed]
+     * (edge, length) is the length the user just typed for that edge. Earlier records are kept only while they
+     * match an edge the edit left alone (one per edge, the latest), so stale records are pruned on every edit.
+     */
+    private fun handSetAfterEdit(
+        room: Room,
+        corners: List<Vec2>,
+        changed: Map<Int, Int?>,
+        typed: Pair<Int, Double>? = null,
+    ): List<HandSetWall> {
+        val old = room.handSetWalls
+        val n = corners.size
+        if (n < 2) return emptyList()
+        val keep = BooleanArray(old.size)
+        for (k in 0 until n) {
+            if (k in changed) continue
+            val last = old.indices.lastOrNull { matchesHandSet(corners, k, old[it]) } ?: continue
+            keep[last] = true
+        }
+        val kept = old.filterIndexed { i, _ -> keep[i] }
+        val fresh = changed.keys.sorted().mapNotNull { k ->
+            if (k !in corners.indices) return@mapNotNull null
+            val a = corners[k]
+            val b = corners[(k + 1) % n]
+            if (!a.isFinite() || !b.isFinite() || a.distanceTo(b) < 1e-9) return@mapNotNull null
+            val length = a.distanceTo(b)
+            val from = changed[k]
+            val typedLength = when {
+                typed != null && typed.first == k -> typed.second
+                from != null -> old.lastOrNull { it.typedLength != null && matchesHandSet(room.corners, from, it) }
+                    ?.typedLength?.takeIf { abs(it - length) <= TYPED_LENGTH_TOLERANCE * max(1.0, it) }
+                else -> null
+            }
+            HandSetWall(Segment2(a, b), typedLength)
+        }
+        return kept + fresh
+    }
 
     private fun edgeLength(c: List<Vec2>, i: Int): Double = c[i].distanceTo(c[(i + 1) % c.size])
 
@@ -511,22 +630,44 @@ object FloorOps {
     private const val SNAP_IDENTITY_ANGLE = 1e-9
     private const val SNAP_IDENTITY_SHIFT = 1e-6
 
+    /** [calibrate]: a drawn room stays attached to a neighbour whose facing wall is parallel within this angle... */
+    private val ATTACHED_ANGLE = Math.toRadians(1.0)
+
+    /** ...and at most this far away (m; covers interior and exterior wall thicknesses). */
+    private const val MAX_ATTACHED_GAP = 0.35
+
+    /**
+     * [calibrate]: at most this many Gauss-Seidel passes settle chains of drawn rooms attached to each other; they
+     * stop early once no room moves by more than [ATTACH_SETTLED] meters.
+     */
+    private const val ATTACH_PASSES = 100
+    private const val ATTACH_SETTLED = 1e-12
+
     /**
      * Tape calibration: scale the floor's AR-measured rooms so that edge [wallIndex] of room [roomId] measures
-     * [trueLength]. AR scale error is the only thing being corrected, so only AR measurements change:
+     * [trueLength]. AR scale error is the only thing being corrected, so only AR measurements change
+     * (provenance rule):
      *
-     * * Only scanned rooms ([CaptureMethod.WALLS] / [CaptureMethod.CORNERS]) are scaled; rooms drawn by hand
-     *   ([CaptureMethod.MANUAL]) already use typed sizes and are left exactly as they are.
-     * * In a scanned room: corners, observations (lines, extents, viewers, residuals), corner taps and the
-     *   opening offsets / widths are scaled. Opening heights and sills (settings defaults) are not, and the
-     *   ceiling height is scaled only when it was measured (`!ceilingEstimated`).
-     * * All rooms are scaled about one origin so their relative placement is preserved: the first
-     *   calibration uses the bounding-box center of the scanned rooms; a later one reuses the stored
-     *   [Calibration.origin], so the stored [Calibration] (composed factor, origin) always describes the
-     *   whole correction from the raw AR scale, and [applyCalibration] can repeat it for rooms added later.
+     * * Scanned rooms ([CaptureMethod.WALLS] / [CaptureMethod.CORNERS]) are scaled about one origin, so their
+     *   relative placement is preserved: corners, observations (lines, extents, viewers, residuals), corner
+     *   taps, hand-set wall segments, and the offsets / widths of openings marked in AR.
+     * * Values the user typed keep their values: a typed ceiling ([Room.ceilingTyped]) and an estimated
+     *   (default) one are not scaled; a typed opening ([Opening.typed]) keeps its width and only its centre
+     *   moves with the scaled wall; opening heights and sills (typed or defaults) never scale; and every wall
+     *   whose length was typed ([HandSetWall.typedLength]) is set back to that length after scaling
+     *   ([RoomOps.setWallLength]), so tape values survive.
+     * * Rooms drawn by hand ([CaptureMethod.MANUAL]) keep their size but move with the scaled plan: each is
+     *   translated by (factor - 1) x (its centroid - origin). A drawn room that was attached to a neighbour
+     *   (facing walls parallel within 1° and at most 35 cm apart, e.g. snapped) is then shifted so every such
+     *   gap is what it was before (least squares when it is attached on several sides), so a snapped closet
+     *   stays snapped instead of overlapping or drifting off its scaled neighbour.
+     * * The origin: the first calibration uses the bounding-box center of the scanned rooms; a later one reuses
+     *   the stored [Calibration.origin], so the stored [Calibration] (composed factor, origin) always describes
+     *   the whole correction from the raw AR scale, and [applyCalibration] can repeat it for rooms added later.
      *
      * The resulting [Calibration] stores the composed factor (previous x this one), the edge's length before
-     * this calibration ([Calibration.measuredLength]), [trueLength], [now] and the origin.
+     * this calibration ([Calibration.measuredLength]), [trueLength], [now] and the origin. Placement frames
+     * ([Room.frameId]) do not change: the whole floor moves as one.
      *
      * @throws IllegalArgumentException with a user-presentable message when [trueLength] is not a positive
      *   number, the room or wall does not exist, the room was drawn by hand, or the implied correction is
@@ -551,8 +692,16 @@ object FloorOps {
         val previous = floor.calibration?.takeIf { it.factor.isFinite() && it.factor > 0.0 && it.origin.isFinite() }
         val origin = previous?.origin
             ?: Bounds.of(floor.rooms.filter(::isArMeasured).flatMap { r -> r.corners.filter { it.isFinite() } }).center
+        val attachments = drawnRoomAttachments(floor.rooms)
+        // A reference wall whose length was typed before gets the new tape value, so restoring typed lengths after
+        // scaling does not undo this calibration on the very wall it was taken from.
+        val reference = RoomOps.handSetWallFor(room, wallIndex)?.takeIf { it.typedLength != null }
+        val rooms = if (reference == null) floor.rooms else floor.rooms.map { r ->
+            if (r.id != roomId) r else r.copy(handSetWalls = r.handSetWalls.map { if (it === reference) it.copy(typedLength = trueLength) else it })
+        }
+        val moved = rooms.map { if (isArMeasured(it)) scaleMeasured(it, factor, origin) else translateWithScale(it, factor, origin) }
         return floor.copy(
-            rooms = floor.rooms.map { if (isArMeasured(it)) scaleMeasured(it, factor, origin) else it },
+            rooms = settleDrawnRooms(moved, attachments),
             calibration = Calibration(
                 factor = (previous?.factor ?: 1.0) * factor,
                 roomId = roomId,
@@ -630,6 +779,8 @@ object FloorOps {
      *   callers can say "already aligned" with `===`.
      * * Null also for an unknown room, a room or neighbours without a usable outline, and invalid parameters.
      *   Only the room's pose changes (see [RoomOps.transform]); its shape, openings and the calibration stay.
+     * * A room snapped on its own leaves its scan session's placement frame ([Room.frameId] = its id) when other
+     *   rooms share that frame, see [transformRooms].
      */
     fun snapRoom(floor: Floor, roomId: String, wallThickness: Double, maxDistance: Double = 0.6, maxAngleDeg: Double = 12.0): Floor? =
         snapGroup(floor, roomId, setOf(roomId), wallThickness, maxDistance, maxAngleDeg)
@@ -695,16 +846,40 @@ object FloorOps {
     /**
      * Apply [t] ([RoomOps.transform]) to every room whose id is in [ids]; other rooms and the calibration are
      * unchanged. Used to move / rotate a whole scan session as one block.
+     *
+     * Placement frames ([Room.placementFrame]) follow what really moved together: a frame whose rooms all move
+     * keeps its id (a whole-scan move); rooms moved out of a frame that keeps other rooms leave it, a single
+     * room getting its own id as [Room.frameId] and several rooms of one frame moved together a shared new
+     * frame. So FloorChecks never treats a room's siblings as aligned just because the room itself was moved.
+     * Unknown ids, an empty set and the identity transform return the floor unchanged (same instance).
      */
     fun transformRooms(floor: Floor, ids: Set<String>, t: RigidTransform2): Floor {
         if (ids.isEmpty() || floor.rooms.none { it.id in ids }) return floor
-        return floor.copy(rooms = floor.rooms.map { if (it.id in ids) RoomOps.transform(it, t) else it })
+        if (t.angle == 0.0 && t.translation == Vec2.ZERO) return floor
+        val movedByFrame = floor.rooms.filter { it.id in ids }.groupBy { it.placementFrame }
+        val newFrame = HashMap<String, String>()
+        for ((frame, moved) in movedByFrame) {
+            val split = floor.rooms.any { it.placementFrame == frame && it.id !in ids }
+            if (!split) continue
+            val id = if (moved.size == 1) moved[0].id else "frame:${moved[0].id}"
+            for (r in moved) newFrame[r.id] = id
+        }
+        return floor.copy(
+            rooms = floor.rooms.map { room ->
+                if (room.id !in ids) return@map room
+                val placed = RoomOps.transform(room, t)
+                val frame = newFrame[room.id]
+                if (frame == null || frame == placed.placementFrame) placed else placed.copy(frameId = frame)
+            },
+        )
     }
 
     /**
      * Apply the floor's existing calibration to a room that is being ADDED to it (e.g. newly captured), scaling
-     * about Calibration.origin. Only AR-measured quantities are scaled: corners, observations, taps, opening
-     * offsets/widths, and ceilingHeight unless ceilingEstimated. MANUAL rooms and uncalibrated floors: unchanged.
+     * about Calibration.origin with the same provenance rule as [calibrate]: only AR-measured quantities scale
+     * (corners, observations, taps, the offsets / widths of openings marked in AR, a measured ceiling); typed
+     * values keep theirs (typed and estimated ceilings, typed opening widths, typed wall lengths). MANUAL rooms
+     * and uncalibrated floors: unchanged (a drawn room added later is placed by the user in the calibrated plan).
      *
      * The factor is the floor's composed [Calibration.factor] (the whole correction from raw AR scale), so a
      * room scanned after calibrating matches its neighbours. A room whose id is already on the floor is
@@ -733,16 +908,26 @@ object FloorOps {
     internal fun displayName(room: Room): String = room.name.replace('\n', ' ').trim().ifEmpty { room.type.displayName }
 
     /**
-     * Uniform scale of the AR-measured parts of [room] about [origin] (see [calibrate]): unlike [RoomOps.scale],
-     * opening heights / sills and an estimated ceiling keep their (typed or default) values.
+     * Uniform scale of the AR-measured parts of [room] about [origin] (the provenance rule of [calibrate]). Unlike
+     * [RoomOps.scale]: opening heights / sills, typed and estimated ceilings and typed opening widths keep their
+     * values (a typed opening's centre moves with its wall), and typed wall lengths are restored afterwards.
      */
     private fun scaleMeasured(room: Room, factor: Double, origin: Vec2): Room {
         fun s(p: Vec2) = origin + (p - origin) * factor
-        return room.copy(
-            corners = room.corners.map(::s),
+        val corners = room.corners.map(::s)
+        val n = corners.size
+        val openings = room.openings.map { o ->
+            val placed = if (o.typed) o.copy(offset = (o.offset + o.width / 2) * factor - o.width / 2)
+            else o.copy(offset = o.offset * factor, width = o.width * factor)
+            if (o.wallIndex in corners.indices && n >= 2) RoomOps.clampToEdge(placed, corners[o.wallIndex].distanceTo(corners[(o.wallIndex + 1) % n]))
+            else placed
+        }
+        val scaled = room.copy(
+            corners = corners,
             cornerTaps = room.cornerTaps.map(::s),
-            ceilingHeight = if (room.ceilingEstimated) room.ceilingHeight else room.ceilingHeight?.let { it * factor },
-            openings = room.openings.map { it.copy(offset = it.offset * factor, width = it.width * factor) },
+            ceilingHeight = if (room.ceilingEstimated || room.ceilingTyped) room.ceilingHeight else room.ceilingHeight?.let { it * factor },
+            openings = openings,
+            handSetWalls = room.handSetWalls.map { it.copy(segment = Segment2(s(it.segment.a), s(it.segment.b))) },
             observations = room.observations.map { o ->
                 o.copy(
                     line = Line2(s(o.line.point), o.line.direction),
@@ -753,5 +938,141 @@ object FloorOps {
                 )
             },
         )
+        return restoreTypedLengths(scaled)
+    }
+
+    /**
+     * Set every wall of [room] whose length was typed ([HandSetWall.typedLength]) back to that length with
+     * [RoomOps.setWallLength], in the order the records were made (a later record for the same wall wins).
+     * Edge indices are found once up front (setWallLength keeps the corner count), so a wall moved by an earlier
+     * restore is still found. Each restored wall keeps a typed record while it still measures its length.
+     */
+    private fun restoreTypedLengths(room: Room): Room {
+        val targets = LinkedHashMap<Int, Double>()
+        for (h in room.handSetWalls) {
+            val length = h.typedLength ?: continue
+            if (!length.isFinite() || length <= RoomOps.MIN_WALL_LENGTH) continue
+            val edge = room.corners.indices.firstOrNull { RoomOps.matchesHandSet(room.corners, it, h) } ?: continue
+            targets.remove(edge)
+            targets[edge] = length
+        }
+        if (targets.isEmpty()) return room
+        var r = room
+        for ((edge, length) in targets) r = RoomOps.setWallLength(r, edge, length)
+        val c = r.corners
+        val n = c.size
+        val others = r.handSetWalls.filter { rec -> targets.keys.none { RoomOps.matchesHandSet(c, it, rec) } }
+        val restored = targets.map { (edge, length) ->
+            val a = c[edge]
+            val b = c[(edge + 1) % n]
+            HandSetWall(Segment2(a, b), length.takeIf { abs(a.distanceTo(b) - it) <= 1e-6 * max(1.0, it) })
+        }
+        return r.copy(handSetWalls = others + restored)
+    }
+
+    /** [room] translated (not resized) so it moves with a plan scaled by [factor] about [origin]. */
+    private fun translateWithScale(room: Room, factor: Double, origin: Vec2): Room {
+        val pts = room.corners.filter { it.isFinite() }
+        if (pts.isEmpty()) return room
+        val centroid = if (pts.size >= 3 && abs(Polygons.signedArea(pts)) > 1e-9) Polygons.centroid(pts) else Bounds.of(pts).center
+        val shift = (centroid - origin) * (factor - 1)
+        if (!shift.isFinite() || shift == Vec2.ZERO) return room
+        return RoomOps.transform(room, RigidTransform2(0.0, shift))
+    }
+
+    /**
+     * A drawn room's wall facing a neighbour's wall before calibrating: room [room] edge [edge] (of its CCW
+     * outline) faces room [other] edge [otherEdge] at [gap] along [overlap] meters.
+     */
+    private class Attachment(val room: Int, val edge: Int, val other: Int, val otherEdge: Int, val gap: Double, val overlap: Double)
+
+    /** Every attachment of a drawn room to any other room (see [calibrate]). */
+    private fun drawnRoomAttachments(rooms: List<Room>): List<Attachment> {
+        val outlines = rooms.map { WallPairs.ccwOutline(it.corners) }
+        val out = ArrayList<Attachment>()
+        rooms.forEachIndexed { i, room ->
+            if (isArMeasured(room)) return@forEachIndexed
+            val a = outlines[i] ?: return@forEachIndexed
+            outlines.forEachIndexed { j, b ->
+                if (j == i || b == null || rooms[j].id == room.id) return@forEachIndexed
+                for (p in WallPairs.facing(a, b, ATTACHED_ANGLE)) {
+                    val gap = faceGap(a, p.edge, b, p.otherEdge) ?: continue
+                    if (gap < -0.01 || gap > MAX_ATTACHED_GAP) continue
+                    out += Attachment(i, p.edge, j, p.otherEdge, gap, p.overlap)
+                }
+            }
+        }
+        return out
+    }
+
+    /**
+     * Shift each drawn room of [rooms] (already translated with the plan) so its [attachments] get their gaps
+     * back: per room, the least-squares translation along the neighbours' normals (weighted by the facing
+     * length), measured against the neighbours' current positions, repeated a few times so drawn rooms attached
+     * to each other settle together. Rooms with no attachment are left where they are.
+     */
+    private fun settleDrawnRooms(rooms: List<Room>, attachments: List<Attachment>): List<Room> {
+        if (attachments.isEmpty()) return rooms
+        val current = rooms.toMutableList()
+        val byRoom = attachments.groupBy { it.room }
+        for (pass in 0 until ATTACH_PASSES) {
+            var largest = 0.0
+            for ((i, list) in byRoom) {
+                val a = WallPairs.ccwOutline(current[i].corners) ?: continue
+                var sxx = 0.0
+                var sxy = 0.0
+                var syy = 0.0
+                var rx = 0.0
+                var ry = 0.0
+                for (att in list) {
+                    val b = WallPairs.ccwOutline(current[att.other].corners) ?: continue
+                    if (att.edge !in a.indices || att.otherEdge !in b.indices) continue
+                    val gap = faceGap(a, att.edge, b, att.otherEdge) ?: continue
+                    val normal = outwardNormal(b, att.otherEdge) ?: continue
+                    val need = att.gap - gap
+                    val w = att.overlap
+                    sxx += w * normal.x * normal.x
+                    sxy += w * normal.x * normal.y
+                    syy += w * normal.y * normal.y
+                    rx += w * normal.x * need
+                    ry += w * normal.y * need
+                }
+                val shift = leastSquares(sxx, sxy, syy, rx, ry)
+                if (shift.isFinite() && shift.length > ATTACH_SETTLED) {
+                    current[i] = RoomOps.transform(current[i], RigidTransform2(0.0, shift))
+                    largest = max(largest, shift.length)
+                }
+            }
+            if (largest <= ATTACH_SETTLED) break
+        }
+        return current
+    }
+
+    /** Distance from B's edge [j] to the middle of A's edge [i], along B's outward normal (null if degenerate). */
+    private fun faceGap(a: List<Vec2>, i: Int, b: List<Vec2>, j: Int): Double? {
+        val normal = outwardNormal(b, j) ?: return null
+        val mid = Vec2.lerp(a[i], a[(i + 1) % a.size], 0.5)
+        return ((mid - b[j]) dot normal).takeIf { it.isFinite() }
+    }
+
+    /** Outward unit normal of edge [j] of the CCW outline [b] (interior on the left), or null if degenerate. */
+    private fun outwardNormal(b: List<Vec2>, j: Int): Vec2? {
+        val d = (b[(j + 1) % b.size] - b[j]).normalized()
+        return if (d == Vec2.ZERO || !d.isFinite()) null else -d.perp()
+    }
+
+    /**
+     * Minimum-norm solution of the 2x2 normal equations [[sxx, sxy], [sxy, syy]] x = (rx, ry): exact when the
+     * constraints span both directions, else only along the one direction they constrain.
+     */
+    private fun leastSquares(sxx: Double, sxy: Double, syy: Double, rx: Double, ry: Double): Vec2 {
+        val trace = sxx + syy
+        if (!(trace > 1e-12)) return Vec2.ZERO
+        val det = sxx * syy - sxy * sxy
+        if (det > 1e-6 * trace * trace) return Vec2((syy * rx - sxy * ry) / det, (sxx * ry - sxy * rx) / det)
+        val lambda = trace / 2 + sqrt(((sxx - syy) / 2) * ((sxx - syy) / 2) + sxy * sxy)
+        val u = (if (abs(sxy) > 1e-12) Vec2(lambda - syy, sxy) else if (sxx >= syy) Vec2(1.0, 0.0) else Vec2(0.0, 1.0)).normalized()
+        if (u == Vec2.ZERO || !(lambda > 0.0)) return Vec2.ZERO
+        return u * (((u.x * rx) + (u.y * ry)) / lambda)
     }
 }

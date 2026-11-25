@@ -5,6 +5,7 @@ import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.model.OpeningType
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.Room
+import com.oroplex.floorplan.core.model.RoomType
 import com.oroplex.floorplan.core.model.UnitSystem
 import java.util.Locale
 import kotlin.math.PI
@@ -20,6 +21,7 @@ object DxfExporter {
     const val LAYER_WINDOWS = "WINDOWS"
     const val LAYER_TEXT = "TEXT"
     const val LAYER_DIMENSIONS = "DIMENSIONS"
+    const val LAYER_STAIRS = "STAIRS"
     private val LAYERS = listOf(
         "0" to 7,
         LAYER_ROOMS to 8, // gray
@@ -28,6 +30,7 @@ object DxfExporter {
         LAYER_WINDOWS to 5, // blue
         LAYER_TEXT to 3, // green
         LAYER_DIMENSIONS to 4, // cyan
+        LAYER_STAIRS to 9, // light gray
     )
 
     /**
@@ -41,9 +44,11 @@ object DxfExporter {
      * Units: inches when settings.unitSystem == IMPERIAL, millimeters when METRIC ($INSUNITS 1 / 4 in header).
      * Layers: ROOMS (closed interior outlines), WALLS (closed outer outlines offset by wall thickness),
      * DOORS (leaf LINE + swing ARC), WINDOWS (LINEs), TEXT (room name / dims / area TEXT entities),
-     * DIMENSIONS (when settings.showOverallDimensions: the overall width / depth dimension lines, extension
-     * lines and 45° ticks as LINEs plus their labels as TEXT, laid out like the on-screen plan with the same
-     * meters-per-point scale as the DXF text, see [OverallDimensions]).
+     * STAIRS (tread and arrow LINEs of stair rooms, the same symbol as the on-screen plan, see
+     * [PlanGeometry.stairSymbol]), DIMENSIONS (only when [showOverallDimensions]: the overall width / depth to the
+     * outside of the exterior walls as dimension lines, extension lines and 45° ticks as LINEs plus their labels
+     * as TEXT, laid out like the on-screen plan with the same meters-per-point scale as the DXF text, see
+     * [OverallDimensions]). Every layer is declared in the LAYER table even when it holds no entities.
      *
      * R12 has no LWPOLYLINE, so outlines are POLYLINE / VERTEX / SEQEND with the closed flag. Door and window
      * symbols use the same geometry as the on-screen plan. Rooms with an unusable outline (fewer than 3 finite
@@ -100,6 +105,14 @@ object DxfExporter {
         }
 
         for (d in drawable) {
+            if (d == null || d.room.type != RoomType.STAIRS) continue
+            val stairs = PlanGeometry.stairSymbol(d) ?: continue
+            for (t in stairs.treads) entities.line(LAYER_STAIRS, t.a, t.b)
+            stairs.shaft?.let { entities.line(LAYER_STAIRS, it.a, it.b) }
+            for (k in 0 until stairs.head.size - 1) entities.line(LAYER_STAIRS, stairs.head[k], stairs.head[k + 1])
+        }
+
+        for (d in drawable) {
             if (d == null) continue
             val label = PlanGeometry.roomLabel(
                 d, settings, showName = true, showDimensions = true, showArea = settings.showRoomAreas, textScale = 1.0,
@@ -112,7 +125,7 @@ object DxfExporter {
         }
 
         if (settings.showOverallDimensions) {
-            for (dim in OverallDimensions.compute(drawable, settings, thickness, TEXT_METERS_PER_PT, textScale = 1.0)) {
+            for (dim in OverallDimensions.compute(drawable, settings, TEXT_METERS_PER_PT, textScale = 1.0)) {
                 entities.line(LAYER_DIMENSIONS, dim.line.a, dim.line.b)
                 for (s in dim.extensions + dim.ticks) entities.line(LAYER_DIMENSIONS, s.a, s.b)
                 val up = Vec2.fromAngle(dim.labelAngle + PI / 2)

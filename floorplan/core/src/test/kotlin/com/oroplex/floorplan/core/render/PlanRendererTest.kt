@@ -8,6 +8,7 @@ import com.oroplex.floorplan.core.measure.Measurements
 import com.oroplex.floorplan.core.measure.Units
 import com.oroplex.floorplan.core.model.DoorSwing
 import com.oroplex.floorplan.core.model.OpeningType
+import com.oroplex.floorplan.core.model.RoomType
 import com.oroplex.floorplan.core.model.UnitSystem
 import com.oroplex.floorplan.core.render.Fixtures.opening
 import com.oroplex.floorplan.core.render.Fixtures.rect
@@ -383,6 +384,59 @@ class PlanRendererTest {
         assertNear(3.0, bands[1].minX)
         assertNotNull(dl.ops.firstOrNull { it.isRoomFill() })
     }
+
+    @Test fun stairRoomsGetTreadsAndADirectionArrowUnderTheLabels() {
+        // A 1.1 x 3.2 m stair run: treads across the short side every ~0.27 m, an arrow along the run.
+        val stairs = room("s", rect(0.0, 0.0, 1.1, 3.2), name = "Stairs").copy(type = RoomType.STAIRS)
+        val dl = PlanRenderer.render(listOf(stairs), settings)
+        val symbol = dl.opsOf<DrawOp.Polyline>().filter { it.tag == "stairs:s" }
+        val treads = symbol.filter { it.widthPt == 0.6 }
+        val count = Math.round(3.2 / PlanGeometry.TREAD).toInt()
+        assertEquals(count - 1, treads.size)
+        val spacing = 3.2 / count
+        assertTrue(spacing in PlanGeometry.MIN_TREAD..PlanGeometry.MAX_TREAD, "$spacing")
+        treads.sortedBy { it.points[0].y }.forEachIndexed { k, t ->
+            // Across the full width of the run (the short side), at an even spacing.
+            assertNear(t.points[0].y, t.points[1].y, 1e-9)
+            assertNear((k + 1) * spacing, t.points[0].y, 1e-9)
+            assertNear(0.0, minOf(t.points[0].x, t.points[1].x), 1e-9)
+            assertNear(1.1, maxOf(t.points[0].x, t.points[1].x), 1e-9)
+        }
+        // The arrow: a shaft along the middle of the run and a two-stroke head at its far end.
+        val arrow = symbol.filter { it.widthPt == 0.75 }
+        assertEquals(2, arrow.size)
+        val shaft = arrow.single { it.points.size == 2 }
+        assertNear(0.55, shaft.points[0].x, 1e-9)
+        assertNear(0.55, shaft.points[1].x, 1e-9)
+        assertTrue(shaft.points[1].y > shaft.points[0].y)
+        val head = arrow.single { it.points.size == 3 }
+        assertNear(shaft.points[1], head.points[1], 1e-9)
+        assertTrue(head.points[0].y < shaft.points[1].y && head.points[2].y < shaft.points[1].y, "the head points along the run")
+        // Everything stays inside the room, and is drawn over the fill but under the label.
+        assertTrue(symbol.all { p -> p.points.all { it.x in -1e-9..1.1 + 1e-9 && it.y in -1e-9..3.2 + 1e-9 } })
+        val fill = dl.ops.indexOfFirst { it.isRoomFill() }
+        val label = dl.ops.indexOfFirst { it is DrawOp.Text }
+        assertTrue(dl.ops.indexOfFirst { it.tag == "stairs:s" } > fill)
+        assertTrue(dl.ops.indexOfLast { it.tag == "stairs:s" } < label)
+        // Other room types and tiny stair rooms get no symbol; broken stair rooms do not crash.
+        assertTrue(PlanRenderer.render(listOf(stairs.copy(type = RoomType.HALLWAY)), settings).ops.none { it.tag?.startsWith("stairs:") == true })
+        assertTrue(PlanRenderer.render(listOf(stairs.copy(corners = rect(0.0, 0.0, 0.2, 0.4))), settings).ops.none { it.tag?.startsWith("stairs:") == true })
+        PlanRenderer.render(listOf(stairs.copy(corners = listOf(Vec2(0.0, 0.0), Vec2(Double.NaN, 1.0), Vec2(1.0, 1.0)))), settings)
+    }
+
+    @Test fun stairSymbolIsClippedToAnLShapedRoom() {
+        // An L-shaped stair room (a winder landing): no tread may cross the notch.
+        val l = listOf(Vec2(0.0, 0.0), Vec2(3.0, 0.0), Vec2(3.0, 1.0), Vec2(1.0, 1.0), Vec2(1.0, 2.5), Vec2(0.0, 2.5))
+        val stairs = room("l", l, name = "Stairs").copy(type = RoomType.STAIRS)
+        val symbol = dl(stairs).opsOf<DrawOp.Polyline>().filter { it.tag == "stairs:l" }
+        assertTrue(symbol.isNotEmpty())
+        for (p in symbol) for (k in 0 until p.points.size - 1) {
+            val mid = Vec2.lerp(p.points[k], p.points[k + 1], 0.5)
+            assertTrue(Polygons.contains(l, mid) || Polygons.signedDistanceToOutline(l, mid) > -1e-9, "$mid inside the room")
+        }
+    }
+
+    private fun dl(room: com.oroplex.floorplan.core.model.Room) = PlanRenderer.render(listOf(room), settings)
 
     private fun DrawOp.colorOrNull(): Int? = when (this) {
         is DrawOp.FillPolygon -> color

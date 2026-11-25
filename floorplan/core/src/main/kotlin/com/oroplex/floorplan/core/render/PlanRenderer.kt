@@ -7,6 +7,7 @@ import com.oroplex.floorplan.core.measure.Units
 import com.oroplex.floorplan.core.model.OpeningType
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.Room
+import com.oroplex.floorplan.core.model.RoomType
 import com.oroplex.floorplan.core.solve.FloorAxis
 import kotlin.math.PI
 import kotlin.math.max
@@ -31,8 +32,7 @@ data class RenderOptions(
     /**
      * Output scale in points per plan meter when the caller knows it (a PDF at a fixed architectural scale, the
      * editor at its current zoom). Overall-dimension offsets, ticks and label gaps are then sized exactly in
-     * points. null = assume the plan spans about 560 pt (fit-to-page).
-     * Round-3 contract: not honoured yet.
+     * points. null (or not a positive finite number) = assume the plan spans about 560 pt (fit-to-page).
      */
     val pointsPerMeter: Double? = null,
 )
@@ -54,6 +54,8 @@ object PlanRenderer {
     private const val DIMENSION_LINE_PT = 0.75
     private const val EXTENSION_LINE_PT = 0.5
     private const val TICK_LINE_PT = 1.0
+    private const val TREAD_PT = 0.6
+    private const val STAIR_ARROW_PT = 0.75
 
     /** Walls shorter than this get no length label (meters). */
     private const val MIN_LABELED_WALL = 0.3
@@ -70,10 +72,13 @@ object PlanRenderer {
      * lengths along each interior edge, selection highlight and corner handles.
      * DrawOp tags: "room:<id>" on room fills, "wall:<roomId>:<edgeIndex>" on wall-length labels,
      * "corner:<roomId>:<index>" on handles, "dimension:width" / "dimension:depth" on overall dimension lines
-     * and their labels. Bounds include wall bands, labels' anchors and the overall dimensions.
+     * and their labels, "stairs:<roomId>" on stair symbols. Bounds include wall bands, labels' anchors and the
+     * overall dimensions.
      *
      * Op order (later ops paint over earlier ones): wall bands, room fills, warning outlines of unusable
-     * rooms, opening gaps, door / window symbols, selection highlight, highlight outlines
+     * rooms, stair symbols of [RoomType.STAIRS] rooms (0.6 pt tread lines across the run plus a 0.75 pt
+     * direction arrow, see [PlanGeometry.stairSymbol]), opening gaps, door / window symbols, selection highlight,
+     * highlight outlines
      * ([RenderOptions.highlightRoomIds]: 2 pt dashed [PlanColors.WARNING]), overall dimension lines, their
      * labels, room labels, wall-length labels, corner handles. Rooms with fewer than 3 finite corners, a
      * self-intersecting outline or no area are drawn only as a dashed [PlanColors.WARNING] outline (still
@@ -81,9 +86,11 @@ object PlanRenderer {
      * drawn once. Never throws on bad data.
      *
      * Overall dimensions ([RenderOptions.showOverallDimensions] ?: [PlanSettings.showOverallDimensions]): the
-     * width and depth of the whole floor between the outer faces of its wall bands, measured in the floor's
-     * own axis frame (its dominant wall direction, see [OverallDimensions]), drawn above and to the left of
-     * the plan with extension lines, 45° tick slashes and a bold 8 pt label.
+     * width and depth of the whole floor to the outside of its exterior walls (the interior extents padded by
+     * [PlanSettings.exteriorWallThickness], see [OverallDimensions]), measured in the floor's own axis frame
+     * (its dominant wall direction), drawn above and to the left of the plan with extension lines, 45° tick
+     * slashes and a bold 8 pt label. Their offsets, ticks and gaps are sized in points at
+     * [RenderOptions.pointsPerMeter] when given, else at a nominal fit-to-page scale.
      */
     fun render(rooms: List<Room>, settings: PlanSettings, options: RenderOptions = RenderOptions()): DrawList {
         if (rooms.isEmpty()) return DrawList(emptyList(), Bounds.EMPTY)
@@ -121,6 +128,16 @@ object PlanRenderer {
                 )
                 pts.size == 1 -> ops += DrawOp.Dot(pts[0], WARNING_DOT_PT, PlanColors.WARNING, tag = roomTag(room))
             }
+        }
+
+        // Pass 2b: stair symbols inside stair rooms (under openings, highlights and labels).
+        for (d in drawable) {
+            if (d == null || d.room.type != RoomType.STAIRS) continue
+            val stairs = PlanGeometry.stairSymbol(d) ?: continue
+            val tag = "stairs:${d.room.id}"
+            for (t in stairs.treads) ops += DrawOp.Polyline(listOf(t.a, t.b), false, TREAD_PT, PlanColors.DIMENSION, tag = tag)
+            stairs.shaft?.let { ops += DrawOp.Polyline(listOf(it.a, it.b), false, STAIR_ARROW_PT, PlanColors.TEXT_SECONDARY, tag = tag) }
+            if (stairs.head.size >= 2) ops += DrawOp.Polyline(stairs.head, false, STAIR_ARROW_PT, PlanColors.TEXT_SECONDARY, tag = tag)
         }
 
         // Pass 3: openings. All gaps first so a later gap can never erase an earlier door's swing.
@@ -176,9 +193,10 @@ object PlanRenderer {
 
         // Pass 4c: overall exterior dimensions (lines first, then labels, all under the room labels).
         if (options.showOverallDimensions ?: settings.showOverallDimensions) {
-            val metersPerPt = OverallDimensions.nominalMetersPerPt(drawable, thickness)
+            val metersPerPt = options.pointsPerMeter?.takeIf { it.isFinite() && it > 0.0 }?.let { 1.0 / it }?.takeIf { it.isFinite() && it > 0.0 }
+                ?: OverallDimensions.nominalMetersPerPt(drawable, thickness)
             val dims = if (metersPerPt == null) emptyList()
-            else OverallDimensions.compute(drawable, settings, thickness, metersPerPt, textScale)
+            else OverallDimensions.compute(drawable, settings, metersPerPt, textScale)
             for (dim in dims) {
                 val tag = "dimension:${dim.kind}"
                 ops += DrawOp.Polyline(listOf(dim.line.a, dim.line.b), false, DIMENSION_LINE_PT, PlanColors.DIMENSION, tag = tag)
@@ -296,18 +314,21 @@ internal data class DimensionLine(
 )
 
 /**
- * Overall exterior dimensions of a floor, shared by [PlanRenderer] and [DxfExporter].
+ * Overall exterior dimensions of a floor, shared by [PlanRenderer] (so also SVG / PDF / PNG) and [DxfExporter].
  *
  * The frame is the floor's dominant wall axis ([FloorAxis], turned into (-45°, 45°] so "width" is the more
  * horizontal direction): a straightened floor gets exactly horizontal / vertical dimensions and a tilted one
- * gets dimensions along its walls. Width and depth are the extents of all wall bands (the outer faces of the
- * exterior walls) in that frame. The width line runs above the plan, the depth line to its left; each
- * extension line starts just off the outermost wall corner at that end.
+ * gets dimensions along its walls. Width and depth measure to the OUTSIDE of the exterior walls: the extents of
+ * all interior corners in that frame, padded on each side by [PlanGeometry.exteriorWallThickness]
+ * ([PlanSettings.exteriorWallThickness], default 6.5", else the interior wall thickness). The drawn wall bands
+ * stay at the interior thickness (it is also the snapping gap). The width line runs above the plan, the depth
+ * line to its left; each extension line starts just off the outer face of the outermost wall at that end.
  *
  * Offsets, tick sizes and label gaps are specified in points but have to be plan meters before the plan is
- * scaled onto an output, so they are converted with a meters-per-point scale: [nominalMetersPerPt] for
- * DrawLists (the plan spread over about [NOMINAL_PLAN_PT] points, i.e. a Letter / A4 page), or the DXF text
- * scale. They are multiplied by the text scale too, so labels and their gaps stay in proportion.
+ * scaled onto an output, so they are converted with a meters-per-point scale: the caller's known output scale
+ * ([RenderOptions.pointsPerMeter]), [nominalMetersPerPt] for DrawLists (the plan spread over about
+ * [NOMINAL_PLAN_PT] points, i.e. a Letter / A4 page), or the DXF text scale. They are multiplied by the text
+ * scale too, so labels and their gaps stay in proportion.
  */
 internal object OverallDimensions {
     const val OFFSET_PT = 24.0
@@ -320,7 +341,7 @@ internal object OverallDimensions {
     /** Width (points) a floor plan is assumed to span on its output when converting point sizes to meters. */
     const val NOMINAL_PLAN_PT = 560.0
 
-    /** Extents shorter than this (m) get no dimension. */
+    /** Interior extents shorter than this (m) get no dimension. */
     const val MIN_EXTENT = 0.3
 
     /** Vertices within this distance (m) of an extreme count as "at" that extreme when placing extension lines. */
@@ -341,19 +362,20 @@ internal object OverallDimensions {
     fun compute(
         rooms: List<DrawableRoom?>,
         settings: PlanSettings,
-        thickness: Double,
         metersPerPt: Double,
         textScale: Double,
     ): List<DimensionLine> {
         if (!metersPerPt.isFinite() || metersPerPt <= 0.0) return emptyList()
         val drawable = rooms.filterNotNull()
-        val pts = drawable.flatMap { it.band(thickness) }.filter { it.isFinite() }
+        val pts = drawable.flatMap { it.corners }.filter { it.isFinite() }
         if (pts.isEmpty()) return emptyList()
+        val pad = PlanGeometry.exteriorWallThickness(settings)
         val axis = FloorAxis.ofOutlines(drawable.map { it.corners }) ?: 0.0
-        val phi = if (axis > PI / 4) axis - PI / 2 else axis
+        val phi = FloorAxis.tilt(axis)
         fun toPlan(p: Vec2) = p.rotated(phi)
         val frame = pts.map { it.rotated(-phi) }
-        val b = Bounds.of(frame)
+        val inner = Bounds.of(frame)
+        val b = Bounds(inner.minX - pad, inner.minY - pad, inner.maxX + pad, inner.maxY + pad)
         val m = metersPerPt * textScale
         val sizePt = LABEL_PT * textScale
         val out = ArrayList<DimensionLine>(2)
@@ -380,10 +402,11 @@ internal object OverallDimensions {
             out += DimensionLine(kind, length, line, extensions, ticks, label, anchor, angle, offsetPt, sizePt, bounds)
         }
 
-        if (b.width >= MIN_EXTENT) {
+        // Extension lines start just off the outer face (interior corner + pad) of the outermost wall at each end.
+        if (inner.width >= MIN_EXTENT) {
             val y = b.maxY + OFFSET_PT * m
-            val leftTop = frame.filter { it.x <= b.minX + EXTREME_TOLERANCE }.maxOf { it.y }
-            val rightTop = frame.filter { it.x >= b.maxX - EXTREME_TOLERANCE }.maxOf { it.y }
+            val leftTop = frame.filter { it.x <= inner.minX + EXTREME_TOLERANCE }.maxOf { it.y } + pad
+            val rightTop = frame.filter { it.x >= inner.maxX - EXTREME_TOLERANCE }.maxOf { it.y } + pad
             val beyond = y + EXTENSION_OVERSHOOT_PT * m
             val extensions = listOf(
                 Segment2(toPlan(Vec2(b.minX, leftTop + EXTENSION_GAP_PT * m)), toPlan(Vec2(b.minX, beyond))),
@@ -391,10 +414,10 @@ internal object OverallDimensions {
             )
             build("width", Vec2(b.minX, y), Vec2(b.maxX, y), extensions, Vec2(0.0, 1.0), b.width)
         }
-        if (b.height >= MIN_EXTENT) {
+        if (inner.height >= MIN_EXTENT) {
             val x = b.minX - OFFSET_PT * m
-            val bottomLeft = frame.filter { it.y <= b.minY + EXTREME_TOLERANCE }.minOf { it.x }
-            val topLeft = frame.filter { it.y >= b.maxY - EXTREME_TOLERANCE }.minOf { it.x }
+            val bottomLeft = frame.filter { it.y <= inner.minY + EXTREME_TOLERANCE }.minOf { it.x } - pad
+            val topLeft = frame.filter { it.y >= inner.maxY - EXTREME_TOLERANCE }.minOf { it.x } - pad
             val beyond = x - EXTENSION_OVERSHOOT_PT * m
             val extensions = listOf(
                 Segment2(toPlan(Vec2(bottomLeft - EXTENSION_GAP_PT * m, b.minY)), toPlan(Vec2(beyond, b.minY))),

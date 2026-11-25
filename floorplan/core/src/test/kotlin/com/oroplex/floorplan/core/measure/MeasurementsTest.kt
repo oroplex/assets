@@ -1,11 +1,13 @@
 package com.oroplex.floorplan.core.measure
 
 import com.oroplex.floorplan.core.geometry.Vec2
+import com.oroplex.floorplan.core.model.AreaCategory
 import com.oroplex.floorplan.core.model.Floor
 import com.oroplex.floorplan.core.model.Opening
 import com.oroplex.floorplan.core.model.OpeningType
 import com.oroplex.floorplan.core.model.Project
 import com.oroplex.floorplan.core.model.Room
+import com.oroplex.floorplan.core.model.RoomType
 import kotlin.math.PI
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -98,5 +100,37 @@ class MeasurementsTest {
         assertEquals(0.0, Measurements.floorArea(Floor("e", "Empty")), 0.0)
         val p = Project(id = "p", name = "House", createdAt = 0L, updatedAt = 0L, floors = listOf(f1, f2))
         assertEquals(48.0, Measurements.projectArea(p), 1e-12)
+    }
+
+    @Test fun areaSummarySplitsLivingFromGarageAndOutdoor() {
+        // A ranch house: living rooms, an attached garage (non-living by type), a porch (outdoor), a laundry the user
+        // excluded by hand, and storage the user counts as living.
+        val living = room(rect).copy(id = "lv", type = RoomType.LIVING) // 12
+        val bed = room(rect).copy(id = "bd", type = RoomType.BEDROOM) // 12
+        val garage = room(lShape).copy(id = "g", type = RoomType.GARAGE) // 24
+        val porch = room(listOf(Vec2(0.0, 0.0), Vec2(2.0, 0.0), Vec2(2.0, 1.5), Vec2(0.0, 1.5))).copy(id = "p", type = RoomType.PORCH) // 3
+        val laundry = room(rect).copy(id = "la", type = RoomType.LAUNDRY, areaCategory = AreaCategory.EXCLUDED) // 12
+        val finished = room(rect).copy(id = "st", type = RoomType.STORAGE, areaCategory = AreaCategory.LIVING) // 12
+        val s = Measurements.areaSummary(listOf(living, bed, garage, porch, laundry, finished))
+        assertEquals(36.0, s.living, 1e-12)
+        assertEquals(24.0, s.nonLiving, 1e-12)
+        assertEquals(3.0, s.exterior, 1e-12)
+        assertEquals(12.0, s.excluded, 1e-12)
+        assertEquals(60.0, s.enclosed, 1e-12, "living + garage & unfinished; outdoor and excluded rooms are not enclosed area")
+        // Outdoor and unfinished types default to their categories.
+        for (t in listOf(RoomType.PORCH, RoomType.DECK, RoomType.BALCONY, RoomType.PATIO)) assertEquals(AreaCategory.EXTERIOR, t.defaultArea)
+        for (t in listOf(RoomType.GARAGE, RoomType.STORAGE, RoomType.UTILITY, RoomType.WORKSHOP, RoomType.BASEMENT)) {
+            assertEquals(AreaCategory.NON_LIVING, t.defaultArea)
+        }
+        assertEquals(AreaCategory.LIVING, RoomType.BEDROOM.defaultArea)
+        // Floors and projects add up; broken rooms count as nothing and never crash.
+        val broken = room(listOf(Vec2(Double.NaN, 0.0), Vec2(1.0, 1.0))).copy(id = "x")
+        val f1 = Floor("f1", "Main", rooms = listOf(living, garage, broken))
+        val f2 = Floor("f2", "Upper", rooms = listOf(bed, porch))
+        val p = Project(id = "p", name = "House", createdAt = 0L, updatedAt = 0L, floors = listOf(f1, f2, Floor("e", "Empty")))
+        assertEquals(AreaSummary(24.0, 24.0, 3.0, 0.0), Measurements.areaSummary(p))
+        assertEquals(AreaSummary.ZERO, Measurements.areaSummary(emptyList()))
+        val total = Measurements.areaSummary(p).let { it.enclosed + it.exterior + it.excluded }
+        assertEquals(Measurements.projectArea(p), total, 1e-12)
     }
 }

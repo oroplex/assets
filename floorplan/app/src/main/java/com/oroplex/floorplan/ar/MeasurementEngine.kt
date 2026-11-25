@@ -478,23 +478,15 @@ private class WallSampler(
                 null // a plane ARCore dropped meanwhile must not cost a successful fit
             }
         }
-        val fitted = sampleFit.observation?.takeIf { sampleFit.failure == null }
-        val result = when {
-            fitted != null -> sampleFit
-            planeObservation != null -> WallFit(
-                observation = planeObservation,
-                failure = null,
-                usedPoints = planeObservation.pointCount,
-                totalPoints = points.size,
-            )
-            else -> sampleFit
-        }
+        // Which evidence may be returned (never an un-aimed fit, never a plane that is not at the crosshair).
+        val decision = WallOutcome.decide(sampleFit, aimPoint, centerPoints, band, planeObservation, viewer, points.size)
         summary = try {
-            summarize(aimDistance, aimPoint, band, sampleFit, planeObservation, viewer)
+            summarize(aimDistance, aimPoint, band, sampleFit, planeObservation, viewer) +
+                " | result " + decision.source.name + (decision.fit.hint?.let { " (\"$it\")" } ?: "")
         } catch (e: Exception) {
             "" // diagnostics only
         }
-        return MeasureResult.WallMeasured(result)
+        return MeasureResult.WallMeasured(decision.fit)
     }
 
     private fun summarize(
@@ -534,7 +526,6 @@ private class WallSampler(
                 val at = aimPoint?.toPlan() ?: Vec2.lerp(fit.extentStart, fit.extentEnd, 0.5)
                 sb.append(' ').append(MeasurementReport.planeVersusFit(fit.line, plane.line, at))
             } else {
-                sb.append(" (used as the result)")
             }
         } else {
             sb.append(" | no wall plane under the crosshair")

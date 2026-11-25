@@ -1,5 +1,8 @@
 package com.oroplex.floorplan.ar
 
+import com.oroplex.floorplan.core.model.WallObservation
+import com.oroplex.floorplan.core.fit.WallFitFailure
+import com.oroplex.floorplan.core.fit.WallFit
 import com.oroplex.floorplan.core.fit.RobustStats
 import com.oroplex.floorplan.core.fit.WallEstimatorConfig
 import com.oroplex.floorplan.core.geometry.Line2
@@ -441,3 +444,107 @@ internal object MeasurementReport {
 
     const val MIN_SIGMA_POINTS = 10
 }
+
+/**
+ * What a wall capture returns, given the depth fit, the crosshair evidence and the ARCore wall plane under
+ * the crosshair. Pure, so the rules can be tested without a device.
+ *
+ * The depth fit ([WallEstimator.fromPoints]) is only trusted when it was told where the user aimed: without
+ * an aim point it fits the biggest surface in view, which behind a tall wardrobe or beside a doorway is not
+ * the wall at the crosshair. And an ARCore plane may only stand in for a failed fit when it really is the
+ * surface at the crosshair, because the "first wall plane along the ray" can be the wall of the next room
+ * seen through a doorway or the wall behind a column.
+ */
+internal object WallOutcome {
+    /** A plane counts as the surface at the crosshair when the crosshair's depth is within this of it (m)... */
+    const val PLANE_AIM_TOLERANCE = 0.05
+
+    /** ...or within this many expected depth sigmas at that range, whichever is larger. */
+    const val PLANE_AIM_SIGMAS = 2.0
+
+    /**
+     * Confidence given to a plane that stands in for a fit the estimator REFUSED (a short wall, too little of
+     * the wall in view): low enough for an amber wall chip and a "weak capture" note in the room review, so the
+     * user knows which wall to check with a tape.
+     */
+    const val UNVERIFIED_PLANE_CONFIDENCE = 0.35
+
+    const val HINT_NO_DEPTH_AT_AIM = "Nothing measurable at the crosshair. Aim at a part of this wall with some detail, or tap its base."
+    const val HINT_AIM_OFF_WALL = "The crosshair is on the floor or ceiling. Aim at the wall itself and capture again."
+    const val HINT_AIM_UNSTEADY = "Keep the crosshair on the wall until the ring fills, then try again."
+
+    /** How [decide] reached its result (for the diagnostics line). */
+    enum class Source { DEPTH_FIT, PLANE, PLANE_AFTER_REFUSAL, NO_AIM, FIT_FAILED }
+
+    class Decision(val fit: WallFit, val source: Source)
+
+    /**
+     * @param sampleFit the depth fit of all samples (computed with [aimPoint])
+     * @param aimPoint where the user aimed (median in-band crosshair sample), null when there were too few
+     * @param crosshair every crosshair sample of the capture, in or out of [band]
+     * @param plane the wall plane under the crosshair as an observation, or null
+     */
+    fun decide(
+        sampleFit: WallFit,
+        aimPoint: Vec3?,
+        crosshair: List<Vec3>,
+        band: ClosedFloatingPointRange<Double>,
+        plane: WallObservation?,
+        viewer: Vec3,
+        totalPoints: Int,
+        config: WallEstimatorConfig = WallEstimatorConfig(),
+    ): Decision {
+        val fitted = sampleFit.observation?.takeIf { sampleFit.failure == null }
+        if (aimPoint != null && fitted != null) return Decision(sampleFit, Source.DEPTH_FIT)
+
+        val planeAtAim = plane?.takeIf { planeIsAtCrosshair(it, crosshair, band, viewer, config) }
+        if (planeAtAim != null) {
+            // A plane replacing a fit the estimator refused on purpose is used, but flagged as unverified.
+            val refused = aimPoint != null && sampleFit.hint != null
+            val observation = if (refused) {
+                planeAtAim.copy(confidence = minOf(planeAtAim.confidence, UNVERIFIED_PLANE_CONFIDENCE))
+            } else {
+                planeAtAim
+            }
+            val fit = WallFit(observation, null, usedPoints = planeAtAim.pointCount, totalPoints = totalPoints)
+            return Decision(fit, if (refused) Source.PLANE_AFTER_REFUSAL else Source.PLANE)
+        }
+        if (aimPoint == null) {
+            val finite = crosshair.filter { it.isFinite() }
+            val hint = when {
+                finite.isEmpty() -> HINT_NO_DEPTH_AT_AIM
+                finite.none { it.y in band } -> HINT_AIM_OFF_WALL
+                else -> HINT_AIM_UNSTEADY
+            }
+            val fit = WallFit(null, WallFitFailure.NO_DOMINANT_PLANE, sampleFit.usedPoints, totalPoints, hint = hint)
+            return Decision(fit, Source.NO_AIM)
+        }
+        return Decision(sampleFit, Source.FIT_FAILED)
+    }
+
+    /**
+     * Whether [plane] is the surface the crosshair is on. With crosshair samples inside the height band, their
+     * median must lie on the plane (within [PLANE_AIM_TOLERANCE] or [PLANE_AIM_SIGMAS] expected sigmas). With
+     * crosshair samples only outside the band (floor, ceiling) the plane is not what was aimed at. With no
+     * crosshair samples at all nothing contradicts the plane, so it is accepted (depth off, or a blank wall
+     * ARCore still found a plane on).
+     */
+    fun planeIsAtCrosshair(
+        plane: WallObservation,
+        crosshair: List<Vec3>,
+        band: ClosedFloatingPointRange<Double>,
+        viewer: Vec3,
+        config: WallEstimatorConfig = WallEstimatorConfig(),
+    ): Boolean {
+        val finite = crosshair.filter { it.isFinite() }
+        if (finite.isEmpty()) return true
+        val inBand = finite.filter { it.y in band }
+        if (inBand.isEmpty()) return false
+        val at = MeasurementMath.componentMedian(inBand)
+        if (!at.isFinite()) return false
+        val range = at.toPlan().distanceTo(viewer.toPlan())
+        val tolerance = max(PLANE_AIM_TOLERANCE, PLANE_AIM_SIGMAS * config.expectedSigma(range))
+        return abs(plane.line.signedDistance(at.toPlan())) <= tolerance
+    }
+}
+

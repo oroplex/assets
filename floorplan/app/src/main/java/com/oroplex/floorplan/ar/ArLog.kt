@@ -1,6 +1,7 @@
 package com.oroplex.floorplan.ar
 
 import android.util.Log
+import com.oroplex.floorplan.diagnostics.ScanLog
 import java.util.Locale
 
 /**
@@ -41,6 +42,13 @@ internal object ArLog {
         } catch (e: RuntimeException) {
             // Plain JVM unit tests run against the stubbed android.jar, whose Log methods throw.
         }
+        // The same line goes to the on-device scan log, so a test without a computer attached can share it.
+        val level = when (priority) {
+            Log.ERROR -> "E "
+            Log.WARN -> "W "
+            else -> ""
+        }
+        ScanLog.record(level + message + (error?.let { " [" + it.javaClass.simpleName + ": " + it.message + "]" } ?: ""))
     }
 }
 

@@ -92,6 +92,16 @@ object ScanLog {
         }
     }
 
+    /** Record one entry in the file only, for callers that have already written it to logcat. Never throws. */
+    fun record(message: String) {
+        val now = System.currentTimeMillis()
+        try {
+            writer.execute { write(now, message) }
+        } catch (e: Throwable) {
+            // Rejected (shutting down): logcat already has it.
+        }
+    }
+
     /**
      * Record [message] before returning. For the crash handler: the process is about to die, so the queue
      * cannot be relied on.

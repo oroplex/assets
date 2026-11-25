@@ -751,7 +751,7 @@ class CaptureViewModel(
                     if (observation != null && observation.isUsable()) {
                         addObservation(observation)
                     } else {
-                        wallFailed(result.fit.failure?.message ?: MSG_WALL_FAILED)
+                        wallFailed(result.fit.message ?: MSG_WALL_FAILED)
                     }
                 }
                 is MeasureResult.Failed -> wallFailed(result.reason)

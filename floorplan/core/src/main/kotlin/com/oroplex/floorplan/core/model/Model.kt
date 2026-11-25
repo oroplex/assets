@@ -36,10 +36,11 @@ data class PlanSettings(
     /** Draw overall exterior dimension lines (width / depth of the whole floor) around the plan. */
     val showOverallDimensions: Boolean = true,
     /**
-     * Thickness drawn for EXTERIOR walls (room walls with no other room's wall facing them across a partition
-     * gap), and therefore what overall dimensions measure to. null = use [wallThickness] for every wall.
+     * Thickness of EXTERIOR walls (room walls with no other room's wall facing them across a partition gap):
+     * overall dimensions measure to the outside of walls this thick (default 6.5" = 0.1651 m, a typical
+     * 2x4 wall with sheathing and siding). null = use [wallThickness]. Snapping gaps stay [wallThickness].
      */
-    val exteriorWallThickness: Double? = null,
+    val exteriorWallThickness: Double? = 0.1651,
 )
 
 /** What a room's floor area counts toward in area summaries (see Measurements.areaSummary). */
@@ -175,10 +176,19 @@ data class Room(
     val areaCategory: AreaCategory? = null,
     /** Walls the user set by hand in the editor (typed length, dragged / inserted / deleted corner). */
     val handSetWalls: List<HandSetWall> = emptyList(),
+    /**
+     * Rigid placement frame the room belongs to; null = its [sessionId] frame. Rooms of one scan session share
+     * a frame until one of them is moved, rotated or snapped ON ITS OWN, which sets this to the room's own id;
+     * whole-scan (group) moves keep it. FloorChecks uses frames to decide what is aligned.
+     */
+    val frameId: String? = null,
 )
 
 /** The area category this room counts toward: [Room.areaCategory], or its type's default. */
 val Room.effectiveAreaCategory: AreaCategory get() = areaCategory ?: type.defaultArea
+
+/** The placement frame of the room: [Room.frameId], else its scan session, else the room itself. */
+val Room.placementFrame: String get() = frameId ?: sessionId ?: id
 
 /**
  * A wall edge the user set by hand in the editor, stored as the edge's plan [segment] so it survives corner

@@ -105,10 +105,11 @@ swing arc, blue window symbols, bold room names, secondary text for dimensions a
 
 ## Round 3 additions (contracts)
 Driven by `docs/REVIEW-2.md` (finding ids SEAM-n, ARX-n, MATH-n, CAPX-n, APPX-n, PREM-n).
-* Model: `PlanSettings.exteriorWallThickness` (null = wallThickness), `AreaCategory` + `RoomType.defaultArea`
+* Model: `PlanSettings.exteriorWallThickness` (default 6.5"; overall dimensions measure to its outside), `AreaCategory` + `RoomType.defaultArea`
   + `Room.areaCategory` / `Room.effectiveAreaCategory`, new room types (den, pantry, bonus room, sunroom,
   mudroom, workshop, basement, porch, deck, balcony, patio), `Opening.typed`, `Room.ceilingTyped`,
-  `Room.handSetWalls` (`HandSetWall(segment, typedLength)`), `RoomNames.unique/isDefaultName` (one numbering
+  `Room.handSetWalls` (`HandSetWall(segment, typedLength)`), `Room.frameId` / `Room.placementFrame` (single-room
+  moves leave the session frame; group moves keep it), `RoomNames.unique/isDefaultName` (one numbering
   rule for capture, editor and type changes).
 * Provenance rule for calibration (tape scale correction): only AR-measured values scale. Typed values
   (`ceilingTyped`, `Opening.typed` widths, `HandSetWall.typedLength`) and estimated ceilings keep their

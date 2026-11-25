@@ -707,11 +707,19 @@ class PlanEditorViewModel(
     /**
      * Returns an error message for the dialog, or null when the length was applied. Goes through
      * [RoomOps.setWallLength], which records the wall as set by hand (kept under tape calibration).
+     * Confirming the length the wall already shows moves no corner but still records it as tape-checked: that
+     * is what a user does when the tape agrees with the plan, and it must protect the wall from a later
+     * calibration and clear its "check with a tape" note just like a changed length does.
      */
     fun setWallLength(roomId: String, wallIndex: Int, length: Double): String? {
         if (!length.isFinite() || length <= MIN_WALL) return "The wall must be longer than ${_state.value.settings.formatLength(MIN_WALL)}."
         val room = committedRoom(roomId) ?: return null
-        if (wallIndex in room.corners.indices && abs(edgeLength(room, wallIndex) - length) < 1e-6) return null
+        if (wallIndex in room.corners.indices && abs(edgeLength(room, wallIndex) - length) < 1e-6) {
+            // The wall's exact current length, so RoomOps takes its "same length" branch and no corner moves.
+            // CHANGED = the record was added (one undo step); UNCHANGED = it was already recorded.
+            editRoom(roomId) { RoomOps.setWallLength(it, wallIndex, edgeLength(it, wallIndex)) }
+            return null
+        }
         return when (editRoom(roomId) { reshaped(it, RoomOps.setWallLength(it, wallIndex, length)) }) {
             EditResult.CHANGED, EditResult.NOT_FOUND -> null
             EditResult.UNCHANGED -> "That length would make the room's outline cross itself. Try moving a corner instead."

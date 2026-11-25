@@ -39,6 +39,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -181,7 +182,10 @@ private fun EndScanDialog(savedRoomCount: Int, onEnd: () -> Unit, onKeepScanning
 private fun InterruptedScanDialog(notice: InterruptedScan, onSave: () -> Unit, onDismiss: () -> Unit) {
     val restorable = notice.restorable
     AlertDialog(
-        onDismissRequest = onDismiss,
+        // With a room that can still be saved, a tap outside or Back must not throw it away: the notice
+        // holds the only copy, so only the two buttons close the dialog. The plain notice closes freely.
+        onDismissRequest = { if (restorable == null) onDismiss() },
+        properties = DialogProperties(dismissOnBackPress = restorable == null, dismissOnClickOutside = restorable == null),
         title = { Text("Scan interrupted") },
         text = { Text(interruptedScanText(notice)) },
         confirmButton = {

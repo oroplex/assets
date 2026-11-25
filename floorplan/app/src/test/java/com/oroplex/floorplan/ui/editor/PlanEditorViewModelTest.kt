@@ -708,14 +708,23 @@ class PlanEditorViewModelTest {
     }
 
     @Test
-    fun settingAWallLengthClearsWarningsButTheSameLengthIsANoOp() = runTest {
+    fun settingAWallLengthClearsWarningsAndConfirmingTheShownLengthRecordsATapeCheck() = runTest {
         val warned = rect("a", 0.0, 0.0, 4.0, 3.0).copy(warnings = listOf("A wall seems to be missing"))
         val repo = FakeRepository(project.copy(floors = listOf(Floor("f1", "Main Floor", listOf(warned)))))
         val vm = vm(repo)
 
+        // The tape agrees with the plan: "Apply" on the pre-filled length. No corner moves and the solver's
+        // warnings stay, but the wall is now recorded as tape-checked (one undo step).
         assertNull(vm.setWallLength("a", 0, 4.0))
-        assertFalse(vm.state.value.canUndo)
+        assertEquals(warned.corners, vm.room("a").corners)
         assertEquals(warned.warnings, vm.room("a").warnings)
+        val record = vm.room("a").handSetWalls.single()
+        assertEquals(4.0, record.typedLength!!, 1e-9)
+        assertTrue(vm.state.value.canUndo)
+        // Confirming it again changes nothing and is not an error.
+        val before = vm.room("a")
+        assertNull(vm.setWallLength("a", 0, 4.0))
+        assertEquals(before, vm.room("a"))
 
         assertNull(vm.setWallLength("a", 0, 5.0))
         assertEquals(5.0, edgeLength(vm.room("a"), 0), 1e-9)

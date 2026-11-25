@@ -165,9 +165,11 @@ class HardScenariosTest {
     @Test
     fun noisierSensor_headOnWallsAreStillCapturedAndPrecise() {
         // Measured worst offset / angle: x1.5 13.2 mm / 1.30 deg; x2.0 21.3 mm / 2.13 deg; frame 17.5 mm / 1.12 deg;
-        // field 5.1 mm / 2.43 deg (a smooth error tilts the wall: nothing in one capture can tell).
+        // field 6.2 mm / 2.43 deg (a smooth error tilts the wall: nothing in one capture can tell). The field
+        // offset was 5.1 mm before the shallow-step rule: on a strongly bowed patch (2 of 120 captures here)
+        // that rule takes the two end stations for another face and the line rests on the other seven.
         val bounds = mapOf(
-            "x1.5" to (17 * MM to 1.7), "x2.0" to (27 * MM to 2.7), "x1.5+frame0.3%" to (22 * MM to 1.5), "x1+field0.3%" to (7 * MM to 3.0),
+            "x1.5" to (17 * MM to 1.7), "x2.0" to (27 * MM to 2.7), "x1.5+frame0.3%" to (22 * MM to 1.5), "x1+field0.3%" to (8 * MM to 3.0),
         )
         assertEquals(bounds.keys, HardScenarios.sweepStress.map { it.first }.toSet())
         for ((name, rows) in HardScenarios.sweepStress) {

@@ -42,7 +42,7 @@ object Onboarding {
             body = "Each room takes about a minute.",
             points = listOf(
                 "Point at the floor and move slowly until it locks.",
-                "Aim at each wall above the furniture and tap Capture. Go around the room in order.",
+                "Aim at bare wall above the furniture, not at a door or picture, and tap Capture. Go around the room in order.",
                 "Close the room, then tap “Scan next room”. Rooms from one session line up automatically.",
             ),
         ),

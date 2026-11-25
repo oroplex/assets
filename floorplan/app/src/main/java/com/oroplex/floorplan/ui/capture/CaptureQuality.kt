@@ -100,7 +100,7 @@ internal fun wallQualityText(o: WallObservation, settings: PlanSettings): String
     return when (grade) {
         CaptureGrade.GOOD -> detail
         CaptureGrade.FAIR -> if (isNoisy(o)) "$detail. Noisy: consider re-capturing it." else "$detail. Re-capture from closer if you can."
-        CaptureGrade.POOR -> "$detail. Re-capture it: aim at a textured spot above furniture, 1–3 m away."
+        CaptureGrade.POOR -> "$detail. Re-capture it: aim at bare wall above furniture, 1–3 m away."
     }
 }
 

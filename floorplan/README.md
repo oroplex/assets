@@ -29,8 +29,8 @@ Developers: `adb install -r app/build/outputs/apk/debug/app-debug.apk` after bui
 1. **Find the floor.** Point at the floor and sweep slowly until the app locks it.
 2. **Ceiling (optional).** Aim straight up and tap *Measure ceiling*, or *Skip* (the default height is
    used and marked *est.* everywhere).
-3. **Walls, in order.** Go around the room in one direction. For each wall, aim the crosshair at a clear
-   area of the wall **above furniture**, hold still, and tap *Capture*. Corners hidden behind furniture
+3. **Walls, in order.** Go around the room in one direction. For each wall, aim the crosshair at **bare wall
+   above furniture** (beside doors, windows, pictures and TVs, not on them), hold still, and tap *Capture*. Corners hidden behind furniture
    don't matter — corners are computed where neighbouring walls meet.
 4. **Close the room**, add doors and windows (mark the left and right edge of each), review, name it.
 5. **Save & scan next room** without leaving the scanner. Rooms scanned in one session line up automatically.
@@ -42,7 +42,9 @@ where the wall meets the floor — or switch to *Corners* mode.
 ## Getting the best accuracy
 
 * Good lighting; slow, steady movement; stay roughly 1–4 m (3–13 ft) from the wall you're capturing.
-* Aim at textured or decorated parts of walls; avoid mirrors, glass and glossy surfaces.
+* Aim at the wall itself. A door, a picture or a TV under the crosshair gets measured instead of the wall
+  (the app refuses the capture or warns that the wall came out off square). Detail nearby helps; avoid
+  mirrors, glass and glossy surfaces.
 * Scan a whole floor in **one** session so rooms align. If you must stop, select a room of the later scan
   in the editor, keep *Whole scan* on, and use *Square to floor* and *Snap to neighbour* to dock all its
   rooms against the existing ones in one go.

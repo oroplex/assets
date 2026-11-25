@@ -69,7 +69,8 @@ internal val SCAN_TIPS = listOf(
     ),
     ScanTip(
         "Capture each wall in order",
-        "Aim above furniture and hold still until the ring fills. Go around the room one wall at a time.",
+        "Aim at bare wall above furniture, beside doors, pictures and TVs rather than on them, and hold still " +
+            "until the ring fills. Go around the room one wall at a time.",
         TipArt.WALLS,
     ),
     ScanTip(

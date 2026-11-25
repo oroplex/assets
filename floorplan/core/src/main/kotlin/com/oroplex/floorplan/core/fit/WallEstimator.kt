@@ -19,7 +19,7 @@ import kotlin.math.sqrt
 
 enum class WallFitFailure(val message: String) {
     TOO_FEW_POINTS("Not enough depth points on the wall. Move closer or aim at a textured area."),
-    NO_DOMINANT_PLANE("Couldn't find a flat wall at the crosshair. Aim at the middle of the wall, above furniture."),
+    NO_DOMINANT_PLANE("Couldn't find a flat wall at the crosshair. Aim at a bare part of the wall, above furniture."),
     TOO_NOISY("Wall measurement too noisy. Hold steady, add light, or move closer."),
     TOO_FAR("Too far from the wall for an accurate reading. Move within about 4 m (13 ft)."),
 }
@@ -295,6 +295,22 @@ object WallEstimator {
     private const val FLATNESS_Z = 3.09
 
     /**
+     * Shallow steps ([shallowStep]): a step model must beat one line by [STEP_Z]² in χ², over at least
+     * [MIN_STEP_STATIONS] stations, with a step of [STEP_MIN_SIGMAS] times the per-sample noise or more
+     * (never under [STEP_MIN_DEPTH] m). A station's median is taken to be known to its statistical error plus
+     * [STEP_SYSTEMATIC] of the per-sample noise. At most [MAX_STEPS] steps are cut off per walk.
+     */
+    private const val STEP_Z = 3.5
+    private const val MIN_STEP_STATIONS = 4
+    private const val STEP_MIN_DEPTH = 0.012
+    private const val STEP_MIN_SIGMAS = 0.8
+    private const val STEP_SYSTEMATIC = 0.05
+
+    /** A step that leaves one station alone on a side must be this many times the minimum step deep. */
+    private const val LONE_STATION_FACTOR = 1.3
+    private const val MAX_STEPS = 3
+
+    /**
      * Aim cluster (see [FitContext.aimCluster]): the samples of the crosshair's station within this multiple of
      * the RANSAC band of the aim point, along their rays. The wall fitted without that station must pass their
      * robust position within [AIM_CLUSTER_SIGMAS] standard errors, at least [MIN_AIM_CLUSTER_TOLERANCE] m (see
@@ -423,6 +439,12 @@ object WallEstimator {
 
     /** [WallFit.hint] when the surface at the crosshair is not one flat face (a chord across a corner). */
     const val HINT_SHORT_WALL = "Short wall or corner here. Stand square to this wall and capture again, or tap its base."
+
+    /**
+     * [WallFit.hint] when something flat stands proud of the wall or is set into it under the crosshair (a
+     * door, a picture, a TV) and too little is left on the crosshair's side of that step to measure.
+     */
+    const val HINT_STEP = "A door, picture or TV is in the way here. Aim at bare wall beside it, or tap the wall's base."
 
     /** [WallFit.hint] when the wall was found but too little of it was seen for a precise line. */
     const val HINT_IMPRECISE = "Too little of this wall is in view. Stand square to it, a little closer, or tap its base."
@@ -759,7 +781,9 @@ object WallEstimator {
 
     /** Steps 6–10 of [fromPoints] for one chosen surface. */
     private fun evaluate(choice: Choice, c: FitContext): Outcome {
-        fun notAWall(used: Int) = Rejection(WallFitFailure.NO_DOMINANT_PLANE, used, HINT_SHORT_WALL, tryNext = true)
+        // A stretch that a shallow step cut short: the refusal should name the door / picture, not a corner.
+        var stepSeen = false
+        fun notAWall(used: Int) = Rejection(WallFitFailure.NO_DOMINANT_PLANE, used, if (stepSeen) HINT_STEP else HINT_SHORT_WALL, tryNext = true)
 
         // 6) Refinement on the samples near the chosen line, then 7) on its own stretch of the depth profile.
         val sigmas = expectedPlanSigmas(c.samples, choice.wall.fit.line, c.viewer, c.config)
@@ -787,6 +811,7 @@ object WallEstimator {
         for (round in 0..SEGMENT_ROUNDS) {
             val within = if (round >= FREE_SEGMENT_ROUNDS) fitted else null
             val next = flatStretch(refined.line, sigmas, seedAzimuth, seedStation, within, c) ?: return notAWall(refined.count)
+            if (next.stepCut) stepSeen = true
             if (next.stations < MIN_STATIONS) return notAWall(refined.count)
             if (fitted != null && next.sameAs(fitted)) {
                 stretch = next
@@ -824,7 +849,7 @@ object WallEstimator {
         val (offsetError, statisticalDirectionError) = c.config.lineErrors(noise.sigma, refined.count, sqrt(12.0) * refined.spread)
         val directionError = hypot(statisticalDirectionError, stretch.endTilt)
         if (!(offsetError <= c.config.maxOffsetError) || !(directionError <= Math.toRadians(c.config.maxDirectionErrorDeg))) {
-            return Rejection(WallFitFailure.TOO_NOISY, refined.count, HINT_IMPRECISE, tryNext = false, noiseRatio = noise.ratio)
+            return Rejection(WallFitFailure.TOO_NOISY, refined.count, if (stepSeen) HINT_STEP else HINT_IMPRECISE, tryNext = false, noiseRatio = noise.ratio)
         }
 
         // 9) Orientation: viewer on the LEFT; extents along +direction in the final orientation.
@@ -880,9 +905,13 @@ object WallEstimator {
          * face's: the end stations' position errors over the lever between them (see [flatStretch]).
          */
         val endTilt: Double,
+        /** A shallow step ([shallowStep]) ended this stretch on one side. */
+        val stepCut: Boolean,
+        /** Exactly three stations, and the middle one is off the line through the other two ([bentTriple]). */
+        val bent: Boolean,
     ) {
-        /** The stations' residuals are jointly consistent with one flat face (see [FLATNESS_Z]). */
-        val flat: Boolean get() = judged <= 2 || chiSquare <= chiSquareLimit(judged - 2)
+        /** The stations' residuals are jointly consistent with one flat face (see [FLATNESS_Z] and [bentTriple]). */
+        val flat: Boolean get() = !bent && (judged <= 2 || chiSquare <= chiSquareLimit(judged - 2))
 
         /** The same samples as [other] up to [SETTLED_FRACTION] of them (a chunk flipping at one end is not a change). */
         fun sameAs(other: BooleanArray): Boolean {
@@ -912,7 +941,7 @@ object WallEstimator {
      * face's samples are smeared along their rays into this face's band (± 4 cm at 2 m). A short wall seen at an
      * angle sits between two such corners; a line through one of its sampling columns and one of a neighbour's
      * fits both perfectly, and so does the diagonal of a closet return through one column of each of its three
-     * faces (review round 2, MATH-1: "fake diagonal chord"). Three rules, all in azimuth order:
+     * faces (review round 2, MATH-1: "fake diagonal chord"). Four rules, all in azimuth order:
      *
      * 1. Walk. Each station's samples within the RANSAC band of [line] are cut into chunks along the azimuth;
      *    starting at the chunk in the [seedAzimuth] direction (the crosshair), chunks are taken in both
@@ -925,7 +954,9 @@ object WallEstimator {
      *    without samples at those heights (one stray frame, furniture below the crosshair) are stepped over.
      * 2. Neighbours. While the outermost station of the stretch lies on the line through the next two stations
      *    beyond it ([ownedByNeighbour]), it is the neighbouring face's, not this wall's, and is given up.
-     * 3. The caller requires [MIN_STATIONS] stations: a wall is only a wall where it is seen flat at three places.
+     * 3. Steps. Where the stations left show a shallow step (two parallel faces a few centimetres apart, see
+     *    [shallowStep]), the stretch ends at the step and only the side the crosshair is on is kept.
+     * 4. The caller requires [MIN_STATIONS] stations: a wall is only a wall where it is seen flat at three places.
      *
      * Tolerances scale with the noise actually measured at the seed station ([localNoise]), relative to the
      * noise model, clamped to 1 … [MAX_SEGMENT_NOISE_RATIO].
@@ -1046,41 +1077,77 @@ object WallEstimator {
         }
 
         // 3) What is left: the samples the wall may use, its stations and their joint flatness.
-        val allowed = BooleanArray(c.usable.size)
-        val supports = ArrayList<Int>()
-        val errors = ArrayList<Double>()
-        val positions = ArrayList<Double>()
-        val indices = ArrayList<Int>()
-        var chiSquare = 0.0
-        var k = 0
-        while (k < chunks.size) {
-            val station = chunks[k].station
-            val residuals = ArrayList<Double>()
-            val perps = ArrayList<Double>()
-            val along = ArrayList<Double>()
-            while (k < chunks.size && chunks[k].station == station) {
-                if (taken[k]) {
-                    for (i in chunks[k].members) {
-                        if (within != null && !within[i]) continue
-                        allowed[i] = true
-                        val d = line.signedDistance(c.usable[i])
-                        if (abs(d) > c.threshold) continue
-                        residuals += d
-                        perps += perp(i)
-                        along += line.param(c.usable[i])
+        fun judge(): StationProfile {
+            val profile = StationProfile(c.usable.size)
+            var k = 0
+            while (k < chunks.size) {
+                val station = chunks[k].station
+                val residuals = ArrayList<Double>()
+                val perps = ArrayList<Double>()
+                val along = ArrayList<Double>()
+                while (k < chunks.size && chunks[k].station == station) {
+                    if (taken[k]) {
+                        for (i in chunks[k].members) {
+                            if (within != null && !within[i]) continue
+                            profile.allowed[i] = true
+                            val d = line.signedDistance(c.usable[i])
+                            if (abs(d) > c.threshold) continue
+                            residuals += d
+                            perps += perp(i)
+                            along += line.param(c.usable[i])
+                        }
                     }
+                    k++
                 }
-                k++
+                if (residuals.size < MIN_STATION_SAMPLES) continue
+                val error = medianError(perps, residuals.size)
+                val median = RobustStats.median(residuals)
+                val perSample = ratio * RobustStats.median(perps)
+                profile.supports += residuals.size
+                profile.errors += error
+                profile.stepErrors += hypot(MEDIAN_SE_FACTOR * perSample / sqrt(residuals.size.toDouble()), STEP_SYSTEMATIC * perSample)
+                profile.noises += perSample
+                profile.medians += median
+                profile.positions += RobustStats.median(along)
+                profile.indices += station
+                val z = median / error
+                profile.chiSquare += z * z
             }
-            if (residuals.size < MIN_STATION_SAMPLES) continue
-            val error = medianError(perps, residuals.size)
-            supports += residuals.size
-            errors += error
-            positions += RobustStats.median(along)
-            indices += station
-            val z = RobustStats.median(residuals) / error
-            chiSquare += z * z
+            return profile
         }
+        var profile = judge()
+        var stepCut = false
+        // A shallow step inside the stretch (a door, a picture, a TV: see [shallowStep]) ends it like a corner
+        // does: only the side the crosshair is on stays. A recessed door has a step at each jamb, hence the loop.
+        for (pass in 0 until MAX_STEPS) {
+            val minDepth = max(STEP_MIN_DEPTH, STEP_MIN_SIGMAS * RobustStats.median(profile.noises))
+            val step = shallowStep(profile.positions, profile.medians, profile.stepErrors, minDepth) ?: break
+            stepCut = true
+            val lowEnd = profile.indices[step.lastLow]
+            val highStart = profile.indices[step.firstHigh]
+            for (k in chunks.indices) {
+                if (!taken[k]) continue
+                val station = chunks[k].station
+                val keep = when {
+                    seedStation <= lowEnd -> station <= lowEnd
+                    seedStation >= highStart -> station >= highStart
+                    else -> station == seedStation // the crosshair is on the edge itself
+                }
+                if (!keep) taken[k] = false
+            }
+            profile = judge()
+        }
+        // Three stations cannot show which side of a step is the wall, only that they are not in one line.
+        val bent = profile.indices.size == MIN_STEP_STATIONS - 1 && run {
+            val minDepth = max(STEP_MIN_DEPTH, STEP_MIN_SIGMAS * RobustStats.median(profile.noises))
+            bentTriple(profile.positions, profile.medians, profile.stepErrors, minDepth)
+        }
+        val allowed = profile.allowed
+        val supports = profile.supports
+        val errors = profile.errors
+        val positions = profile.positions
+        val indices = profile.indices
+        val chiSquare = profile.chiSquare
         // A station counts when it holds a fair share of samples: one stray frame between two sampling columns
         // (a jolt of the hand) is not a third place where the wall was seen.
         val fairShare = max(MIN_STATION_SAMPLES.toDouble(), MIN_STATION_SHARE * RobustStats.median(supports.map { it.toDouble() }))
@@ -1102,7 +1169,145 @@ object WallEstimator {
             val high = if (sampledBeyond(indices.last(), 1)) errors.last() else 0.0
             if (lever > 1e-6) endTilt = hypot(low, high) / lever
         }
-        return Stretch(allowed, supports.count { it >= fairShare }, supports.size, ratio, chiSquare, endTilt)
+        return Stretch(allowed, supports.count { it >= fairShare }, supports.size, ratio, chiSquare, endTilt, stepCut, bent)
+    }
+
+    /** The stations of a stretch as [flatStretch] judges them, in azimuth order. */
+    private class StationProfile(samples: Int) {
+        val allowed = BooleanArray(samples)
+        val supports = ArrayList<Int>()
+        val errors = ArrayList<Double>()
+
+        /** Standard errors for [shallowStep]: without most of the allowance for smooth depth errors. */
+        val stepErrors = ArrayList<Double>()
+
+        /** Expected per-sample noise across the line at each station (m). */
+        val noises = ArrayList<Double>()
+        val medians = ArrayList<Double>()
+        val positions = ArrayList<Double>()
+        val indices = ArrayList<Int>()
+        var chiSquare = 0.0
+    }
+
+    /**
+     * A shallow step in a stretch: something flat that stands a few centimetres proud of the wall or is set
+     * into it (a closed door seen from its recessed side, a wall-mounted TV, a deep picture frame, a radiator
+     * cover). When the step is smaller than the inlier band (2 σ of the depth noise: 6 cm at 2 m, 11 cm at
+     * 4 m) both surfaces are inliers of one line, each station passes its own tolerance, and the line that
+     * fits best is a diagonal through the wall on one side and the object on the other: 5–9° off, which the
+     * room solver keeps as measured. The chord has nothing to do with noise, so the precision gates pass it.
+     *
+     * The stations' median residuals ([medians], with standard errors [errors]) at the places [positions]
+     * along the line are fitted twice by weighted least squares: as one line, and as two PARALLEL lines with
+     * a step between two neighbouring stations (every split of [MIN_STEP_STATIONS] stations or more; a single
+     * end station that is off the line through all the others is the smallest case, and it alone turns a
+     * line through three stations by 6°). A step is reported when the best split lowers χ² by [STEP_Z]² or
+     * more (one extra parameter, so that gain is χ²(1) for a flat wall: p ≈ 0.0005 per split) and is at
+     * least [minDepth] deep. The station on the edge itself sees both faces and lies somewhere between them,
+     * which blurs a clean step; so every split is also tried with that one station left out.
+     *
+     * The errors here are tighter than the ones a station is judged by ([SEGMENT_SYSTEMATIC]): that allowance
+     * is for depth errors that vary smoothly over a patch of wall, and a smooth error (a bowed patch, a
+     * gradient) is not a step: neighbouring stations share it, and the step model does not fit it better
+     * than a line by a step of [minDepth]. What decides is therefore the size of the step, [minDepth]: about
+     * half the per-sample noise, three times the smooth error the estimator allows for, and the size from
+     * which a chord turns the wall by more than squaring absorbs. A tilted wall is still one line.
+     * Returns where the step is, or null.
+     */
+    private fun shallowStep(positions: List<Double>, medians: List<Double>, errors: List<Double>, minDepth: Double): Step? {
+        val n = positions.size
+        if (n < MIN_STEP_STATIONS) return null
+        if (errors.any { !(it > 0.0) || !it.isFinite() }) return null
+        var best: Step? = null
+        var bestGain = STEP_Z * STEP_Z
+        // [skip] = the station on the edge that is left out of both sides, or -1 for a clean step.
+        for (skip in -1 until n) {
+            if (skip >= 0 && (n - 1 < MIN_STEP_STATIONS || skip == 0 || skip == n - 1)) continue
+            val used = (0 until n).filter { it != skip }
+            val w = DoubleArray(n) { 1.0 / (errors[it] * errors[it]) }
+            val sw = used.sumOf { w[it] }
+            val centre = used.sumOf { w[it] * positions[it] } / sw
+            var stt = 0.0
+            var sy = 0.0
+            var sty = 0.0
+            for (i in used) {
+                val t = positions[i] - centre
+                stt += w[i] * t * t
+                sy += w[i] * medians[i]
+                sty += w[i] * t * medians[i]
+            }
+            if (stt < 1e-12) continue
+            // One line (Σ w t = 0 after centring).
+            val a0 = sy / sw
+            val b0 = sty / stt
+            var chiLine = 0.0
+            for (i in used) chiLine += w[i] * (medians[i] - a0 - b0 * (positions[i] - centre)).let { it * it }
+            if (chiLine < bestGain) continue
+
+            val splits = if (skip >= 0) skip - 1..skip - 1 else 0..n - 2
+            for (split in splits) {
+                // y = a + b t + c h with h = 1 beyond the split; normal equations of the weighted fit.
+                var sh = 0.0
+                var sth = 0.0
+                var shy = 0.0
+                for (i in used) {
+                    if (i <= split) continue
+                    sh += w[i]
+                    sth += w[i] * (positions[i] - centre)
+                    shy += w[i] * medians[i]
+                }
+                // | sw  0   sh  | a     | sy  |
+                // | 0   stt sth | b  =  | sty |
+                // | sh  sth sh  | c     | shy |
+                val det = sw * (stt * sh - sth * sth) - sh * (stt * sh)
+                if (abs(det) < 1e-9 * sw * stt * sh || det == 0.0) continue
+                val a = (sy * (stt * sh - sth * sth) + sh * (sty * sth - stt * shy)) / det
+                val b = (sw * (sty * sh - sth * shy) - sh * (sty * sh - sth * sy)) / det
+                val depth = (sw * (stt * shy - sth * sty) - sh * (stt * sy)) / det
+                var chiStep = 0.0
+                for (i in used) {
+                    chiStep += w[i] * (medians[i] - a - b * (positions[i] - centre) - (if (i > split) depth else 0.0)).let { it * it }
+                }
+                val gain = chiLine - chiStep
+                // A single station on one side is only as good as the line through the others carried out to
+                // it, and a bowed patch bends away from that line at its ends: it needs a deeper step, and
+                // its neighbour may not be left out as well.
+                val low = used.count { it <= split }
+                val lone = low == 1 || used.size - low == 1
+                if (lone && skip >= 0) continue
+                if (gain >= bestGain && abs(depth) >= (if (lone) LONE_STATION_FACTOR * minDepth else minDepth)) {
+                    bestGain = gain
+                    best = Step(lastLow = split, firstHigh = if (skip >= 0) skip + 1 else split + 1)
+                }
+            }
+        }
+        return best
+    }
+
+    /**
+     * Where [shallowStep] found a step: between the stations [lastLow] and [firstHigh] of the profile. They
+     * are neighbours, or have one station between them that sits on the edge and belongs to neither face.
+     */
+    private class Step(val lastLow: Int, val firstHigh: Int)
+
+    /**
+     * [shallowStep] for a stretch of exactly three stations: a step between two of them shows as the middle
+     * station lying off the line through the outer two, by half the step when they are evenly spaced. Three
+     * stations cannot tell which side is the wall (a step after the first and one after the second fit them
+     * equally well), so such a stretch is not a flat face at all. The same errors and minimum step as in
+     * [shallowStep] apply; a smooth depth error over three neighbouring stations bends them far less.
+     */
+    private fun bentTriple(positions: List<Double>, medians: List<Double>, errors: List<Double>, minDepth: Double): Boolean {
+        if (positions.size != 3) return false
+        val span = positions[2] - positions[0]
+        if (abs(span) < 1e-9) return false
+        val f = (positions[1] - positions[0]) / span
+        if (f <= 0.0 || f >= 1.0) return false
+        val off = medians[1] - (medians[0] + f * (medians[2] - medians[0]))
+        val error = sqrt(errors[1] * errors[1] + (1 - f) * (1 - f) * errors[0] * errors[0] + f * f * errors[2] * errors[2])
+        // A step of minDepth right after the first or before the last station puts the middle one off by
+        // (1 − f) or f times that.
+        return abs(off) >= STEP_Z * error && abs(off) >= min(f, 1 - f) * minDepth
     }
 
     /** Upper quantile, [FLATNESS_Z] normal deviations out, of χ² with [dof] degrees of freedom (Wilson–Hilferty). */

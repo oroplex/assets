@@ -31,9 +31,14 @@ Create a project, tap **Scan room**, and scan the same room three times, saving 
 
 1. Point at open floor and move slowly until the floor locks.
 2. Aim straight up and tap **Measure ceiling** (try **Skip** on one of the three scans).
-3. Go around the room in one direction. For each wall, stand 1.5–3 m (5–10 ft) back, aim the crosshair at the
-   middle of the wall above the furniture, hold still and tap **Capture wall**.
+3. Go around the room in one direction. For each wall, stand 1.5–3 m (5–10 ft) back, aim the crosshair at
+   bare wall above the furniture (beside doors, windows, pictures and TVs, not on them), hold still and tap
+   **Capture wall**.
 4. **Close room**, mark one door (left edge, then right edge at the floor), **Done**, then save.
+
+One extra capture, worth two minutes: in the third scan, capture one wall a second time while aiming straight
+at a closed door, a wall-mounted TV or a large picture from across the room, and note what the app said (it
+should refuse and name the object, or measure it square). Then capture that wall properly again.
 
 Afterwards, in the editor, tap each room and each wall and copy the lengths into the table. Then pick the
 longest wall of scan 1, tap it, choose **Calibrate floor**, type its tape length, and fill the last column.

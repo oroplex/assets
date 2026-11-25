@@ -29,9 +29,11 @@ private val TIPS = listOf(
     ),
     Tip(
         Icons.Outlined.Texture,
-        "Aim at textured wall areas above furniture",
-        "Pictures, outlets, trim and door frames give the depth sensing detail to lock onto; blank or " +
-            "glossy paint is harder. Aim above sofas, beds and cabinets so furniture isn't measured as wall.",
+        "Aim at bare wall, above furniture",
+        "Keep the crosshair on the wall itself, beside doors, windows, pictures and TVs rather than on them: " +
+            "anything that stands out from the wall or is set into it gets measured instead of the wall. " +
+            "Detail nearby (outlets, trim, a frame's edge) helps the depth sensing; blank or glossy paint is " +
+            "harder. Aim above sofas, beds and cabinets.",
     ),
     Tip(
         Icons.Outlined.SocialDistance,

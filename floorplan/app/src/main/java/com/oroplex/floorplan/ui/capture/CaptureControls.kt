@@ -173,11 +173,11 @@ internal fun stepInstruction(ui: CaptureUiState, floorStatus: FloorStatus): Stri
                 baseline != null && baseline.firstTap == null ->
                     "Aim where wall $n meets the floor, near one end, and tap Mark."
                 baseline != null -> "Now aim at the base of the same wall near its other end and tap Mark."
-                recapture != null -> "Aim at wall $n again, above furniture, and tap Re-capture."
+                recapture != null -> "Aim at wall $n again, at a bare part above furniture, and tap Re-capture."
                 d.observations.isEmpty() ->
-                    "Aim at wall 1 above furniture and hold still while the ring fills. Then go around the room in order."
+                    "Aim at a bare part of wall 1, above furniture, and hold still while the ring fills. Then go around the room in order."
                 d.observations.size >= 3 -> "Aim at wall $n, or tap Close room when every wall is captured."
-                else -> "Aim at wall $n above furniture and tap Capture wall."
+                else -> "Aim at a bare part of wall $n, above furniture, and tap Capture wall."
             }
         }
         CaptureStep.CORNERS -> {

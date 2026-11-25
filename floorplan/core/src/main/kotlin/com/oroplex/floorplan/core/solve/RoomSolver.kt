@@ -15,6 +15,7 @@ import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -70,6 +71,9 @@ object RoomSolver {
     internal const val MIN_ROOM_AREA = 0.5
 
     internal const val REORDERED_WARNING = "Walls were re-ordered to close the room; check the outline"
+
+    /** Scanned walls left unsquared but within this many degrees of the room's axis get a warning. */
+    internal const val OFF_SQUARE_SUSPECT_DEG = 12.0
 
     internal const val UNSQUARED_WARNING = "Corners were not squared because that made the outline cross itself"
 
@@ -252,6 +256,7 @@ object RoomSolver {
             addAll(chosen.attempt.warnings)
             chosen.attempt.lost.forEach { add("Wall ${it.source + 1} didn't fit the outline and was left out; check it") }
             addAll(shallowCornerWarnings(chosen.attempt.edges))
+            if (snapper != null && !unsquared) addAll(offSquareWarnings(chosen.attempt.edges, observations, dominant, cfg.toleranceRad))
             addAll(shapeWarnings(chosen.attempt.edges, wallsMode = true))
         }.distinct()
         return SolveResult(
@@ -261,6 +266,23 @@ object RoomSolver {
             warnings = warnings,
         )
     }
+
+    /**
+     * A wall fitted to depth samples that squaring left alone although it is only a few degrees off the room's
+     * axis (more than the squaring tolerance, at most [OFF_SQUARE_SUSPECT_DEG]). Walls are rarely built like
+     * that; a capture with a door, a picture or a TV under the crosshair can come out like that (a line
+     * through the wall on one side and the object on the other). The wall is kept as measured, because it
+     * may be real, and the user is told what to check.
+     */
+    private fun offSquareWarnings(edges: List<OutlineEdge>, observations: List<WallObservation>, dominant: Double, toleranceRad: Double): List<String> =
+        edges.mapNotNull { edge ->
+            val wall = edge.wall ?: return@mapNotNull null
+            if (observations.getOrNull(edge.source)?.source != WallSource.DEPTH_FIT) return@mapNotNull null
+            val off = axisDistance(wall.line.angle(), dominant)
+            if (off <= toleranceRad + 1e-9 || off > Math.toRadians(OFF_SQUARE_SUSPECT_DEG)) return@mapNotNull null
+            "Wall ${edge.source + 1} is ${Math.toDegrees(off).roundToInt()}° off square with the room. If it should be square, " +
+                "capture it again aiming at bare wall, away from doors, pictures and TVs"
+        }
 
     /**
      * Clean up a corner-tapped outline: drop near-duplicate/collinear points, optional squaring, CCW.

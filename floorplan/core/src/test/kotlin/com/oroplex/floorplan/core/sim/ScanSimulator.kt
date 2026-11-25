@@ -399,7 +399,7 @@ internal class SimUser(
                     }
                 }
                 else -> {
-                    // "Aim at the middle of the wall": re-aim; when that fails again, stand square in front of it.
+                    // "Aim at a bare part of the wall": re-aim; when that fails again, stand square in front of it.
                     aim = aimAt(edge, rng)
                     val repeated = failures.count { it == WallFitFailure.NO_DOMINANT_PLANE || it == WallFitFailure.TOO_FEW_POINTS } >= 2
                     station = if (!repeated && usable(station, edge, aim.plan)) {

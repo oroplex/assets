@@ -18,6 +18,12 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
   gates and the whole simulation assume ±12°. At ±4.5° walls nearer than about 0.6 m were always refused and
   a sensor 1.5× noisier than the model failed most captures. The grid is now sized by angle from the
   camera's projection (`WallSampleGrid.HALF_ANGLE_DEG` = 12), and each wall's log line states the angle used.
+  The check of the accuracy package found the last one, rated critical and confirmed by a second reviewer:
+  a door, picture or TV under the crosshair that is a few centimetres proud of or behind the wall was
+  fitted as one diagonal line through wall and object, 5–9° off, and the room was saved skewed without a
+  warning (a recessed door from 4 m: 44 of 60 simulated captures). Fixed in the estimator (the shallow-step
+  rule, see "Known issues") with a solver warning behind it; `ShallowStepTest` keeps it fixed and writes
+  `core/build/step-report.txt`.
 * **Every wall capture keeps its raw samples on the phone** (`diagnostics/WallCaptureLog`, newest 60, in the
   app's private storage). "Share scan log" appends them to the shared text file. On a computer,
   `WallCaptureRecord.decodeAll(text)` reads them out of the whole file and `record.replay(config)` runs the
@@ -48,6 +54,16 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
   tap its base" instead of being fitted to a wrong surface. Square-on it is measured within about 2-3 times
   its length. With noisier depth than assumed, 0.3 m returns are refused about half the time even close up;
   "Tap wall base" is the way out. Watch the refusal rate in the first device session.
+* **Doors, pictures and TVs under the crosshair.** The estimator now looks for a shallow step among a
+  wall's sampling columns (two parallel faces a few centimetres apart) and keeps only the crosshair's side.
+  From close up the object's own face is then measured, square but offset by the object's depth (a door
+  8 cm back puts that wall 8 cm out); from further away the capture is refused with "A door, picture or TV
+  is in the way here. Aim at bare wall beside it". In simulation 8 of 1 860 such captures still come out
+  more than 5° off; every room they skew carries the new "Wall N is 7° off square with the room" warning.
+  The cost: about 1 mm in the smooth-distortion scenario, and on a real phone possibly false refusals if
+  its depth map has step-like artefacts on plain walls (unknown; the thresholds are `STEP_MIN_SIGMAS` 0.8,
+  `STEP_Z` 3.5 in `WallEstimator`). The field test has one deliberate capture of a door to measure this.
+  Guidance in the app now says "bare wall, beside doors and pictures", not "the middle of the wall".
 * **An ARCore plane can stand in for a refused fit** when the crosshair's depth lies on it; it is marked
   low-confidence (amber chip, "weak capture" in the review). Whether such planes are good enough is a
   device question: the scan log prints the plane next to the depth fit for every wall.
@@ -92,6 +108,7 @@ a compass north arrow.
 | One smooth 0.3 % depth error per capture | 40 | 17 | 0 of 80 |
 | Rooms with closet returns, chimney breast, column | 8 | 5 | 0 of 50 |
 | Short faces from across the room (920 captures) | — | — | 0 (874 refused, 46 measured) |
+| Door, panel, TV or picture under the crosshair (1 860 captures) | — | — | 8 more than 5° off (was over 250); 3 skewed rooms, all warned |
 
 * "Wrong surface" was the critical round-2 finding (a short wall fitted to a fake diagonal); the estimator
   now refuses what it cannot verify. Zero is an empirical result on right-angled rooms, not a proof.
@@ -104,7 +121,9 @@ a compass north arrow.
 ## Gate for "ready to test on the phone"
 1. Round 3 fully merged; `:core:test :app:testDebugUnitTest :app:assembleDebug` green; simulation re-read.
 2. Walkthrough green and its screenshots reviewed by eye (including the label fix).
-3. One narrow regression check of the round-3 diff (major problems only; no new features).
+3. One narrow regression check of the round-3 diff (major problems only; no new features): done, six
+   findings confirmed (three in the app's flows, the sampling grid, the shallow step, calibration from a
+   hand-set wall), all fixed.
 
 ## First on-device session (a measurement study, not a demo)
 * Follow `docs/FIELD-TEST.md`. Diagnostics come back either way: **Settings → About → Share scan log** on

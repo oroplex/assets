@@ -25,8 +25,10 @@ import kotlin.math.tan
  * The defaults are exactly the estimator's own noise prior (WallEstimatorConfig), i.i.d. per ray: the nominal
  * case. Review round 2 (MATH-7) showed that such a simulation only checks the estimator against its own
  * assumption, so the stress scenarios also use [scale] > 1 (real sensors on dark / glossy walls are noisier
- * than any prior) and [frameRangeBias] (depth-from-motion errors are correlated within a frame: every ray of
- * a frame is off by the same relative range error, which more rays cannot average away).
+ * than any prior), [frameRangeBias] (depth-from-motion errors are correlated within a frame: every ray of
+ * a frame is off by the same relative range error, which more rays cannot average away) and [fieldBias] (a
+ * smooth error across the image that stays the same for the whole capture: a patch of wall off by
+ * centimetres together, which no number of samples or frames averages away).
  */
 internal data class DepthNoise(
     val sigma0: Double = 0.005,
@@ -39,6 +41,12 @@ internal data class DepthNoise(
     val scale: Double = 1.0,
     /** σ of a per-frame relative range error: every ray of one frame has its range scaled by (1 + b), b ~ N(0, this). */
     val frameRangeBias: Double = 0.0,
+    /**
+     * Amplitude of a smooth relative range error across the sampling grid, drawn once per capture: with grid
+     * coordinates u, v in [-1, 1], range × (1 + this · (c1·u + c2·v + c3·(u² − ⅓) + c4·(v² − ⅓) + c5·u·v)),
+     * c ~ N(0, 1): a tilt and a bow of the measured surface.
+     */
+    val fieldBias: Double = 0.0,
 ) {
     fun sigma(distance: Double) = scale * (sigma0 + sigmaPerMeter * distance)
 
@@ -47,6 +55,9 @@ internal data class DepthNoise(
 
         /** Pessimistic: 1.5 × the model per ray plus a 0.3 % per-frame range error. */
         val PESSIMISTIC = DepthNoise(scale = 1.5, frameRangeBias = 0.003)
+
+        /** The nominal per-ray noise plus a 0.3 % smooth field error (7.5 mm across the grid at 2.5 m). */
+        val SMOOTH_FIELD = DepthNoise(fieldBias = 0.003)
     }
 }
 
@@ -149,6 +160,7 @@ internal object ScanSimulator {
         // One detected-plane offset error per wall and capture (a plane is one estimate, not per-ray noise).
         // Random draws only happen for the options in use, so the nominal scenarios keep their exact samples.
         val planeOffsets = DoubleArray(room.size) { if (planes.coverage > 0) rng.nextGaussian() * planes.planeOffsetSigma else 0.0 }
+        val field = DoubleArray(5) { if (noise.fieldBias > 0) rng.nextGaussian() * noise.fieldBias else 0.0 }
         for (frame in 0 until rig.frames) {
             val cam = station + Vec3(
                 rng.nextGaussian() * rig.handPositionSigma,
@@ -162,8 +174,11 @@ internal object ScanSimulator {
             val (right, up) = basis(forward)
             for (row in 0 until g) {
                 for (col in 0 until g) {
+                    val u = if (half > 0) (col - half) / half else 0.0
+                    val v = if (half > 0) (half - row) / half else 0.0
                     val a = if (half > 0) tanHalf * (col - half) / half else 0.0
                     val b = if (half > 0) tanHalf * (half - row) / half else 0.0
+                    val fieldScale = 1.0 + field[0] * u + field[1] * v + field[2] * (u * u - 1.0 / 3) + field[3] * (v * v - 1.0 / 3) + field[4] * u * v
                     val d = (forward + right * a + up * b).normalized()
                     val hit = room.hit(cam, d) ?: continue
                     surfaces.merge(hit.surface, 1, Int::plus)
@@ -173,7 +188,7 @@ internal object ScanSimulator {
                     } else if (rng.nextDouble() < noise.outlierRate) {
                         t * (noise.outlierMinFactor + (noise.outlierMaxFactor - noise.outlierMinFactor) * rng.nextDouble())
                     } else {
-                        t * frameScale + rng.nextGaussian() * noise.sigma(t)
+                        t * frameScale * fieldScale + rng.nextGaussian() * noise.sigma(t)
                     }
                     val plane: Double? = if (hit.surface >= 0 && planes.coverage > 0 && rng.nextDouble() < planes.coverage) {
                         room.planeHit(cam, d, hit.surface, planeOffsets[hit.surface])
@@ -254,6 +269,8 @@ internal class WallCaptureLog(
     val surfaceHits: Map<Int, Int>,
     /** The accepted observation is within 5° and 5 cm of the aimed wall's face ([SimFace.matches]). */
     val precise: Boolean = observation != null && matchedEdge == edge,
+    /** Incidence (degrees off square) of the FIRST attempt. */
+    val firstIncidenceDeg: Double = 0.0,
 ) {
     val rays: Int get() = surfaceHits.values.sum()
 
@@ -268,9 +285,10 @@ internal class WallCaptureLog(
 
 /**
  * A simulated user capturing walls the way the capture screen instructs: aim at the wall (random point
- * on the middle 60 % of the edge, 1.0–1.8 m high), hold steady, tap Capture. On TOO_NOISY / TOO_FAR the
- * user moves closer (to 60 % of the distance); on a first NO_DOMINANT_PLANE / TOO_FEW_POINTS they re-aim,
- * on a second one they do what the message says and stand square in front of the wall.
+ * on the middle 60 % of the edge, 1.0–1.8 m high), hold steady, tap Capture. On a failure they do what the
+ * message says: with a hint ("stand square to this wall", "a little closer") they stand square in front of
+ * the wall, and closer (60 %) each time it comes again; on TOO_NOISY / TOO_FAR they move closer (to 60 % of
+ * the distance); on a first NO_DOMINANT_PLANE / TOO_FEW_POINTS they re-aim, on a second one they stand square.
  */
 internal class SimUser(
     val room: SimRoom,
@@ -332,6 +350,8 @@ internal class SimUser(
             }
         }
         val firstDistance = station.distanceTo(aim.plan)
+        val firstIncidence = incidenceDeg(edge, station, aim.plan)
+        var squareUps = 0
         val failures = ArrayList<WallFitFailure>()
         var lastHits: Map<Int, Int> = emptyMap()
         for (attempt in 1..maxAttempts) {
@@ -352,15 +372,23 @@ internal class SimUser(
             if (obs != null && cap.fit.failure == null) {
                 return WallCaptureLog(
                     edge, obs, attempt, failures, station.distanceTo(aim.plan), firstDistance, relocated,
-                    matchEdge(obs), cap.surfaceHits, face(edge).matches(obs),
+                    matchEdge(obs), cap.surfaceHits, face(edge).matches(obs), firstIncidence,
                 )
             }
             val reason = cap.fit.failure ?: WallFitFailure.NO_DOMINANT_PLANE
             failures += reason
             val dist = station.distanceTo(aim.plan)
-            when (reason) {
-                WallFitFailure.TOO_NOISY, WallFitFailure.TOO_FAR -> {
-                    val target = max(dist * 0.6, min(standOff(edge), 0.5 * room.depthInFront(edge, aim.plan)))
+            val closest = min(standOff(edge), 0.5 * room.depthInFront(edge, aim.plan))
+            when {
+                // "Stand square to this wall (a little closer)": do that; closer still when it comes again.
+                cap.fit.hint != null -> {
+                    squareUps++
+                    aim = aimAt(edge, rng)
+                    val target = if (squareUps == 1) min(dist, preferredDistance) else max(0.6 * min(dist, preferredDistance), closest)
+                    station = stationInFront(edge, aim.plan, target)
+                }
+                reason == WallFitFailure.TOO_NOISY || reason == WallFitFailure.TOO_FAR -> {
+                    val target = max(dist * 0.6, closest)
                     if (target < dist - 0.05) {
                         val dir = (station - aim.plan).normalized()
                         val candidate = aim.plan + dir * target
@@ -370,7 +398,8 @@ internal class SimUser(
                         station = stationInFront(edge, aim.plan, dist)
                     }
                 }
-                WallFitFailure.NO_DOMINANT_PLANE, WallFitFailure.TOO_FEW_POINTS -> {
+                else -> {
+                    // "Aim at the middle of the wall": re-aim; when that fails again, stand square in front of it.
                     aim = aimAt(edge, rng)
                     val repeated = failures.count { it == WallFitFailure.NO_DOMINANT_PLANE || it == WallFitFailure.TOO_FEW_POINTS } >= 2
                     station = if (!repeated && usable(station, edge, aim.plan)) {
@@ -383,7 +412,14 @@ internal class SimUser(
         }
         return WallCaptureLog(
             edge, null, maxAttempts, failures, station.distanceTo(aim.plan), firstDistance, relocated, -2, lastHits,
+            firstIncidenceDeg = firstIncidence,
         )
+    }
+
+    /** Angle (degrees) between the line of sight [station] -> [aim] and the normal of wall [edge]: 0 = square to it. */
+    private fun incidenceDeg(edge: Int, station: Vec2, aim: Vec2): Double {
+        val toStation = (station - aim).normalized()
+        return Math.toDegrees(Math.acos((toStation dot room.inwardNormal(edge)).coerceIn(-1.0, 1.0)))
     }
 
     /** The true wall [o] lies on (see [WallCaptureLog.matchedEdge]). */
@@ -462,6 +498,9 @@ internal class RoomScan(
 
     /** Captures whose accepted fit is a different surface than the wall that was aimed at. */
     val wrongWall: Int get() = captures.count { it.observation != null && !it.onTarget }
+
+    /** Walls the user gave up on (every attempt failed). */
+    val missingWalls: Int get() = captures.count { it.observation == null }
 
     /** Every capture produced an observation of the wall that was aimed at. */
     val allOnTarget: Boolean get() = captures.all { it.onTarget }

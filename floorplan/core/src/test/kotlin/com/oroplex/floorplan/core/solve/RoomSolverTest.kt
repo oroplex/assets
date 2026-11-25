@@ -408,7 +408,167 @@ class RoomSolverTest {
         assertNotNull(RoomSolver.solveWalls(obs, SolverOptions(axisHint = Double.NaN)))
     }
 
+    /** A perfect 4 x 3.5 m room captured with exact data, aiming at 25 % / 75 % along alternate walls. */
+    private val offCentreRect = listOf(v(0.0, 0.0), v(4.0, 0.0), v(4.0, 3.5), v(0.0, 3.5))
+    private val offCentreWalls = offCentreRect.indices.map { i ->
+        patchObs(offCentreRect[i], offCentreRect[(i + 1) % 4], length = 0.4, at = if (i % 2 == 0) 0.25 else 0.75)
+    }
+
+    private fun edgeLengths(corners: List<Vec2>) = corners.indices.map { corners[it].distanceTo(corners[(it + 1) % corners.size]) }
+
+    @Test fun axisHintNeverChangesTheRoomsDimensions() {
+        // Review round 2 (MATH-2): the hint replaced the room's axis whenever it was within 5 degrees, and each
+        // wall was snapped onto it about its own pivot: a 1.6 degree hint turned this room into 3.949 x 3.555 m.
+        val plain = assertNotNull(RoomSolver.solveWalls(offCentreWalls))
+        assertPolygonEquals(offCentreRect, plain.corners)
+        for (deg in listOf(0.6, 1.0, 1.6, 3.0, -1.6, 4.9)) {
+            val r = assertNotNull(RoomSolver.solveWalls(offCentreWalls, SolverOptions(axisHint = Math.toRadians(deg))), "hint $deg")
+            // Exact data: the room's own axis is known far better than 0.5 degrees, so these hints are ignored.
+            assertPolygonEquals(offCentreRect, r.corners)
+            assertEquals(0.0, r.dominantAngle, 1e-12, "hint $deg")
+            assertEquals(emptyList(), r.warnings)
+        }
+        // A hint the room agrees with (0.3 degrees) turns the finished room rigidly: same lengths, right angles.
+        for (deg in listOf(0.3, -0.3, 90.3, 0.5)) {
+            val hint = Math.toRadians(deg)
+            val r = assertNotNull(RoomSolver.solveWalls(offCentreWalls, SolverOptions(axisHint = hint)), "hint $deg")
+            val turn = angleDistance(hint, 0.0).let { if (deg < 0) -it else it }
+            assertEquals((hint % (PI / 2) + PI / 2) % (PI / 2), r.dominantAngle, 1e-12, "hint $deg")
+            edgeLengths(r.corners).zip(edgeLengths(offCentreRect)).forEach { (a, b) -> assertEquals(b, a, 1e-9, "hint $deg changed a length") }
+            assertAllRightAngles(r.corners)
+            for (i in r.corners.indices) {
+                val d = r.corners[(i + 1) % r.corners.size] - r.corners[i]
+                assertTrue(angleDistance(d.angle(), hint) < 1e-9, "hint $deg: edge $i is not on the hinted axis")
+            }
+            // Turned about where the room was measured (the walls' mean pivot), not about the origin.
+            val pivot = offCentreWalls.map { Vec2.lerp(it.extentStart, it.extentEnd, 0.5) }.fold(Vec2.ZERO) { a, m -> a + m } / 4.0
+            val expected = offCentreRect.map { pivot + (it - pivot).rotated(turn) }
+            assertSameOutline(expected, r.corners, 1e-9)
+        }
+        // Without squaring there is no axis to share: the hint does nothing.
+        val unsquared = assertNotNull(RoomSolver.solveWalls(offCentreWalls, SolverOptions(squareAngles = false, axisHint = Math.toRadians(0.3))))
+        assertPolygonEquals(offCentreRect, unsquared.corners)
+        assertEquals(0.0, unsquared.dominantAngle, 1e-12)
+    }
+
+    @Test fun axisHintToleranceFollowsTheRoomsOwnUncertainty() {
+        // Short, noisy captures leave the room's axis open by about a degree: a hint 1.5 degrees away may then
+        // settle it. The room is still only turned, never resized.
+        val vague = offCentreWalls.map { it.copy(rmsResidual = 0.03, pointCount = 50) }
+        val plain = assertNotNull(RoomSolver.solveWalls(vague))
+        val hinted = assertNotNull(RoomSolver.solveWalls(vague, SolverOptions(axisHint = Math.toRadians(1.5))))
+        assertEquals(Math.toRadians(1.5), hinted.dominantAngle, 1e-12)
+        edgeLengths(hinted.corners).zip(edgeLengths(plain.corners)).forEach { (a, b) -> assertEquals(b, a, 1e-9) }
+        assertAllRightAngles(hinted.corners)
+        // Beyond the squaring tolerance no hint is ever taken, however vague the room.
+        val far = assertNotNull(RoomSolver.solveWalls(vague, SolverOptions(axisHint = Math.toRadians(6.0))))
+        assertPolygonEquals(plain.corners, far.corners)
+        // Precise captures of the same room refuse the same 1.5 degree hint.
+        val precise = assertNotNull(RoomSolver.solveWalls(offCentreWalls, SolverOptions(axisHint = Math.toRadians(1.5))))
+        assertEquals(0.0, precise.dominantAngle, 1e-12)
+    }
+
+    @Test fun axisHintTurnsCornerTapsRigidly() {
+        val plain = assertNotNull(RoomSolver.solveCorners(Shapes.lShape))
+        val hint = Math.toRadians(0.4)
+        val hinted = assertNotNull(RoomSolver.solveCorners(Shapes.lShape, SolverOptions(axisHint = hint)))
+        assertEquals(hint, hinted.dominantAngle, 1e-12)
+        assertEquals(plain.edgeSources, hinted.edgeSources)
+        edgeLengths(hinted.corners).zip(edgeLengths(plain.corners)).forEach { (a, b) -> assertEquals(b, a, 1e-9) }
+        val center = plain.corners.fold(Vec2.ZERO) { a, c -> a + c } / plain.corners.size.toDouble()
+        assertPolygonEquals(plain.corners.map { center + (it - center).rotated(hint) }, hinted.corners, 1e-9)
+        // Taps 5 cm apart in direction leave the axis open by about 0.2 degrees per 4 m edge: a 3 degree hint is refused.
+        val refused = assertNotNull(RoomSolver.solveCorners(Shapes.lShape, SolverOptions(axisHint = Math.toRadians(3.0))))
+        assertPolygonEquals(plain.corners, refused.corners)
+        assertEquals(0.0, refused.dominantAngle, 1e-12)
+    }
+
+    // ---------------------------------------------------------------- shared axis of a session
+
+    /** 4 x 5 m room with a 1.5 m wall at 30 degrees across one corner (review round 2, SEAM-2). */
+    private val chamfered: List<Vec2> = run {
+        val cut = Vec2.fromAngle(Math.toRadians(150.0), 1.5)
+        listOf(v(0.0, 0.0), v(4.0, 0.0), v(4.0, 5.0 + cut.y), v(4.0 + cut.x, 5.0), v(0.0, 5.0))
+    }
+
+    @Test fun sharedAxisIsNotPulledByAnAngledWall() {
+        for (deg in listOf(0.0, 17.0, 63.0, 89.5)) {
+            val t = RigidTransform2(Math.toRadians(deg), Vec2(2.0, -1.0))
+            val outline = chamfered.map { t.apply(it) }
+            val shared = assertNotNull(RoomSolver.sharedAxis(listOf(outline)))
+            assertTrue(angleDistance(shared, Math.toRadians(deg)) < 1e-9, "$deg: shared axis ${Math.toDegrees(shared)}")
+            // The plain mean, which the capture flow used as a hint, is off by more than a degree.
+            val plain = RoomSolver.dominantAngle(outline.indices.map { (outline[(it + 1) % outline.size] - outline[it]).angle() }, outline.indices.map { outline[it].distanceTo(outline[(it + 1) % outline.size]) })
+            assertTrue(angleDistance(plain, Math.toRadians(deg)) > Math.toRadians(1.0), "$deg: plain mean ${Math.toDegrees(plain)}")
+            // The next room of the session, squared with that hint, comes out exactly parallel to this one.
+            val next = wallsOf(Shapes.rect).map { o ->
+                o.copy(line = t.apply(o.line), extentStart = t.apply(o.extentStart), extentEnd = t.apply(o.extentEnd), viewer = t.apply(o.viewer))
+            }
+            val solved = assertNotNull(RoomSolver.solveWalls(next, SolverOptions(axisHint = shared)))
+            assertEquals(shared, solved.dominantAngle, 1e-9)
+            edgeLengths(solved.corners).zip(listOf(4.0, 3.0, 4.0, 3.0)).forEach { (a, b) -> assertEquals(b, a, 1e-9) }
+        }
+    }
+
+    @Test fun sharedAxisIsTheConsensusOfTheRooms() {
+        val turned = { deg: Double, shift: Vec2 -> Shapes.rect.map { RigidTransform2(Math.toRadians(deg), shift).apply(it) } }
+        // Three rooms of one session and one stray room at 37 degrees: the session's axis, exactly.
+        val session = listOf(turned(10.0, v(0.0, 0.0)), turned(10.0, v(6.0, 0.0)), turned(100.0, v(0.0, 6.0)), turned(47.0, v(9.0, 9.0)))
+        assertEquals(Math.toRadians(10.0), assertNotNull(RoomSolver.sharedAxis(session)), 1e-9)
+        // Slightly different headings (drift) average, weighted by length, among the supporters only.
+        val drift = listOf(turned(0.0, v(0.0, 0.0)), turned(1.0, v(6.0, 0.0)), turned(30.0, v(12.0, 0.0)))
+        assertEquals(Math.toRadians(0.5), assertNotNull(RoomSolver.sharedAxis(drift)), 1e-9)
+        // One 40 m wall does not outvote two rooms: its vote is capped (3 m), theirs add up.
+        val longWall = listOf(v(0.0, 20.0), v(40.0, 20.0)).map { RigidTransform2(Math.toRadians(20.0), Vec2.ZERO).apply(it) }
+        val withLongWall = RoomSolver.sharedAxis(listOf(Shapes.rect, turned(0.0, v(6.0, 0.0)), longWall))
+        // ... but then the supporting length is less than half of the total: no coherent axis.
+        assertNull(withLongWall)
+        // No coherent axis: a regular pentagon, two rooms 45 degrees apart with equal walls, nothing usable.
+        val pentagon = (0 until 5).map { Vec2.fromAngle(2 * PI * it / 5, 2.0) }
+        assertNull(RoomSolver.sharedAxis(listOf(pentagon)))
+        assertNull(RoomSolver.sharedAxis(emptyList()))
+        assertNull(RoomSolver.sharedAxis(listOf(emptyList(), listOf(v(1.0, 1.0)), listOf(v(1.0, 1.0), v(1.0, 1.0)))))
+        assertNull(RoomSolver.sharedAxis(listOf(listOf(v(Double.NaN, 0.0), v(1.0, 0.0), v(1.0, Double.POSITIVE_INFINITY)))))
+        // Unusable corners are skipped, the rest still counts; the result is always in [0, 90 degrees).
+        val damaged = Shapes.rect + v(Double.NaN, 1.0)
+        assertEquals(0.0, assertNotNull(RoomSolver.sharedAxis(listOf(damaged))), 1e-12)
+        val quarter = assertNotNull(RoomSolver.sharedAxis(listOf(turned(-0.2, Vec2.ZERO))))
+        assertTrue(quarter >= 0.0 && quarter < PI / 2, "$quarter")
+        assertEquals(Math.toRadians(89.8), quarter, 1e-9)
+    }
+
     // ---------------------------------------------------------------- capture order and duplicates
+
+    /** 5 x 4 m room with a 0.4 m closet return (wall 4) between two parallel walls (walls 3 and 5). */
+    private val closetRoom = listOf(v(0.0, 0.0), v(5.0, 0.0), v(5.0, 4.0), v(1.4, 4.0), v(1.4, 3.6), v(0.0, 3.6))
+
+    @Test fun stepBetweenParallelWallsIsNotMistakenForFurniture() {
+        // Review round 2 (MATH-1): wall 3's observed extent, stretched past the return by range outliers,
+        // overlapped wall 5 "40 cm apart", and the correctly measured wall 5 was deleted: a 5 x 4 m rectangle.
+        val walls = wallsOf(closetRoom).toMutableList()
+        walls[2] = wallObs(v(4.5, 4.0), v(0.5, 4.0))
+        val r = assertNotNull(RoomSolver.solveWalls(walls))
+        assertPolygonEquals(closetRoom, r.corners)
+        assertEquals(listOf(0, 1, 2, 3, 4, 5), r.edgeSources)
+        assertEquals(listOf("Walls 3 and 5 overlap at the step along wall 4; check that corner"), r.warnings)
+        // Any capture order, and the return measured as a short patch at either end, give the same room.
+        for (order in listOf(listOf(0, 1, 2, 4, 3, 5), listOf(3, 0, 1, 2, 4, 5), listOf(5, 4, 3, 2, 1, 0))) {
+            val again = assertNotNull(RoomSolver.solveWalls(order.map { walls[it] }), "order $order")
+            assertSameOutline(closetRoom, again.corners)
+        }
+        // Robust extents that do not reach past the return need no warning at all.
+        assertEquals(emptyList(), assertNotNull(RoomSolver.solveWalls(wallsOf(closetRoom))).warnings)
+        // Without a captured step between them the rule still drops the capture that sits in front (furniture).
+        val withoutReturn = walls.filterIndexed { i, _ -> i != 3 }
+        val flat = assertNotNull(RoomSolver.solveWalls(withoutReturn))
+        assertPolygonEquals(listOf(v(0.0, 0.0), v(5.0, 0.0), v(5.0, 4.0), v(0.0, 4.0)), flat.corners)
+        assertTrue(flat.warnings.single().startsWith("Walls 3 and 4 are the same wall measured"), "${flat.warnings}")
+        // A wall elsewhere in the room, or one parallel to the pair, is not a step between them.
+        val sofa = wallObs(v(3.0, 3.5), v(2.0, 3.5))
+        val furnished = assertNotNull(RoomSolver.solveWalls(wallsOf(Shapes.rect.map { it * 1.25 }) + sofa))
+        assertEquals(4, furnished.corners.size)
+        assertTrue(furnished.warnings.any { "same wall measured" in it }, "${furnished.warnings}")
+    }
 
     @Test fun notchedRoomWithSwappedWallsIsRecovered() {
         // Review round 1 (Core math AR-4, 1): walls 2 and 3 swapped became two silent fake steps (20.5 m² vs 22).

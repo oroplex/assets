@@ -17,7 +17,9 @@ import kotlin.test.assertTrue
  * End-to-end scan simulation of the core measurement pipeline (WallEstimator.fromPoints with the aim point
  * -> RoomSolver.solveWalls) against the sample house, with the production defaults. See [SimScenarios] for
  * the scenarios and `core/build/sim-report.txt` for the measured distributions the bounds below are based on
- * (each bound has ~20 % headroom over what the current pipeline achieves; the simulation is deterministic).
+ * (each bound has ~20 % headroom over what the pipeline achieved when it was set; the simulation is
+ * deterministic). The scenarios here are the NOMINAL ones: the estimator's own noise model on a house without
+ * short walls. What that leaves out is in [HardScenarios] / [HardScenariosTest].
  *
  * Accuracy assertions use the "accurate" scans (every capture on the wall that was aimed at, correct corner
  * count); that every scan IS accurate is asserted separately ([noScenarioHasWrongWallsOrTopologyFailures]).
@@ -133,7 +135,12 @@ class ScanSimulationTest {
         }
     }
 
-    /** Captures succeed on the first try (production defaults, users standing where the scenario puts them). */
+    /**
+     * Captures of ordinary walls succeed on the first try (production defaults, users standing where the scenario
+     * puts them). Since round 3 the estimator refuses walls it cannot verify (too short or too oblique to be seen
+     * flat at three places, see HardScenariosTest); none of the sample house's walls is one of those from where
+     * the scenarios stand.
+     */
     @Test
     fun firstTryFailuresAreRare() {
         for ((what, scans) in allScenarios) {
@@ -145,7 +152,7 @@ class ScanSimulationTest {
     // ---------------------------------------------------------------------------------------------
     // (a) clean walls
 
-    /** Measured: max |dL| 22 mm (8 m L-shaped living room), p95 6 mm, corners <= 24 mm, rotation <= 0.41 deg. */
+    /** Measured: max |dL| 11.4 mm (8 m L-shaped living room), p95 3.7 mm, corners <= 19.9 mm, rotation <= 0.30 deg. */
     @Test
     fun cleanWalls_accurateScansStayWithinMeasuredBounds() {
         val scans = SimScenarios.clean
@@ -218,7 +225,7 @@ class ScanSimulationTest {
     // ---------------------------------------------------------------------------------------------
     // (b) furniture
 
-    /** Measured: max |dL| 17 mm, p95 7 mm, corners <= 21 mm; no capture picked the furniture face. */
+    /** Measured: max |dL| 17.3 mm, p95 5.5 mm, corners <= 21.3 mm; no capture picked the furniture face. */
     @Test
     fun furniture_wallsWithin2Point5cm() {
         val scans = SimScenarios.furniture
@@ -349,7 +356,7 @@ class ScanSimulationTest {
     // ---------------------------------------------------------------------------------------------
     // (f) narrow rooms
 
-    /** Measured: |dL| <= 2.2 mm, corners <= 17 mm (0.3 deg heading over the 5.4 m hallway). */
+    /** Measured: |dL| <= 2.1 mm, corners <= 17.5 mm (0.3 deg heading over the 5.4 m hallway). */
     @Test
     fun narrowRooms_closeRangeCaptures() {
         val scans = SimScenarios.narrow

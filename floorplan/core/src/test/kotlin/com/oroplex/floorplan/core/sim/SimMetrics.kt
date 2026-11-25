@@ -93,7 +93,9 @@ internal class ErrorSummary(val scans: List<RoomScan>) {
     val accurate: List<RoomScan> = scans.filter { it.allOnTarget && it.error?.topologyOk == true }
     val solved = scans.count { it.result != null }
     val topologyOk = scans.count { it.error?.topologyOk == true }
-    val offTargetScans = scans.count { !it.allOnTarget }
+
+    /** Scans with at least one WRONG capture: an accepted observation that is not the wall aimed at. */
+    val wrongWallScans = scans.count { it.wrongWall > 0 }
     private val lengthErrors = accurate.flatMap { it.error!!.edgeLengthErrors }.map { abs(it) }.sorted()
     val maxLength: Double = lengthErrors.lastOrNull() ?: Double.NaN
     val p95Length: Double = percentile(lengthErrors, 0.95)
@@ -132,11 +134,11 @@ internal fun rotationDeg(dominantAngle: Double): Double {
 
 /** Compact fixed-width tables for the report. */
 internal object SimReport {
-    private const val ROW = "  %-17s %5s %5s %5s %8s %5s | %6s %6s %7s %6s %5s %5s | %s"
+    private const val ROW = "  %-17s %5s %5s %5s %4s %8s %5s | %6s %6s %7s %6s %5s %5s | %s"
 
     val HEADER: String = String.format(
         Locale.ROOT, ROW,
-        "room", "scans", "topo", "offT", "1stfail", "dist", "maxdL", "p95dL", "corner", "area%", "sq°", "rot°", "warnings",
+        "room", "scans", "topo", "WRONG", "miss", "1stfail", "dist", "maxdL", "p95dL", "corner", "area%", "sq°", "rot°", "warnings",
     )
 
     private fun f1(v: Double) = if (v.isNaN()) "-" else String.format(Locale.ROOT, "%.1f", v)
@@ -149,7 +151,7 @@ internal object SimReport {
             .joinToString(", ")
         return String.format(
             Locale.ROOT, ROW,
-            label.take(17), "${s.scans.size}", "${s.topologyOk}", "${s.offTargetScans}",
+            label.take(17), "${s.scans.size}", "${s.topologyOk}", "${s.wrongWallScans}", "${s.missingWalls}",
             "${s.firstTryFailures}/${s.captures}", f2(s.meanDistance),
             f1(mm(s.maxLength)), f1(mm(s.p95Length)), f1(mm(s.maxCorner)), f2(s.maxAreaPct), f2(s.maxSquareness),
             f2(s.maxRotation), warnings,
@@ -194,7 +196,7 @@ internal object SimReport {
                     ),
                 )
             }
-            scan.captures.filter { it.observation == null }.forEach { add("wall ${it.edge + 1} never captured ${it.failures}") }
+            scan.captures.filter { it.observation == null }.forEach { add("wall ${it.edge + 1} not captured in ${it.attempts} tries ${it.failures}") }
         }
         val err = if (e == null) {
             "-"

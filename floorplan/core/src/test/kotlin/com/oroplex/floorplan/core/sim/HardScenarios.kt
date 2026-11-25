@@ -74,9 +74,11 @@ internal class BiasRow(val label: String, val range: Double, val meanOffset: Dou
  *
  * * Rooms with 0.3–0.6 m closet returns, a chimney breast (0.45 m sides) and a free-standing column, scanned
  *   from the room's pole (the short faces are then seen at 40–65° incidence).
- * * Capture-level stress: every short face aimed at from 40°, 50° and 65° incidence, 2.0 and 2.6 m away.
- * * Noise stress: the per-ray noise at 1.5× and 2× the model, a 0.3 % per-frame range error, and ARCore plane
- *   hits mixed in (depth-first, as the AR layer does since MATH-5; nearest-first kept for the record).
+ * * Capture-level stress: every short face aimed at from 40°, 50° and 65° incidence, 2.0 and 2.6 m away, and
+ *   square-on from 0.6–2.2 m (what the estimator's hint asks the user to do).
+ * * Noise stress: the per-ray noise at 1.5× and 2× the model, a 0.3 % per-frame range error, a smooth 0.3 %
+ *   error across the image (a patch of wall off by centimetres together), and ARCore plane hits mixed in
+ *   (depth-first, as the AR layer does since MATH-5; nearest-first kept for the record).
  * * A 2.7 m-ceiling room with a 2.2 m wardrobe, aimed at just above it with an unmeasured ceiling (CAPX-8).
  *
  * The strict rule everywhere: a failed capture is acceptable (the user is told what to do), a wrong
@@ -155,47 +157,59 @@ internal object HardScenarios {
     /** Same with pessimistic noise and depth-first plane hits. */
     val facesStress: List<FaceRow> by lazy { faceRows(DepthNoise.PESSIMISTIC, STRESS_PLANES, 810L) }
 
-    private fun faceRows(noise: DepthNoise, planes: PlaneHits, family: Long): List<FaceRow> = rooms.withIndex().flatMap { (ri, room) ->
-        shortFaces(room).withIndex().flatMap { (fi, face) ->
-            INCIDENCES.flatMap { inc ->
-                RANGES.mapNotNull { range ->
-                    val station = stationFor(room, face, inc, range) ?: return@mapNotNull null
-                    var on = 0
-                    var wrong = 0
-                    var failed = 0
-                    val offsets = ArrayList<Double>()
-                    val angles = ArrayList<Double>()
-                    val failures = HashMap<WallFitFailure, Int>()
-                    val details = ArrayList<String>()
-                    for (k in 0 until FACE_TRIALS) {
-                        val rng = Random(seedOf(family, ri.toLong(), fi.toLong(), inc.toLong(), (range * 10).toLong(), k.toLong()))
-                        val aim = face.pointOn(0.2 + 0.6 * rng.nextDouble())
-                        val cap = ScanSimulator.capture(
-                            room, Vec3.fromPlan(station, CAMERA_HEIGHT), Vec3.fromPlan(aim, 1.0 + 0.8 * rng.nextDouble()), rng,
-                            noise = noise, planes = planes,
-                        )
-                        val o = cap.fit.observation
-                        when {
-                            o == null -> {
-                                failed++
-                                cap.fit.failure?.let { failures.merge(it, 1, Int::plus) }
-                            }
-                            face.matches(o) -> {
-                                on++
-                                offsets += face.line.distance(o.line.project(face.pointOn(0.5)))
-                                angles += Math.toDegrees(Math.asin(abs(o.line.direction cross face.direction).coerceAtMost(1.0)))
-                            }
-                            else -> {
-                                wrong++
-                                details += describe(room, o)
-                            }
+    /** One aimed capture of the short-face stress: where it was taken from and what came out. */
+    class FaceTrial(val room: SimRoom, val face: SimFace, val incidenceDeg: Double, val range: Double, val station: Vec2, val aim: Vec3, val capture: SimCapture)
+
+    /** Every short face, aimed at from each incidence / range that fits in the room, [FACE_TRIALS] captures each. */
+    fun faceTrials(noise: DepthNoise, planes: PlaneHits, family: Long, trials: Int = FACE_TRIALS): Sequence<FaceTrial> = sequence {
+        for ((ri, room) in rooms.withIndex()) {
+            for ((fi, face) in shortFaces(room).withIndex()) {
+                for (inc in INCIDENCES) {
+                    for (range in RANGES) {
+                        val station = stationFor(room, face, inc, range) ?: continue
+                        for (k in 0 until trials) {
+                            val rng = Random(seedOf(family, ri.toLong(), fi.toLong(), inc.toLong(), (range * 10).toLong(), k.toLong()))
+                            val aim = Vec3.fromPlan(face.pointOn(0.2 + 0.6 * rng.nextDouble()), 1.0 + 0.8 * rng.nextDouble())
+                            val cap = ScanSimulator.capture(room, Vec3.fromPlan(station, CAMERA_HEIGHT), aim, rng, noise = noise, planes = planes)
+                            yield(FaceTrial(room, face, inc, range, station, aim, cap))
                         }
                     }
-                    FaceRow(room.name, face.label, inc, range, on, wrong, failed, offsets, angles, failures, details)
                 }
             }
         }
     }
+
+    private fun faceRows(noise: DepthNoise, planes: PlaneHits, family: Long): List<FaceRow> =
+        faceTrials(noise, planes, family).groupBy { listOf(it.room.name, it.face.label, it.incidenceDeg, it.range) }.values.map { group ->
+            val first = group.first()
+            var on = 0
+            var wrong = 0
+            var failed = 0
+            val offsets = ArrayList<Double>()
+            val angles = ArrayList<Double>()
+            val failures = HashMap<WallFitFailure, Int>()
+            val details = ArrayList<String>()
+            for (trial in group) {
+                val face = trial.face
+                val o = trial.capture.fit.observation
+                when {
+                    o == null -> {
+                        failed++
+                        trial.capture.fit.failure?.let { failures.merge(it, 1, Int::plus) }
+                    }
+                    face.matches(o) -> {
+                        on++
+                        offsets += face.line.distance(o.line.project(face.pointOn(0.5)))
+                        angles += Math.toDegrees(Math.asin(abs(o.line.direction cross face.direction).coerceAtMost(1.0)))
+                    }
+                    else -> {
+                        wrong++
+                        details += describe(trial.room, o)
+                    }
+                }
+            }
+            FaceRow(first.room.name, first.face.label, first.incidenceDeg, first.range, on, wrong, failed, offsets, angles, failures, details)
+        }
 
     /**
      * A station [range] from the face's middle, [incidenceDeg] off its normal (either side), inside the room
@@ -242,6 +256,7 @@ internal object HardScenarios {
         "x1.5" to DepthNoise(scale = 1.5),
         "x2.0" to DepthNoise(scale = 2.0),
         "x1.5+frame0.3%" to DepthNoise(scale = 1.5, frameRangeBias = 0.003),
+        "x1+field0.3%" to DepthNoise.SMOOTH_FIELD,
     )
 
     private val sweepRoom = SimRoom("Sweep 8x8", listOf(Vec2(0.0, 0.0), Vec2(8.0, 0.0), Vec2(8.0, 8.0), Vec2(0.0, 8.0)))
@@ -315,6 +330,87 @@ internal object HardScenarios {
         }
     }
 
+    /** (a) clean walls of the sample house with the nominal per-ray noise plus a smooth 0.3 % field error. */
+    val cleanField: List<RoomScan> by lazy {
+        SimScenarios.SEED_SETS.flatMap { k ->
+            SimScenarios.truthRooms.withIndex().flatMap { (i, room) ->
+                val user = SimUser(room, noise = DepthNoise.SMOOTH_FIELD)
+                SimScenarios.stations(room, i, k).mapIndexed { si, (label, home) ->
+                    scanRoom(user, i, si, "s$k/$label", home, (0 until room.size).toList(), 7400L + k)
+                }
+            }
+        }
+    }
+
+    /** Half-angle (degrees) of the narrow sampling grid of [cleanNarrowGrid]. */
+    const val NARROW_GRID_DEG = 8.0
+
+    /**
+     * (a) clean walls of the sample house, nominal noise, sampled over ± [NARROW_GRID_DEG]° instead of ± 12°. The
+     * app samples a square of 25 % of the short side of the view: about ± 7° to ± 10° depending on the camera's
+     * field of view, which is not known from here. A narrower grid sees less of each wall, so directions are
+     * known less well.
+     */
+    val cleanNarrowGrid: List<RoomScan> by lazy {
+        SimScenarios.SEED_SETS.flatMap { k ->
+            SimScenarios.truthRooms.withIndex().flatMap { (i, room) ->
+                val user = SimUser(room, rig = CaptureRig(halfAngleDeg = NARROW_GRID_DEG))
+                SimScenarios.stations(room, i, k).mapIndexed { si, (label, home) ->
+                    scanRoom(user, i, si, "s$k/$label", home, (0 until room.size).toList(), 100L + k)
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Short walls square-on: what the hint asks for
+
+    val SQUARE_DISTANCES = listOf(0.6, 0.8, 1.0, 1.2, 1.5, 1.8, 2.2)
+    private const val SQUARE_TRIALS = 20
+
+    /** Outcome counts of square-on captures of one short wall from one distance. */
+    class SquareRow(val room: String, val length: Double, val distance: Double, val stress: Boolean, val onTarget: Int, val wrong: Int, val failed: Int, val maxAngle: Double, val maxOffset: Double) {
+        val trials: Int get() = onTarget + wrong + failed
+    }
+
+    /**
+     * The short wall of each closet-return / chimney room (its wall 4), aimed at from square in front of it at
+     * [SQUARE_DISTANCES], [SQUARE_TRIALS] captures each, with nominal and with pessimistic noise.
+     */
+    val squareOn: List<SquareRow> by lazy {
+        listOf(false, true).flatMap { stress ->
+            listOf(closet30, closet40, closet60, chimney).flatMap { room ->
+                val face = SimFace("wall 4", room.start(3), room.end(3))
+                SQUARE_DISTANCES.map { d ->
+                    var on = 0
+                    var wrong = 0
+                    var failed = 0
+                    var maxAngle = 0.0
+                    var maxOffset = 0.0
+                    for (k in 0 until SQUARE_TRIALS) {
+                        val rng = Random(seedOf(980L, if (stress) 1L else 0L, (face.length * 100).toLong(), (d * 10).toLong(), k.toLong()))
+                        val aim = face.pointOn(0.2 + 0.6 * rng.nextDouble())
+                        val cap = ScanSimulator.capture(
+                            room, Vec3.fromPlan(aim + face.normal * d, CAMERA_HEIGHT), Vec3.fromPlan(aim, 1.0 + 0.8 * rng.nextDouble()), rng,
+                            noise = if (stress) DepthNoise.PESSIMISTIC else DepthNoise(), planes = if (stress) STRESS_PLANES else PlaneHits.NONE,
+                        )
+                        val o = cap.fit.observation
+                        when {
+                            o == null -> failed++
+                            face.matches(o) -> {
+                                on++
+                                maxAngle = max(maxAngle, Math.toDegrees(Math.asin(abs(o.line.direction cross face.direction).coerceAtMost(1.0))))
+                                maxOffset = max(maxOffset, face.line.distance(o.line.project(face.pointOn(0.5))))
+                            }
+                            else -> wrong++
+                        }
+                    }
+                    SquareRow(room.name, face.length, d, stress, on, wrong, failed, maxAngle, maxOffset)
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------
     // CAPX-8: tall wardrobe under an unmeasured 2.7 m ceiling
 
@@ -372,19 +468,36 @@ internal object HardScenarios {
     fun report(): String = buildString {
         appendLine("== hard rooms: closet returns 0.3-0.6 m, a bump-out, a chimney breast (0.45 m sides), a free-standing column")
         appendLine(
-            "  Full scans from the room's pole / bounds center (short faces at 40-65 deg incidence); the simulated user re-aims " +
-                "after a failure and stands square to the wall after a second one. offT counts STRICT wrong walls " +
-                "(> 5 deg or > 5 cm off the aimed face).",
+            "  Full scans from the room's pole / bounds center (short faces at 40-65 deg incidence). The simulated user does " +
+                "what a failure's message says: stands square to the wall, closer each time (4 tries; after that the app's " +
+                "'tap the wall base' is what is left, which the simulation does not do). WRONG counts STRICT wrong walls " +
+                "(accepted, but > 5 deg or > 5 cm off the aimed face); miss = walls not captured in 4 tries.",
         )
         append(SimReport.section("(h) hard rooms, nominal noise", scans))
         append(SimReport.section("(h2) hard rooms, noise x1.5 + 0.3 % per-frame range error + depth-first plane hits", scansStress))
         appendLine()
-        appendLine("== short faces: aimed captures at 40 / 50 / 65 deg incidence, 2.0 and 2.6 m away ($FACE_TRIALS each)")
+        appendLine("== short faces from the room: aimed captures at 40 / 50 / 65 deg incidence, 2.0 and 2.6 m away ($FACE_TRIALS each)")
+        appendLine("  A short wall seen at an angle from across the room is refused unless it is seen flat over enough of the view; the")
+        appendLine("  message asks the user to stand square to it or to tap its base. A refusal is fine; a WRONG observation is not.")
         appendLine("  room              face            inc  range |  on wrong fail | |off| max mm  |ang| max deg | failures / wrong fits")
         for (r in faces) appendLine(faceLine(r))
         appendLine(faceTotals("nominal", faces))
         appendLine(faceTotals("stress (x1.5 + frame bias + planes)", facesStress))
         for (r in facesStress.filter { it.wrong > 0 }) appendLine("  stress " + faceLine(r).trim())
+        appendLine()
+        appendLine("== short walls square-on (what the message asks for): accepted on target / WRONG / refused of $SQUARE_TRIALS, by distance")
+        appendLine("  wall                      noise    |" + SQUARE_DISTANCES.joinToString("") { String.format(Locale.ROOT, " %7.1f m", it) } + " | max |ang| deg, |off| mm")
+        for (group in squareOn.groupBy { it.room to it.stress }.values) {
+            val first = group.first()
+            appendLine(
+                String.format(
+                    Locale.ROOT, "  %-17s %4.2f m  %-8s |%s | %.2f, %.1f",
+                    first.room.take(17), first.length, if (first.stress) "stress" else "nominal",
+                    group.joinToString("") { String.format(Locale.ROOT, " %9s", "${it.onTarget}/${it.wrong}/${it.failed}") },
+                    group.maxOf { it.maxAngle }, mm(group.maxOf { it.maxOffset }),
+                ),
+            )
+        }
         appendLine()
         appendLine("== noise stress: flat wall head-on, 30 captures per distance (the estimator assumes the nominal model)")
         for ((name, rows) in sweepStress) {
@@ -409,6 +522,20 @@ internal object HardScenarios {
         appendLine()
         append(SimReport.section("(a-stress) sample house, noise x1.5 + 0.3 % per-frame range error + depth-first plane hits", cleanStress))
         appendLine()
+        append(
+            SimReport.section(
+                "(a-field) sample house, nominal per-ray noise + a smooth 0.3 % range error across the image (the same for all frames of a capture)",
+                cleanField,
+            ),
+        )
+        appendLine()
+        append(
+            SimReport.section(
+                "(a-narrow) sample house, nominal noise, sampling grid +-${NARROW_GRID_DEG.toInt()} deg instead of +-12 deg (same seeds as (a))",
+                cleanNarrowGrid,
+            ),
+        )
+        appendLine()
         appendLine("== tall wardrobe (CAPX-8): 2.7 m ceiling not measured, 2.2 m wardrobe, aim just above it (~2.4-2.5 m high), 30 captures each")
         for (w in wardrobe) {
             val fails = w.failures.entries.sortedBy { it.key.name }.joinToString(",") { "${it.key.name}x${it.value}" }
@@ -419,6 +546,11 @@ internal object HardScenarios {
                 ),
             )
         }
+        appendLine(
+            "  (ceilingY = null is the round-2 call, kept for the record: the strip of wall above the wardrobe is outside the " +
+                "height band, so the AR layer has no aim point to pass and the estimator fits what is left in the band, the " +
+                "wardrobe front. The capture flow now always passes a band top.)",
+        )
     }
 
     private fun faceLine(r: FaceRow): String {

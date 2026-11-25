@@ -19,7 +19,7 @@ import org.robolectric.Shadows.shadowOf
  * reads / clicks nodes straight from the semantics tree of every window. Used only where the normal test
  * API cannot be (see AppWalkthroughTest.withTextDialog). Robolectric tests run on the main thread.
  */
-internal class RawUi(private val clock: MainTestClock) {
+class RawUi(private val clock: MainTestClock) {
     /** Lets [ms] of animations, recomposition and layout happen. */
     fun pump(ms: Long = 400) {
         var left = ms

@@ -32,103 +32,8 @@ import org.robolectric.annotation.GraphicsMode
  */
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
-@Config(sdk = [35], qualifiers = PHONE)
-class AppWalkthroughTest {
-    @get:Rule
-    val rule = createAndroidComposeRule<MainActivity>()
-
-    private fun shoot(group: String, name: String) {
-        rule.waitForIdle()
-        Screenshots.shoot(group, name)
-    }
-
-    /**
-     * Drives a dialog that contains a text field. On the JVM runtime such a dialog never reports "idle" once
-     * the clock runs (a runtime artifact, not an app loop: a bare AlertDialog with one OutlinedTextField does
-     * the same), and every normal test lookup waits for idle. So inside [block] the clock is advanced by hand
-     * and nodes are found and clicked directly through the semantics tree ([RawUi]).
-     */
-    private fun withTextDialog(block: RawUi.() -> Unit) {
-        rule.waitForIdle()
-        rule.mainClock.autoAdvance = false
-        try {
-            RawUi(rule.mainClock).block()
-        } finally {
-            rule.mainClock.autoAdvance = true
-        }
-        rule.waitForIdle()
-    }
-
-    private fun exists(label: String): Boolean =
-        rule.onAllNodesWithText(label).fetchSemanticsNodes().isNotEmpty() ||
-            rule.onAllNodesWithContentDescription(label).fetchSemanticsNodes().isNotEmpty()
-
-    private fun uiTree(): String =
-        rule.onAllNodes(isRoot()).fetchSemanticsNodes().indices.joinToString("\n---\n") {
-            rule.onAllNodes(isRoot())[it].printToString(maxDepth = 40)
-        }
-
-    /** Waits until a node with text or content description [label] exists; dumps the UI tree if not. */
-    private fun await(label: String, timeoutMs: Long = 15_000) {
-        try {
-            rule.waitUntil(timeoutMs) { exists(label) }
-        } catch (e: Throwable) {
-            Screenshots.shoot("failure", label.replace(' ', '-').lowercase())
-            throw AssertionError("Never saw \"$label\". UI tree:\n${uiTree()}", e)
-        }
-    }
-
-    /** Taps the first node whose text or content description is [label]. */
-    private fun tap(label: String) {
-        await(label)
-        val byText = rule.onAllNodesWithText(label)
-        if (byText.fetchSemanticsNodes().isNotEmpty()) {
-            byText.onFirst().performClick()
-        } else {
-            rule.onAllNodesWithContentDescription(label).onFirst().performClick()
-        }
-        rule.waitForIdle()
-    }
-
-    /** System Back: dismisses the topmost dialog / menu / sheet if there is one, else navigates back. */
-    private fun back() {
-        rule.waitForIdle()
-        rule.runOnUiThread {
-            val roots = WindowInspector.getGlobalWindowViews().filter { it.isShown }
-            if (roots.size > 1) {
-                val top = roots.last()
-                top.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK))
-                top.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK))
-            } else {
-                rule.activity.onBackPressedDispatcher.onBackPressed()
-            }
-        }
-        rule.waitForIdle()
-    }
-
-    /** Scrolls the screen's content down by about a third of the screen. */
-    private fun scrollDown() {
-        rule.onAllNodes(isRoot()).onFirst().performTouchInput { swipeUp(startY = height * 0.7f, endY = height * 0.35f, durationMillis = 400) }
-        rule.waitForIdle()
-    }
-
-    /** Waits until some text containing [part] is on screen. */
-    private fun awaitTextContaining(part: String, timeoutMs: Long = 15_000) {
-        rule.waitUntil(timeoutMs) { rule.onAllNodesWithText(part, substring = true).fetchSemanticsNodes().isNotEmpty() }
-        rule.waitForIdle()
-    }
-
-    private fun skipOnboarding() {
-        tap("Skip")
-        await("FloorPlan Scan")
-    }
-
-    private fun openSampleHouse() {
-        skipOnboarding()
-        tap("Open sample house")
-        await("Export")
-    }
-
+@Config(sdk = [35], qualifiers = WALKTHROUGH_PHONE)
+class AppWalkthroughTest : WalkthroughBase() {
     @Test
     fun onboardingTour() {
         shoot("onboarding", "page1")
@@ -280,7 +185,7 @@ class AppWalkthroughTest {
     }
 
     @Test
-    @Config(sdk = [35], qualifiers = "w412dp-h915dp-night-420dpi")
+    @Config(sdk = [35], qualifiers = WALKTHROUGH_PHONE_NIGHT)
     fun darkTheme() {
         skipOnboarding()
         shoot("dark", "projects-empty")
@@ -302,6 +207,3 @@ class AppWalkthroughTest {
         shoot("dark", "settings")
     }
 }
-
-/** A tall phone, close to the Galaxy S26 Ultra's default display size. */
-private const val PHONE = "w412dp-h915dp-420dpi"

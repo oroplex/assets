@@ -91,20 +91,25 @@ internal interface ReviewActions {
  * ceiling, openings) and warnings, name and type, the save actions with what they mean, and the ways back
  * (walls, doors & windows, redo). Scrolls within ~62 % of the screen height so the camera stays partly
  * visible and the keyboard fits.
+ *
+ * [room] is the draft exactly as it will be saved (CaptureViewModel.roomAsSaved: scaled to the floor's tape
+ * calibration, if any), so every size shown here is the size that ends up in the plan. Quality reasons number
+ * walls and corners by capture, like the wall chips.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 internal fun ReviewPanel(
     ui: CaptureUiState,
+    room: Room?,
     actions: ReviewActions,
     modifier: Modifier = Modifier,
 ) {
-    val room = ui.draftRoom
     val d = ui.draft
     val enabled = !ui.busy && !ui.finished
     val maxHeight = (LocalConfiguration.current.screenHeightDp * 0.62f).dp
     val focusManager = LocalFocusManager.current
-    val quality = remember(room) { room?.let { reviewQuality(safeAssess(it)) } }
+    val units = ui.settings.unitSystem
+    val quality = remember(room, units) { room?.let { reviewQuality(safeAssess(it, units)) } }
     Surface(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
@@ -291,7 +296,13 @@ private fun RoomPreview(room: Room, settings: PlanSettings, modifier: Modifier =
     val pxPerPt = density * 160.0 / 72.0 * 0.7
     val drawList: DrawList? = remember(room, settings) {
         try {
-            PlanRenderer.render(listOf(room), settings, RenderOptions(showRoomNames = false, showWallLengths = true))
+            // No overall dimension lines: measured to the outside of assumed wall bands, they would sit next
+            // to the interior wall lengths and the "Size" row as a second, conflicting size.
+            PlanRenderer.render(
+                listOf(room),
+                settings,
+                RenderOptions(showRoomNames = false, showWallLengths = true, showOverallDimensions = false),
+            )
         } catch (e: Exception) {
             null
         }

@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -38,6 +39,8 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.oroplex.floorplan.ar.ArCaptureController
@@ -62,12 +65,16 @@ fun CaptureScreen(projectId: String, floorId: String, onDone: () -> Unit) {
     val finished by remember { derivedStateOf { state.value.finished } }
     val loadError by remember { derivedStateOf { state.value.loadError } }
     val confirmDiscard by remember { derivedStateOf { state.value.confirmDiscard } }
+    val confirmEndSession by remember { derivedStateOf { state.value.confirmEndSession } }
+    val interrupted by remember { derivedStateOf { state.value.interrupted } }
+    val savedRoomCount by remember { derivedStateOf { state.value.sessionRoomIds.size } }
     val showTips by remember { derivedStateOf { state.value.showTips } }
     val tipsFromHelp by remember { derivedStateOf { state.value.tipsFromHelp } }
     val currentOnDone by rememberUpdatedState(onDone)
 
     // The AR controller last handed to the capture UI. Back on the AR host's own screens (e.g. "camera in
-    // use by another app" mid-scan) still exits through the ViewModel: discard prompt + anchor corrections.
+    // use by another app" mid-scan) still exits through the ViewModel: the discard / end-scan prompts and the
+    // anchor corrections.
     var lastController by remember { mutableStateOf<ArCaptureController?>(null) }
 
     LaunchedEffect(finished) {
@@ -90,19 +97,119 @@ fun CaptureScreen(projectId: String, floorId: String, onDone: () -> Unit) {
 
     // Composed outside the AR host so they also show above its error screens.
     if (confirmDiscard) {
-        AlertDialog(
-            onDismissRequest = vm::dismissDiscard,
-            title = { Text("Discard this room?") },
-            text = { Text("What you captured for this room will be lost. Rooms you already saved are kept.") },
-            confirmButton = {
-                TextButton(onClick = { vm.discardAndExit(lastController) }) { Text("Discard") }
-            },
-            dismissButton = {
-                TextButton(onClick = vm::dismissDiscard) { Text("Keep scanning") }
-            },
+        DiscardRoomDialog(
+            savedRoomCount = savedRoomCount,
+            onKeepScanning = vm::discardRoom,
+            onEndScan = { vm.discardAndExit(lastController) },
+            onCancel = vm::dismissDiscard,
         )
     }
+    if (confirmEndSession) {
+        EndScanDialog(
+            savedRoomCount = savedRoomCount,
+            onEnd = { vm.endSession(lastController) },
+            onKeepScanning = vm::dismissEndSession,
+        )
+    }
+    interrupted?.let { notice ->
+        InterruptedScanDialog(notice, onSave = vm::saveInterruptedRoom, onDismiss = vm::dismissInterrupted)
+    }
     if (showTips) HowToScanSheet(doneLabel = if (tipsFromHelp) "Got it" else "Start scanning", onDismiss = vm::dismissTips)
+}
+
+/**
+ * "Discard this room?": discard and keep scanning in the same AR session (its frame and saved rooms stay),
+ * discard and end the scan, or cancel. Buttons are stacked so the long labels stay readable.
+ */
+@Composable
+private fun DiscardRoomDialog(savedRoomCount: Int, onKeepScanning: () -> Unit, onEndScan: () -> Unit, onCancel: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Discard this room?") },
+        text = {
+            Text(
+                if (savedRoomCount > 0) {
+                    "What you captured for this room will be lost. Your saved rooms are kept. " +
+                        "If you end the scan, rooms you scan after this won't line up automatically."
+                } else {
+                    "What you captured for this room will be lost."
+                },
+            )
+        },
+        confirmButton = {
+            Column(horizontalAlignment = Alignment.End) {
+                TextButton(onClick = onKeepScanning, modifier = Modifier.heightIn(min = 48.dp)) { Text("Discard room, keep scanning") }
+                TextButton(onClick = onEndScan, modifier = Modifier.heightIn(min = 48.dp)) { Text("Discard and end scan") }
+                TextButton(onClick = onCancel, modifier = Modifier.heightIn(min = 48.dp)) { Text("Cancel") }
+            }
+        },
+    )
+}
+
+/** "End this scan?" when leaving between rooms: the shared AR frame ends with the scan. */
+@Composable
+private fun EndScanDialog(savedRoomCount: Int, onEnd: () -> Unit, onKeepScanning: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onKeepScanning,
+        title = { Text("End this scan?") },
+        text = {
+            Text(
+                when (savedRoomCount) {
+                    0 -> "You haven't saved a room yet. Next time you'll start by finding the floor again."
+                    1 -> "Rooms you scan after this won't line up automatically. Your saved room is kept."
+                    else -> "Rooms you scan after this won't line up automatically. Your $savedRoomCount saved rooms are kept."
+                },
+            )
+        },
+        confirmButton = { TextButton(onClick = onEnd, modifier = Modifier.heightIn(min = 48.dp)) { Text("End scan") } },
+        dismissButton = { TextButton(onClick = onKeepScanning, modifier = Modifier.heightIn(min = 48.dp)) { Text("Keep scanning") } },
+    )
+}
+
+/** Persistent notice after the AR session restarted mid-scan (e.g. Android closed the app in the background). */
+@Composable
+private fun InterruptedScanDialog(notice: InterruptedScan, onSave: () -> Unit, onDismiss: () -> Unit) {
+    val restorable = notice.restorable
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Scan interrupted") },
+        text = { Text(interruptedScanText(notice)) },
+        confirmButton = {
+            if (restorable != null) {
+                TextButton(onClick = onSave, modifier = Modifier.heightIn(min = 48.dp)) { Text("Save that room") }
+            } else {
+                TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text("OK") }
+            }
+        },
+        dismissButton = if (restorable != null) {
+            { TextButton(onClick = onDismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text("Discard it") } }
+        } else {
+            null
+        },
+    )
+}
+
+/** Body of the "Scan interrupted" notice: what was kept, what was lost, and what to do next. */
+internal fun interruptedScanText(notice: InterruptedScan): String {
+    val parts = ArrayList<String>(3)
+    parts += "The camera session restarted, so scanning continues in a new frame."
+    when (notice.savedRoomCount) {
+        0 -> Unit
+        1 -> parts += "Your saved room is kept. Rooms you scan now won't line up with it automatically: use Snap to neighbour in the editor."
+        else -> parts += "Your ${notice.savedRoomCount} saved rooms are kept. Rooms you scan now won't line up with them automatically: use Snap to neighbour in the editor."
+    }
+    val restorable = notice.restorable
+    when {
+        restorable != null -> {
+            val name = restorable.draft.name.trim()
+            val what = if (name.isNotEmpty()) name else "The room you were scanning"
+            val n = restorable.draft.captureCount
+            val noun = if (restorable.draft.method == CaptureMethod.CORNERS) "corner" else "wall"
+            parts += "$what ($n ${if (n == 1) noun else noun + "s"}) can still be saved as it was."
+        }
+        notice.lostRoom -> parts += "The room you were scanning needs to be scanned again."
+    }
+    return parts.joinToString(" ")
 }
 
 /** Everything layered over the live camera once the AR session runs. */
@@ -123,6 +230,15 @@ private fun CaptureContent(
         vm.attach(controller)
         controller.frameState.collect { vm.onFrame(it, controller) }
     }
+    // Android may kill the process once the app is in the background, without another callback: take the
+    // anchor corrections now so the saved snapshot carries them (ON_PAUSE also covers API < 28, where state
+    // is saved before ON_STOP).
+    LifecycleEventEffect(Lifecycle.Event.ON_PAUSE) { vm.onBackground(controller) }
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { vm.onBackground(controller) }
+
+    // The draft exactly as it will be saved (scaled to the floor's tape calibration) for review and mini-map;
+    // the AR overlay keeps the raw draft so it lines up with the camera image.
+    val savedDraft = remember(ui.draft, ui.settings, ui.sessionId, ui.floorRooms, ui.floorCalibration) { vm.roomAsSaved(ui) }
 
     // Reticle feedback: the progress ring fills while measuring; outcomes play a haptic and an animation.
     val fx = remember { ReticleFx() }
@@ -180,14 +296,14 @@ private fun CaptureContent(
             val showMiniMap = ui.step == CaptureStep.WALLS || ui.step == CaptureStep.CORNERS || ui.step == CaptureStep.OPENINGS
             if (showMiniMap) {
                 Spacer(Modifier.width(12.dp))
-                MiniMap(ui, frame, Modifier.size(MiniMapSize))
+                MiniMap(ui, savedDraft, frame, Modifier.size(MiniMapSize))
             }
         }
 
         Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().imePadding()) {
             SnackbarHost(snackbarHostState, Modifier.fillMaxWidth())
             if (ui.step == CaptureStep.REVIEW) {
-                ReviewPanel(ui, actions)
+                ReviewPanel(ui, savedDraft, actions)
             } else {
                 CaptureControls(ui, floorStatus, actions)
             }
@@ -205,6 +321,7 @@ private class BoundCaptureActions(
     override fun measureCeiling() = vm.measureCeiling(controller)
     override fun skipCeiling() = vm.skipCeiling(controller)
     override fun useLastCeiling() = vm.useLastCeiling(controller)
+    override fun keepCeiling() = vm.keepCeiling(controller)
     override fun setMethod(method: CaptureMethod) = vm.setMethod(method)
     override fun captureWall() = vm.captureWall(controller)
     override fun startBaseline() = vm.startBaseline()

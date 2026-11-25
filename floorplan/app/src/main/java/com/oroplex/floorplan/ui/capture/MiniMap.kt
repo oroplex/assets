@@ -49,13 +49,26 @@ private const val HIGHLIGHT_COLOR: Int = 0xFFFFB300.toInt()
  * Static part of the mini-map (changes only when the capture state does): the session's rooms and the
  * draft drawn by [PlanRenderer] once solved, or the raw observation segments / corner taps before that.
  * [focus] is what the view auto-fits to (the draft), before adding the camera.
+ *
+ * Everything is drawn in ONE frame, the floor as stored: saved session rooms are stored scaled by the floor's
+ * tape calibration, so the draft ([savedDraft], the room as it will be saved), the raw captures and the camera
+ * ([scale], applied with [mapCamera]) are mapped into that frame too. Wall lengths then read as they will be
+ * saved, and earlier rooms sit where they really are next to the live one.
  */
-internal data class MiniMapContent(val drawList: DrawList, val focus: Bounds) {
+internal data class MiniMapContent(val drawList: DrawList, val focus: Bounds, val scale: AppliedScale?) {
+    /** A raw AR plan point (camera, aim) in the mini-map's frame. */
+    fun mapCamera(p: Vec2): Vec2 = scale?.map(p) ?: p
+
     companion object {
-        fun build(ui: CaptureUiState): MiniMapContent {
+        /**
+         * [savedDraft] is the draft room as it will be saved (CaptureViewModel.roomAsSaved), null while unsolved.
+         * Overall dimension lines are off: on a 150 dp card they are unreadable and look like conflicting sizes.
+         */
+        fun build(ui: CaptureUiState, savedDraft: Room?): MiniMapContent {
             val draft = ui.draft
-            val draftRoom = ui.draftRoom
-            val rooms: List<Room> = ui.sessionRooms + listOfNotNull(draftRoom)
+            val scale = ui.savedScale
+            fun map(p: Vec2): Vec2 = scale?.map(p) ?: p
+            val rooms: List<Room> = ui.sessionRooms + listOfNotNull(savedDraft)
             val rendered = if (rooms.isEmpty()) {
                 null
             } else {
@@ -68,7 +81,8 @@ internal data class MiniMapContent(val drawList: DrawList, val focus: Bounds) {
                             showRoomDimensions = false,
                             showAreas = false,
                             showWallLengths = true,
-                            selectedRoomId = draftRoom?.id,
+                            selectedRoomId = savedDraft?.id,
+                            showOverallDimensions = false,
                         ),
                     )
                 } catch (e: Exception) {
@@ -77,44 +91,46 @@ internal data class MiniMapContent(val drawList: DrawList, val focus: Bounds) {
             }
             val ops = ArrayList<DrawOp>()
             rendered?.let { ops += it.ops }
-            if (draftRoom == null || rendered == null) ops += rawDraftOps(ui, draftRoom)
-            ops += recaptureOps(draft)
+            if (savedDraft == null || rendered == null) ops += rawDraftOps(draft, savedDraft, ::map)
+            ops += recaptureOps(draft, ::map)
 
             val focusPoints: List<Vec2> = when {
-                draftRoom != null -> draftRoom.corners
-                draft.method == CaptureMethod.CORNERS -> draft.cornerTaps
-                else -> draft.observations.flatMap { listOf(it.extentStart, it.extentEnd) }
+                savedDraft != null -> savedDraft.corners
+                draft.method == CaptureMethod.CORNERS -> draft.cornerTaps.map(::map)
+                else -> draft.observations.flatMap { listOf(map(it.extentStart), map(it.extentEnd)) }
             }.filter { it.isFinite() }
             val focus = if (focusPoints.isNotEmpty()) Bounds.of(focusPoints) else Bounds.EMPTY
-            return MiniMapContent(DrawList(ops, rendered?.bounds ?: focus), focus)
+            return MiniMapContent(DrawList(ops, rendered?.bounds ?: focus), focus, scale)
         }
 
         /** The wall or corner being re-captured, drawn on top in amber so the user sees which one to aim at. */
-        private fun recaptureOps(d: RoomDraft): List<DrawOp> {
+        private fun recaptureOps(d: RoomDraft, map: (Vec2) -> Vec2): List<DrawOp> {
             val i = d.recaptureIndex ?: return emptyList()
             return if (d.method == CaptureMethod.CORNERS) {
                 val p = d.cornerTaps.getOrNull(i)?.takeIf { it.isFinite() } ?: return emptyList()
-                listOf(DrawOp.Dot(p, radiusPt = 6.0, fillColor = HIGHLIGHT_COLOR, strokeColor = PlanColors.HANDLE_FILL))
+                listOf(DrawOp.Dot(map(p), radiusPt = 6.0, fillColor = HIGHLIGHT_COLOR, strokeColor = PlanColors.HANDLE_FILL))
             } else {
                 val o = d.observations.getOrNull(i) ?: return emptyList()
                 if (!o.extentStart.isFinite() || !o.extentEnd.isFinite()) return emptyList()
-                listOf(DrawOp.Polyline(listOf(o.extentStart, o.extentEnd), closed = false, widthPt = 7.0, color = HIGHLIGHT_COLOR))
+                listOf(DrawOp.Polyline(listOf(map(o.extentStart), map(o.extentEnd)), closed = false, widthPt = 7.0, color = HIGHLIGHT_COLOR))
             }
         }
 
         /** Unsolved draft (or renderer failure): observation segments with wall numbers, corner taps. */
-        private fun rawDraftOps(ui: CaptureUiState, draftRoom: Room?): List<DrawOp> {
+        private fun rawDraftOps(d: RoomDraft, savedDraft: Room?, map: (Vec2) -> Vec2): List<DrawOp> {
             val ops = ArrayList<DrawOp>()
-            val d = ui.draft
-            if (draftRoom != null) {
-                ops += DrawOp.Polyline(draftRoom.corners, closed = true, widthPt = 3.0, color = PlanColors.WALL)
+            if (savedDraft != null) {
+                ops += DrawOp.Polyline(savedDraft.corners, closed = true, widthPt = 3.0, color = PlanColors.WALL)
                 return ops
             }
             d.observations.forEachIndexed { i, o ->
                 if (!o.extentStart.isFinite() || !o.extentEnd.isFinite()) return@forEachIndexed
-                ops += DrawOp.Polyline(listOf(o.extentStart, o.extentEnd), closed = false, widthPt = 4.0, color = OBSERVATION_COLOR)
+                val a = map(o.extentStart)
+                val b = map(o.extentEnd)
+                ops += DrawOp.Polyline(listOf(a, b), closed = false, widthPt = 4.0, color = OBSERVATION_COLOR)
+                val normal = o.line.normal.takeIf { it.isFinite() } ?: Vec2.ZERO
                 ops += DrawOp.Text(
-                    anchor = Vec2.lerp(o.extentStart, o.extentEnd, 0.5) + o.line.normal * 0.35,
+                    anchor = Vec2.lerp(a, b, 0.5) + normal * 0.35,
                     text = "${i + 1}",
                     sizePt = 14.0,
                     color = PlanColors.TEXT,
@@ -122,10 +138,11 @@ internal data class MiniMapContent(val drawList: DrawList, val focus: Bounds) {
                 )
             }
             if (d.method == CaptureMethod.CORNERS && d.cornerTaps.isNotEmpty()) {
-                if (d.cornerTaps.size >= 2) {
-                    ops += DrawOp.Polyline(d.cornerTaps, closed = false, widthPt = 3.0, color = OBSERVATION_COLOR)
+                val taps = d.cornerTaps.filter { it.isFinite() }.map(map)
+                if (taps.size >= 2) {
+                    ops += DrawOp.Polyline(taps, closed = false, widthPt = 3.0, color = OBSERVATION_COLOR)
                 }
-                d.cornerTaps.forEach { ops += DrawOp.Dot(it, radiusPt = 4.0, fillColor = PlanColors.HANDLE_FILL, strokeColor = OBSERVATION_COLOR) }
+                taps.forEach { ops += DrawOp.Dot(it, radiusPt = 4.0, fillColor = PlanColors.HANDLE_FILL, strokeColor = OBSERVATION_COLOR) }
             }
             return ops
         }
@@ -135,17 +152,20 @@ internal data class MiniMapContent(val drawList: DrawList, val focus: Bounds) {
 /**
  * Top-down mini-map card: the room being captured (and this session's earlier rooms) plus the phone's
  * position and aim, auto-fitted around the draft and the camera. Redrawn every AR frame from [frame]
- * without recomposition.
+ * without recomposition. [savedDraft] is the draft as it will be saved (see [MiniMapContent]).
  */
 @Composable
 internal fun MiniMap(
     ui: CaptureUiState,
+    savedDraft: Room?,
     frame: () -> ArFrameState,
     modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current.density
     val pxPerPt = density * 160.0 / 72.0 * MINI_MAP_PT_SCALE
-    val content = remember(ui.draft, ui.sessionRooms, ui.settings, ui.sessionId) { MiniMapContent.build(ui) }
+    val content = remember(ui.draft, savedDraft, ui.sessionRooms, ui.settings, ui.sessionId, ui.floorCalibration) {
+        MiniMapContent.build(ui, savedDraft)
+    }
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(16.dp),
@@ -155,9 +175,11 @@ internal fun MiniMap(
         Box {
             Canvas(Modifier.fillMaxSize().clipToBounds()) {
                 val f = frame()
-                val camera = f.cameraPosition?.takeIf { it.isFinite() }?.toPlan()
-                val aim = f.reticle?.world?.takeIf { it.isFinite() }?.toPlan()
-                    ?.takeIf { camera != null && it.distanceTo(camera) <= MAX_AIM_LINE }
+                val rawCamera = f.cameraPosition?.takeIf { it.isFinite() }?.toPlan()
+                val rawAim = f.reticle?.world?.takeIf { it.isFinite() }?.toPlan()
+                    ?.takeIf { rawCamera != null && it.distanceTo(rawCamera) <= MAX_AIM_LINE }
+                val camera = rawCamera?.let(content::mapCamera)
+                val aim = rawAim?.let(content::mapCamera)
 
                 var bounds = content.focus
                 if (camera != null) bounds = bounds.include(camera)

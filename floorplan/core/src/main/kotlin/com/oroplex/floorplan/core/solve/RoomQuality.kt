@@ -1,5 +1,6 @@
 package com.oroplex.floorplan.core.solve
 
+import com.oroplex.floorplan.core.fit.WallEstimatorConfig
 import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.measure.Units
 import com.oroplex.floorplan.core.model.CaptureMethod
@@ -45,6 +46,23 @@ object RoomQuality {
 
     /** Depth fits whose inlier RMS is above this (m) are called out as noisy. */
     internal const val NOISY_RMS = 0.025
+
+    /** [noisyLimit]: multiple of the range-adaptive expected per-point sigma a depth fit may reach. */
+    const val NOISY_SIGMA_FACTOR = 1.3
+
+    /**
+     * Per-point RMS (m) above which a depth-fit observation counts as noisy: max(2.5 cm, 1.3 x the estimator's
+     * expected sigma at the capture range), range = horizontal distance from [WallObservation.viewer] to the
+     * middle of the observed extent. Per-point noise grows with range (about 5 mm + 1.2 % of the distance), so a
+     * fixed limit would flag every accurate capture from 2 m or more. Shared by RoomQuality and the capture
+     * screen's wall chips so the two always agree. Non-finite input gives the 2.5 cm floor.
+     */
+    fun noisyLimit(o: WallObservation): Double {
+        val mid = (o.extentStart + o.extentEnd) * 0.5
+        val range = o.viewer.distanceTo(mid)
+        if (!range.isFinite()) return NOISY_RMS
+        return max(NOISY_RMS, NOISY_SIGMA_FACTOR * WallEstimatorConfig().expectedSigma(range))
+    }
 
     /** Highest score a noisy depth fit can get (enough to pull an otherwise clean room down to FAIR). */
     private const val NOISY_WALL = 0.6

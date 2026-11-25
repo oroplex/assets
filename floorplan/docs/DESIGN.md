@@ -114,7 +114,7 @@ Driven by `docs/REVIEW-2.md` (finding ids SEAM-n, ARX-n, MATH-n, CAPX-n, APPX-n,
 * Provenance rule for calibration (tape scale correction): only AR-measured values scale. Typed values
   (`ceilingTyped`, `Opening.typed` widths, `HandSetWall.typedLength`) and estimated ceilings keep their
   values; drawn (MANUAL) rooms keep their size but move with the scaled plan.
-* Core: `RoomQuality.assess(room, numbering = OUTLINE|CAPTURE, unitSystem)` (capture review must use CAPTURE
+* Core: `RoomQuality.assess(room, numbering = OUTLINE|CAPTURE, unitSystem)` and `RoomQuality.noisyLimit(observation)` (the one range-adaptive "noisy wall" rule; capture chips must use it too) (capture review must use CAPTURE
   numbers, which match the wall chips), `FloorIssue.action` (`STRAIGHTEN_FLOOR`, `SNAP_ROOM`),
   `Measurements.areaSummary` (living / non-living / outdoor; never call it GLA), `DxfExporter.export(...,
   showAreas, showOverallDimensions)`, `RenderOptions.pointsPerMeter`, `RoomSolver.sharedAxis(outlines)`

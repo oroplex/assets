@@ -2,7 +2,6 @@ package com.oroplex.floorplan.ar
 
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
-import android.util.Log
 import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Frame
 import java.nio.ByteBuffer
@@ -94,7 +93,6 @@ internal class BackgroundRenderer {
     }
 
     private companion object {
-        const val TAG = "BackgroundRenderer"
 
         /** Full-screen quad as a triangle strip, in normalized device coordinates (x, y pairs). */
         val QUAD_NDC = floatArrayOf(-1f, -1f, +1f, -1f, -1f, +1f, +1f, +1f)
@@ -136,7 +134,7 @@ internal class BackgroundRenderer {
             }
             val program = GLES20.glCreateProgram()
             if (program == 0) {
-                Log.e(TAG, "glCreateProgram failed: 0x${Integer.toHexString(GLES20.glGetError())}")
+                ArLog.e("glCreateProgram failed: 0x${Integer.toHexString(GLES20.glGetError())}")
                 return 0
             }
             GLES20.glAttachShader(program, vertex)
@@ -148,7 +146,7 @@ internal class BackgroundRenderer {
             val status = IntArray(1)
             GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, status, 0)
             if (status[0] != GLES20.GL_TRUE) {
-                Log.e(TAG, "Camera background program failed to link: ${GLES20.glGetProgramInfoLog(program)}")
+                ArLog.e("camera background program failed to link: ${GLES20.glGetProgramInfoLog(program)}")
                 GLES20.glDeleteProgram(program)
                 return 0
             }
@@ -164,7 +162,7 @@ internal class BackgroundRenderer {
             val status = IntArray(1)
             GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, status, 0)
             if (status[0] != GLES20.GL_TRUE) {
-                Log.e(TAG, "Camera background shader failed to compile: ${GLES20.glGetShaderInfoLog(shader)}")
+                ArLog.e("camera background shader failed to compile: ${GLES20.glGetShaderInfoLog(shader)}")
                 GLES20.glDeleteShader(shader)
                 return 0
             }

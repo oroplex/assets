@@ -8,7 +8,6 @@ import android.content.Intent
 import android.net.Uri
 import android.os.SystemClock
 import android.provider.Settings
-import android.util.Log
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
@@ -85,7 +84,6 @@ internal sealed interface ArAvailabilityResult {
 
 /** ARCore availability check and install flow. Everything here must run on the main thread. */
 internal object ArAvailability {
-    private const val TAG = "ArAvailability"
     private const val POLL_INTERVAL_MS = 200L
 
     /** How long to keep polling while ARCore reports a transient (still checking) state. */
@@ -99,8 +97,10 @@ internal object ArAvailability {
      * returning from the install flow) reports a decline as [ArSetupError.INSTALL_DECLINED] instead of
      * prompting again.
      */
-    suspend fun prepare(activity: Activity, userRequestedInstall: Boolean): ArAvailabilityResult =
-        when (awaitAvailability(activity)) {
+    suspend fun prepare(activity: Activity, userRequestedInstall: Boolean): ArAvailabilityResult {
+        val availability = awaitAvailability(activity)
+        ArLog.i("ARCore availability: $availability")
+        return when (availability) {
             ArCoreApk.Availability.SUPPORTED_INSTALLED -> ArAvailabilityResult.Ready
             ArCoreApk.Availability.SUPPORTED_NOT_INSTALLED,
             ArCoreApk.Availability.SUPPORTED_APK_TOO_OLD,
@@ -110,6 +110,7 @@ internal object ArAvailability {
             // UNKNOWN_ERROR, UNKNOWN_TIMED_OUT (typically offline on first launch), or still checking.
             else -> ArAvailabilityResult.Unavailable(ArSetupError.CHECK_FAILED)
         }
+    }
 
     /**
      * [ArCoreApk.checkAvailability] answers UNKNOWN_CHECKING while it queries the device-support list in
@@ -122,7 +123,7 @@ internal object ArAvailability {
             val availability = try {
                 apk.checkAvailability(context)
             } catch (e: Exception) {
-                Log.w(TAG, "ARCore availability check failed", e)
+                ArLog.w("ARCore availability check failed", e)
                 ArCoreApk.Availability.UNKNOWN_ERROR
             } ?: ArCoreApk.Availability.UNKNOWN_ERROR
             if (!availability.isTransient || SystemClock.elapsedRealtime() >= deadline) return availability
@@ -140,7 +141,7 @@ internal object ArAvailability {
     } catch (e: UnavailableDeviceNotCompatibleException) {
         ArAvailabilityResult.Unavailable(ArSetupError.DEVICE_NOT_SUPPORTED)
     } catch (e: Exception) {
-        Log.w(TAG, "ARCore install request failed", e)
+        ArLog.w("ARCore install request failed", e)
         ArAvailabilityResult.Unavailable(ArSetupError.CHECK_FAILED)
     }
 }
@@ -165,7 +166,7 @@ internal fun Context.openAppSettings() {
         try {
             startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         } catch (e2: ActivityNotFoundException) {
-            Log.w("ArAvailability", "No settings activity available", e2)
+            ArLog.w("no settings activity available", e2)
         }
     }
 }

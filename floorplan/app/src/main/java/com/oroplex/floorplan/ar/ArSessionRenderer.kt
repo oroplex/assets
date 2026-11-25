@@ -4,7 +4,6 @@ import android.content.Context
 import android.hardware.display.DisplayManager
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
-import android.util.Log
 import android.view.Display
 import android.view.Surface
 import android.view.View
@@ -40,7 +39,9 @@ internal class ArSessionRenderer(
 
     /** Whether Session.setCameraTextureName was called for the current EGL context's texture. */
     private var textureBound = false
-    private val errors = ThrottledLog(TAG)
+    private val errors = ThrottledLog()
+    private val perf = FramePerf()
+    private var lastImageTimestamp = 0L
     private var cameraFailingSinceNs = NOT_FAILING
     private var cameraLostReported = false
     private var seenResumeCount = -1
@@ -58,16 +59,18 @@ internal class ArSessionRenderer(
         try {
             background.createOnGlThread()
         } catch (e: Exception) {
-            Log.e(TAG, "Creating the camera background failed", e)
+            ArLog.e("creating the camera background failed", e)
         }
         // A new EGL context invalidates the old texture name: re-bind before the next update(), and
         // re-map the camera image onto the screen quad on the next frame.
         textureBound = false
         uvUpdatePending = true
+        ArLog.i("GL surface created (camera texture ${if (background.textureId != 0) "ready" else "MISSING"})")
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         GLES20.glViewport(0, 0, width, height)
+        if (width != viewportWidth || height != viewportHeight) ArLog.i("GL surface size ${width}x$height")
         viewportWidth = width
         viewportHeight = height
         uvUpdatePending = true
@@ -96,6 +99,7 @@ internal class ArSessionRenderer(
             seenResumeCount = controller.resumeCount
             cameraFailingSinceNs = NOT_FAILING
             cameraLostReported = false
+            perf.reset()
         }
 
         try {
@@ -105,19 +109,22 @@ internal class ArSessionRenderer(
             }
             displayRotation.applyIfChanged(session, viewportWidth, viewportHeight)
 
+            val updateStartNs = System.nanoTime()
             val frame = try {
                 session.update()
             } catch (e: CameraNotAvailableException) {
-                errors.warn("Camera not available", e)
+                errors.warn("camera not available", e)
                 controller.onFrameUnavailable(TrackingProblem.CAMERA_UNAVAILABLE)
                 onCameraUnavailable()
                 return
             }
+            val updatedNs = System.nanoTime()
             cameraFailingSinceNs = NOT_FAILING
             cameraLostReported = false
 
             // Timestamp 0: the camera has not produced its first image yet; nothing valid to draw.
-            val hasImage = frame.timestamp != 0L
+            val timestamp = frame.timestamp
+            val hasImage = timestamp != 0L
             if (frame.hasDisplayGeometryChanged() || uvUpdatePending) {
                 background.updateDisplayGeometry(frame)
                 if (hasImage) uvUpdatePending = false
@@ -126,11 +133,21 @@ internal class ArSessionRenderer(
 
             background.draw()
             controller.onFrame(session, frame, viewportWidth, viewportHeight)
+
+            // Frame-time diagnostics: one summary line every few seconds, never per frame.
+            val doneNs = System.nanoTime()
+            val newImage = timestamp != lastImageTimestamp
+            lastImageTimestamp = timestamp
+            perf.onFrame(doneNs, newImage, updatedNs - updateStartNs, doneNs - updatedNs)?.let { ArLog.i(it) }
         } catch (e: SessionPausedException) {
             // Pause raced this frame; the GL thread is about to be paused too.
         } catch (e: Exception) {
             errors.warn("AR frame failed", e)
-            controller.onFrameUnavailable(TrackingProblem.BAD_STATE)
+            try {
+                controller.onFrameUnavailable(TrackingProblem.BAD_STATE)
+            } catch (inner: Exception) {
+                // Nothing may escape onDrawFrame: an exception here would kill the GL thread and the app.
+            }
         }
     }
 
@@ -139,12 +156,12 @@ internal class ArSessionRenderer(
         if (cameraFailingSinceNs == NOT_FAILING) cameraFailingSinceNs = now
         if (!cameraLostReported && now - cameraFailingSinceNs > CAMERA_LOST_AFTER_NS) {
             cameraLostReported = true
+            ArLog.w("camera unavailable for ${CAMERA_LOST_AFTER_NS.nsToMs()} ms while running: pausing for Retry")
             onCameraLost()
         }
     }
 
     private companion object {
-        const val TAG = "ArSessionRenderer"
         const val CAMERA_LOST_AFTER_NS = 1_500_000_000L
         const val NOT_FAILING = Long.MIN_VALUE
     }

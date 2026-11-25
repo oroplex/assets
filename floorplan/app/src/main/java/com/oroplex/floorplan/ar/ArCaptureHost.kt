@@ -4,8 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.opengl.GLSurfaceView
-import android.util.Log
-import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -38,7 +36,8 @@ import com.google.ar.core.exceptions.CameraNotAvailableException
  * configuration, lifecycle (resume/pause/close), and renders the camera feed. Once the session runs it
  * calls [content] with the live controller, layered above the camera view. Shows friendly full-screen
  * messages (with retry / back) for every failure (no permission, unsupported device, install declined,
- * camera unavailable). [onExit] is invoked when the user backs out of an error screen.
+ * camera unavailable). [onExit] is invoked when the user backs out of an error screen, including the
+ * "Camera unavailable" screen that covers a running scan (see [ArSessionLayers]).
  */
 @Composable
 fun ArCaptureHost(
@@ -200,24 +199,49 @@ private fun ArSessionContent(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val backDispatcher = LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
+    ArSessionLayers(
+        cameraView = { AndroidView(factory = { runner.view }, modifier = Modifier.fillMaxSize()) },
+        showContent = runner.started,
+        cameraUnavailable = runner.cameraUnavailable,
+        onRetry = {
+            if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) runner.resume()
+        },
+        onExit = onExit,
+        content = { content(holder.controller) },
+    )
+}
+
+/**
+ * The layers of a session, bottom to top: the camera view, the capture UI ([content], composed once the
+ * session has run and then kept, with its state, even while the camera is unavailable), and the
+ * full-screen "Camera unavailable" overlay with Retry and Back.
+ *
+ * Back on that overlay, the button and system Back alike, calls [onExit], which is the capture flow's
+ * "leave the scan" (it asks before discarding a room in progress or ending a multi-room session, and applies
+ * the anchor corrections). It must NOT reach the capture UI's own Back handling: that steps back through
+ * the capture flow (out of review, out of a re-capture, dropping a half-marked door), and those steps would
+ * happen invisibly underneath the overlay while the visible Back appeared to do nothing (ARX-5 / CAPX-10).
+ * The overlay is composed after [content], so its back handler is registered later and takes priority for
+ * as long as it is shown; the capture flow's prompts are dialogs composed outside the host, above it.
+ */
+@Composable
+internal fun ArSessionLayers(
+    cameraView: @Composable () -> Unit,
+    showContent: Boolean,
+    cameraUnavailable: Boolean,
+    onRetry: () -> Unit,
+    onExit: () -> Unit,
+    content: @Composable () -> Unit,
+) {
     Box(Modifier.fillMaxSize()) {
-        AndroidView(factory = { runner.view }, modifier = Modifier.fillMaxSize())
-        // Once started, the capture UI stays composed (keeping its state) even under the error overlay.
-        val inSession = runner.started
-        if (inSession) content(holder.controller)
-        if (runner.cameraUnavailable) {
-            // Mid-session, Back must go through the capture flow (discard prompt, anchor corrections), not
-            // pop the screen: the overlay leaves system Back to the content's BackHandler, and its Back
-            // button dispatches a regular back press. Before the session ever ran, Back simply exits.
-            val sessionBack = backDispatcher?.takeIf { inSession }
+        cameraView()
+        if (showContent) content()
+        if (cameraUnavailable) {
             ArSetupErrorScreen(
                 error = ArSetupError.CAMERA_UNAVAILABLE,
-                onPrimary = {
-                    if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) runner.resume()
-                },
-                onBack = if (sessionBack != null) ({ sessionBack.onBackPressed() }) else onExit,
-                handleSystemBack = sessionBack == null,
+                onPrimary = onRetry,
+                onBack = onExit,
+                handleSystemBack = true,
             )
         }
     }
@@ -267,12 +291,12 @@ private class ArSessionRunner(context: Context, private val sessionHolder: ArSes
         try {
             sessionHolder.session.resume()
         } catch (e: CameraNotAvailableException) {
-            Log.w(TAG, "Camera not available on resume", e)
+            ArLog.w("session resume failed: camera not available (in use by another app?)", e)
             cameraUnavailable = true
             return
         } catch (e: Exception) {
             // SecurityException (permission revoked), FatalException, IllegalStateException, ...
-            Log.e(TAG, "Session.resume failed", e)
+            ArLog.e("session resume failed", e)
             cameraUnavailable = true
             return
         }
@@ -292,7 +316,7 @@ private class ArSessionRunner(context: Context, private val sessionHolder: ArSes
         try {
             sessionHolder.session.pause()
         } catch (e: Exception) {
-            Log.w(TAG, "Session.pause failed", e)
+            ArLog.w("Session.pause failed", e)
         }
         sessionHolder.controller.onSessionPaused()
     }
@@ -310,9 +334,5 @@ private class ArSessionRunner(context: Context, private val sessionHolder: ArSes
         view.onPause()
         displayRotation.release()
         sessionHolder.close()
-    }
-
-    private companion object {
-        const val TAG = "ArSessionRunner"
     }
 }

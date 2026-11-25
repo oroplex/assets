@@ -52,6 +52,25 @@ android {
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
+
+    testOptions {
+        unitTests {
+            // The headless UI walkthrough (src/test/.../walkthrough) runs the real screens on Robolectric.
+            isIncludeAndroidResources = true
+            all {
+                it.maxHeapSize = "2g"
+                // Real (hardware-path) rendering, so saved screenshots look like the device.
+                it.systemProperty("robolectric.pixelCopyRenderMode", "hardware")
+                // Robolectric downloads its Android runtime jars itself; use the same mirror as the build.
+                it.systemProperty("robolectric.dependency.repo.url", "https://maven-central.storage-download.googleapis.com/maven2")
+                it.systemProperty("robolectric.dependency.repo.id", "google-maven-central")
+                it.systemProperty(
+                    "floorplan.walkthrough.dir",
+                    layout.buildDirectory.dir("ui-walkthrough").get().asFile.absolutePath,
+                )
+            }
+        }
+    }
 }
 
 kotlin {
@@ -81,4 +100,9 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
+    testImplementation(libs.androidx.test.ext.junit)
+    testImplementation(platform(libs.compose.bom))
+    testImplementation(libs.compose.ui.test.junit4)
 }

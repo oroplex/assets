@@ -32,6 +32,17 @@ jobs:
       - name: Unit tests (core geometry, solver, exporters)
         run: ./gradlew :core:test --console=plain
 
+      - name: App unit tests and headless UI walkthrough
+        run: ./gradlew :app:testDebugUnitTest --console=plain
+
+      - name: Upload UI walkthrough screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-walkthrough-screenshots
+          path: floorplan/app/build/ui-walkthrough/
+          if-no-files-found: ignore
+
       - name: Build APK
         run: ./gradlew :app:assembleDebug --console=plain
 
@@ -42,9 +53,11 @@ jobs:
           path: floorplan/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
-      - name: Upload core test report
+      - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: core-test-report
-          path: floorplan/core/build/reports/tests/
+          name: test-reports
+          path: |
+            floorplan/core/build/reports/tests/
+            floorplan/app/build/reports/tests/

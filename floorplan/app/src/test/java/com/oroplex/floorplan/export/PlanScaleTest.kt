@@ -323,8 +323,9 @@ class PdfScaleTest {
 
     @Test
     fun `dimension lines are sized for the chosen scale`() {
-        // The overall dimension line sits a fixed distance on paper outside the walls, so in plan meters it is
-        // four times farther out at 1:200 than at 1:50. The renderer only does that when told the scale.
+        // The overall dimension line sits a distance measured on paper outside the walls (4.5 % of the floor's
+        // size on the page, between 12 and 24 pt), so in plan meters it is much farther out at 1:200 than at
+        // 1:50. The renderer only does that when told the scale.
         val p = project(UnitSystem.METRIC, floor("a", 2))
         val floor = p.floors.single()
         fun height(scale: PlanScale?) =
@@ -332,13 +333,14 @@ class PdfScaleTest {
         val at50 = height(PlanScales.METRIC[0])
         val at200 = height(PlanScales.METRIC[4])
         assertTrue("1:50 $at50 m, 1:200 $at200 m", at200 > at50 + 0.8)
-        // In points on paper the offset is the same at both scales. The building itself (3 m of rooms plus an
-        // exterior wall on each side, which is what the dimension measures) is the part that scales.
+        // In points on paper the space taken outside the building (3 m of rooms plus an exterior wall on each
+        // side, which is what the dimension measures) stays in a narrow band at both scales, a little smaller
+        // for the smaller drawing; it is the building that scales.
         val building = 3.0 + 2 * p.settings.exteriorWallThickness!!
         val offsetPt50 = (at50 - building) * PlanScales.METRIC[0].pointsPerMeter
         val offsetPt200 = (at200 - building) * PlanScales.METRIC[4].pointsPerMeter
-        assertEquals(offsetPt50, offsetPt200, 1e-6)
-        assertTrue("offset $offsetPt50 pt", offsetPt50 > 20.0)
+        assertTrue("offset at 1:50 $offsetPt50 pt", offsetPt50 in 20.0..36.0)
+        assertTrue("offset at 1:200 $offsetPt200 pt", offsetPt200 in 14.0..offsetPt50)
         // The sheets carry exactly these renders.
         val sheet = prepare(p, PaperSize.A4).labeledSheets.single()
         assertEquals(at50, sheet.drawList!!.bounds.height, 1e-9)

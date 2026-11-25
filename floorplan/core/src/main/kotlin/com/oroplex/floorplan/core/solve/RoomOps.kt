@@ -669,9 +669,13 @@ object FloorOps {
      * this calibration ([Calibration.measuredLength]), [trueLength], [now] and the origin. Placement frames
      * ([Room.frameId]) do not change: the whole floor moves as one.
      *
+     * The reference wall must still be the app's own AR measurement. A wall that was set by hand (typed, or
+     * moved by an edit) is refused: its length is no longer what AR measured, so "tape / shown length" would
+     * say nothing about the AR scale error and the correction would be wrong for every other room.
+     *
      * @throws IllegalArgumentException with a user-presentable message when [trueLength] is not a positive
-     *   number, the room or wall does not exist, the room was drawn by hand, or the implied correction is
-     *   outside 0.5x..2x (almost always a typo or the wrong units).
+     *   number, the room or wall does not exist, the room was drawn by hand, the wall was set by hand, or the
+     *   implied correction is outside 0.5x..2x (almost always a typo or the wrong units).
      */
     fun calibrate(floor: Floor, roomId: String, wallIndex: Int, trueLength: Double, now: Long): Floor {
         require(trueLength.isFinite() && trueLength > 0.0) { "Enter a length greater than zero." }
@@ -681,6 +685,10 @@ object FloorOps {
         }
         val c = room.corners
         require(c.size >= 3 && wallIndex in c.indices) { "That wall no longer exists in ${displayName(room)}." }
+        require(RoomOps.handSetWallFor(room, wallIndex) == null) {
+            "Wall ${wallIndex + 1} of ${displayName(room)} was set by hand, so it no longer shows the app's own " +
+                "measurement. Calibrate from a wall you have not edited, or re-solve the room first."
+        }
         val measured = c[wallIndex].distanceTo(c[(wallIndex + 1) % c.size])
         require(measured.isFinite() && measured > 1e-3) { "That wall is too short to calibrate from." }
         val factor = trueLength / measured
@@ -693,13 +701,7 @@ object FloorOps {
         val origin = previous?.origin
             ?: Bounds.of(floor.rooms.filter(::isArMeasured).flatMap { r -> r.corners.filter { it.isFinite() } }).center
         val attachments = drawnRoomAttachments(floor.rooms)
-        // A reference wall whose length was typed before gets the new tape value, so restoring typed lengths after
-        // scaling does not undo this calibration on the very wall it was taken from.
-        val reference = RoomOps.handSetWallFor(room, wallIndex)?.takeIf { it.typedLength != null }
-        val rooms = if (reference == null) floor.rooms else floor.rooms.map { r ->
-            if (r.id != roomId) r else r.copy(handSetWalls = r.handSetWalls.map { if (it === reference) it.copy(typedLength = trueLength) else it })
-        }
-        val moved = rooms.map { if (isArMeasured(it)) scaleMeasured(it, factor, origin) else translateWithScale(it, factor, origin) }
+        val moved = floor.rooms.map { if (isArMeasured(it)) scaleMeasured(it, factor, origin) else translateWithScale(it, factor, origin) }
         return floor.copy(
             rooms = settleDrawnRooms(moved, attachments),
             calibration = Calibration(

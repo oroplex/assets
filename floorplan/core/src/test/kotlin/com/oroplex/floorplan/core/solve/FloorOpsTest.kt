@@ -206,10 +206,20 @@ class FloorOpsTest {
         assertEquals(2.9, c2.corners[1].distanceTo(c2.corners[2]), 1e-9)
         assertEquals(3.5, RoomOps.handSetWallFor(c2, 0)?.typedLength)
         assertEquals(2.9, RoomOps.handSetWallFor(c2, 1)?.typedLength)
-        // Calibrating from the typed wall itself: the new tape value wins on that wall (restoring must not undo it).
-        val self = FloorOps.calibrate(floor(living, typed), "bed", 0, 3.55, now = 1L).room("bed")
-        assertEquals(3.55, self.corners[0].distanceTo(self.corners[1]), 1e-9)
-        assertEquals(3.55, RoomOps.handSetWallFor(self, 0)?.typedLength)
+        // A wall set by hand is not the app's measurement any more, so it cannot be the calibration reference:
+        // neither the typed wall nor the opposite wall that was stretched with it.
+        for (handSet in listOf(0, 2)) {
+            val refused = assertFailsWith<IllegalArgumentException> {
+                FloorOps.calibrate(floor(living, typed), "bed", handSet, 3.55, now = 1L)
+            }
+            assertTrue("set by hand" in refused.message.orEmpty(), refused.message)
+        }
+        // An untouched wall of the same room still works: it is scaled, and the typed wall keeps its tape value.
+        val fromUntouched = FloorOps.calibrate(floor(living, typed), "bed", 3, 3.06, now = 1L)
+        assertEquals(1.02, fromUntouched.calibration!!.factor, 1e-9)
+        val bed3 = fromUntouched.room("bed")
+        assertEquals(3.06, bed3.corners[3].distanceTo(bed3.corners[0]), 1e-9)
+        assertEquals(3.5, bed3.corners[0].distanceTo(bed3.corners[1]), 1e-9)
         // And a later room calibrated on arrival (applyCalibration) follows the same rule.
         val calibrated = FloorOps.calibrate(floor(living), "living", 0, 5.1, now = 1L)
         val arriving = FloorOps.applyCalibration(calibrated, typed.copy(ceilingHeight = 2.5, ceilingTyped = true))

@@ -518,6 +518,15 @@ fun SetWallLengthDialog(
                     "Currently ${settings.formatLength(current)}. The wall's start corner stays put; the room stretches along the wall so a rectangle stays square.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
+                if (room.captureMethod != CaptureMethod.MANUAL) {
+                    Spacer(Modifier.padding(2.dp))
+                    Text(
+                        "This changes one wall. To correct the scale of the whole floor from a tape measurement, use " +
+                            "Calibrate floor on a wall you have not edited.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Spacer(Modifier.padding(4.dp))
                 LengthField(
                     field,

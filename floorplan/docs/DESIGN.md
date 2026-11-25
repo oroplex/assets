@@ -123,3 +123,12 @@ Driven by `docs/REVIEW-2.md` (finding ids SEAM-n, ARX-n, MATH-n, CAPX-n, APPX-n,
 * AR: `ArFrameState.localFloorY` (floor under the user; another level seen through a doorway never wins),
   `floorAutoLockable`, `cameraForward`; `ArCaptureController.setReferenceFloor(y)` (default no-op).
 * App: `PlanEditorScreen(focusRoomId, onFocusRoomConsumed)`, `ExportScreen(onOpenRoom)`.
+* Added while merging round 3: `WallFit.hint` / `message` / `noiseRatio` (a refused fit says what the user
+  should change; the capture flow shows `fit.message`), `WallEstimatorConfig.grossNoiseFactor` /
+  `maxOffsetError` / `maxDirectionErrorDeg` / `maxEffectivePoints`, `SolverOptions.axisHint` taken only within
+  max(0.5°, 2 standard errors) and applied as a rigid turn, `ar/SamplingPolicy.kt WallOutcome.decide` (a depth
+  fit is only returned with an aim point; a plane stands in for a failed fit only when the crosshair's depth
+  lies on it), `render/LabelFit.kt` (labels fitted at `RenderOptions.pointsPerMeter`), `diagnostics/ScanLog`
+  (on-device log fed by `ar/ArLog`, shared from Settings), `ui/capture CaptureDialogs` and
+  `ui/common FocusOnShow` (never request focus from outside a dialog's content), and the headless
+  walkthrough in `app/src/test/.../walkthrough` (`WalkthroughBase`).

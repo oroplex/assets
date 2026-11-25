@@ -3,14 +3,16 @@
 _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
 
 ## Where things stand
-* Rounds 1 and 2 are merged. Round 3 (fixes for `REVIEW-2.md`, 55 confirmed findings) is being merged
-  package by package: capture flow, editor, core ops/render and export/shell are in; core accuracy and the
-  AR layer are running (a container restart on 2026-11-25 interrupted them; they were relaunched, core
-  accuracy from its saved work on branch `round3-r1-wip`).
-* **The app has never run on a phone.** Until 2026-11-25 it had never run at all: every test was a logic
-  test. A headless walkthrough now launches the real app on the JVM (see below). The camera / ARCore part
-  can only be checked on a device.
-* **Feature freeze after round 3.** Fixes only until the first on-device test.
+* Rounds 1, 2 and 3 are merged. Round 3 fixed the 55 confirmed findings of `REVIEW-2.md` in six packages
+  (capture flow, editor, core ops/render, export/shell, core accuracy, AR layer); the joins between them
+  were fixed afterwards (aim-checked wall results, estimator hints shown to the user, AR diagnostics in the
+  shareable scan log). Build: 403 core + 605 app tests, 0 failed, APK builds.
+* **The app has never run on a phone.** A headless walkthrough launches the real app on the JVM (see below);
+  the camera / ARCore part can only be checked on a device.
+* **Feature freeze.** Fixes only until the first on-device test (`docs/FIELD-TEST.md`).
+* A narrow regression check of round 3 (major problems only, each finding verified by a second agent) found
+  two bugs in the first four packages, both fixed; the check of the accuracy and AR packages was running
+  when this was written.
 
 ## Headless UI walkthrough (the only check that the UI starts and draws)
 * `./gradlew :app:testDebugUnitTest` runs `walkthrough/AppWalkthroughTest` and `CaptureWalkthroughTest` on
@@ -30,22 +32,46 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
 * Known runtime quirk: a dialog containing a text field never reports "idle" on Robolectric, so those
   steps use `RawUi` (manual clock, direct semantics access). It is not an app bug.
 
-## Known issues not yet fixed
-* `ArSessionFactory` sets `FocusMode.AUTO`. ARCore's docs say the default (fixed focus) tracks best; a
-  measuring app should use `FIXED`. Now part of the AR package (round 3); check it after the merge.
-* Decision for the owner after the first test: PDFs now print at a standard architectural scale (the
-  sample house at 1/8" = 1'-0" fills about half a Letter page). Fit-to-page fills the sheet but is not to
-  scale. Ask which they want as the default; a switch is a small change in `export/PlanScale.kt`.
-* Wall sampling uses 81 hit tests per frame instead of reading the depth image and its confidence map.
-  Evaluate after the first device data.
+## Known issues and open questions
+* **Short walls are refused from across the room, by design.** A wall the estimator cannot verify (a 0.3-0.6 m
+  closet return or chimney side seen at an angle) is refused with the hint "Stand square to this wall ... or
+  tap its base" instead of being fitted to a wrong surface. Square-on it is measured within about 2-3 times
+  its length. With noisier depth than assumed, 0.3 m returns are refused about half the time even close up;
+  "Tap wall base" is the way out. Watch the refusal rate in the first device session.
+* **An ARCore plane can stand in for a refused fit** when the crosshair's depth lies on it; it is marked
+  low-confidence (amber chip, "weak capture" in the review). Whether such planes are good enough is a
+  device question: the scan log prints the plane next to the depth fit for every wall.
+* **Floor auto-lock is stricter than before** (a plane within 1 m of the phone; under the phone when it is
+  less than 1.2 m below). Manual "Lock floor" always works. The log says why auto-lock did not fire.
+* **Neighbouring rooms may be about 1° apart.** The shared squaring axis is now only taken when a room's own
+  axis agrees within max(0.5°, 2 standard errors); it never changes a dimension.
+* Decision for the owner after the first test: PDFs print at a standard architectural scale (the sample house
+  at 1/8" = 1'-0" fills about half a Letter page). Fit-to-page fills the sheet but is not to scale. A switch
+  is a small change in `export/PlanScale.kt`.
+* Deferred for the feature freeze: extra room-schedule columns (wall area, volume, openings) in the PDF.
+* Wall sampling still uses hit tests (9x9 grid, shrinking to 7x7 / 5x5 when frames are slow) instead of
+  reading the depth image and its confidence map. Evaluate after the first device data.
+* Every threshold in the AR layer and the estimator is calibrated on simulation only.
 
 ## Accuracy: what is and is not known
-* `core/build/sim-report.txt` (written by `:core:test`) shows the geometry is sound. It is **not** a
-  prediction for the phone: until round 3 it used the estimator's own noise model, and real
-  depth-from-motion error on plain walls is spatially correlated (a whole wall patch can be off by
-  centimetres together), which averaging many samples does not remove.
+`core/build/sim-report.txt` (written by `:core:test`) is the full report. Summary, wall-length error in mm:
+
+| Scenario | worst | 95th pct | wrong surface |
+| --- | --- | --- | --- |
+| Sample house, the estimator's own noise model | 11 | 4 | 0 of 80 scans |
+| With furniture in front of walls | 17 | 6-7 | 0 of 120 |
+| Noise x1.5 + per-frame error + plane hits | 18 | 9 | 0 of 80 |
+| One smooth 0.3 % depth error per capture | 40 | 17 | 0 of 80 |
+| Rooms with closet returns, chimney breast, column | 8 | 5 | 0 of 50 |
+| Short faces from across the room (920 captures) | — | — | 0 (874 refused, 46 measured) |
+
+* "Wrong surface" was the critical round-2 finding (a short wall fitted to a fake diagonal); the estimator
+  now refuses what it cannot verify. Zero is an empirical result on right-angled rooms, not a proof.
+* The simulation is **not** a prediction for the phone. Real depth-from-motion error on a plain wall is
+  smooth (a whole patch is off together); the "smooth field" row shows that even 0.3 % of that triples the
+  error. Tracking drift is not simulated at all.
 * Plan on ±1–3 % per room before tape calibration. Whether depth fits or ARCore's detected wall planes are
-  more accurate on the S26 Ultra is an open question for the first device session.
+  more accurate on the S26 Ultra is an open question; the scan log records both for every wall.
 
 ## Gate for "ready to test on the phone"
 1. Round 3 fully merged; `:core:test :app:testDebugUnitTest :app:assembleDebug` green; simulation re-read.
@@ -53,8 +79,9 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
 3. One narrow regression check of the round-3 diff (major problems only; no new features).
 
 ## First on-device session (a measurement study, not a demo)
-* Phone on USB with debugging on, so logs can be read: `adb logcat -s FloorPlanScan` (the AR package adds
-  one line per measurement: samples by kind, noise vs expected, result).
+* Follow `docs/FIELD-TEST.md`. Diagnostics come back either way: **Settings → About → Share scan log** on
+  the phone alone, or `adb logcat -s FloorPlanScan` with the phone on USB. One line per measurement: samples
+  by kind, noise against expected, the depth fit and the ARCore plane side by side, the result or the hint.
 * One ordinary room. Tape-measure its four walls first. Scan it three times, in one session.
 * Compare each wall with the tape. Then calibrate from one wall and compare again.
 * Note any wall that would not capture, and what it looked like (plain, glossy, window).

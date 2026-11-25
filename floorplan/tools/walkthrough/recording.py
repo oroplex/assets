@@ -114,15 +114,15 @@ class Recording:
 
     def depth(self, frame):
         """(depth in metres HxW float32, confidence HxW uint8) of a frame record, or None when it has none."""
-        if not frame.get("depth"):
-            return None
+        if not frame.get("depth") or frame["depth"] not in self.names:
+            return None  # none recorded, or the file is missing (a recording that was cut off)
         w, h = int(frame["depthWidth"]), int(frame["depthHeight"])
         d = np.frombuffer(self.read(frame["depth"]), dtype="<u2")
         if d.size != w * h:
             return None
         depth = d.reshape(h, w).astype(np.float32) / 1000.0
         conf = None
-        if frame.get("confidence"):
+        if frame.get("confidence") and frame["confidence"] in self.names:
             c = np.frombuffer(self.read(frame["confidence"]), dtype=np.uint8)
             conf = c.reshape(h, w) if c.size == w * h else None
         if conf is None:

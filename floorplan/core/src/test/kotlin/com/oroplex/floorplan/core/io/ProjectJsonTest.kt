@@ -11,6 +11,7 @@ import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.RoomType
 import com.oroplex.floorplan.core.model.effectiveAreaCategory
 import com.oroplex.floorplan.core.model.placementFrame
+import com.oroplex.floorplan.core.geometry.Polygons
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -28,6 +29,27 @@ class ProjectJsonTest {
         // Defaults are written explicitly so backups do not depend on future default changes.
         assertTrue("\"wallThickness\"" in json && "\"schemaVersion\"" in json && "\"captureMethod\"" in json)
         assertEquals(json, ProjectJson.encode(ProjectJson.decode(json)), "stable encoding")
+    }
+
+    /**
+     * `tools/walkthrough/build_plan.py` writes projects for this app from a walk-through recording. The file
+     * read here was made by that tool from a synthetic recording of a 4 x 3 m and a 3 x 3 m room, turned 27°;
+     * when the tool's output changes, make it again (the command is in docs/HANDOFF.md).
+     */
+    @Test fun aPlanMadeFromAWalkthroughRecordingOpens() {
+        val text = checkNotNull(javaClass.getResource("/walkthrough-plan-sample.json")).readText()
+        val project = ProjectJson.decode(text)
+        val rooms = project.floors.single().rooms
+        assertEquals(listOf("Room 1", "Room 2"), rooms.map { it.name })
+        assertEquals(12.0, Polygons.area(rooms[0].corners), 0.05)
+        assertEquals(9.0, Polygons.area(rooms[1].corners), 0.05)
+        // Interior outlines, counter-clockwise, as the rest of the app expects.
+        assertTrue(rooms.all { Polygons.signedArea(it.corners) > 0 })
+        // One recording is one frame: the rooms are already placed against each other.
+        assertEquals(1, rooms.map { it.placementFrame }.toSet().size)
+        assertTrue(rooms.all { it.ceilingHeight != null && !it.ceilingEstimated && it.warnings.isNotEmpty() })
+        // It is an ordinary project from here on.
+        assertEquals(project, ProjectJson.decode(ProjectJson.encode(project)))
     }
 
     @Test fun garbageIsRejectedWithAClearMessage() {

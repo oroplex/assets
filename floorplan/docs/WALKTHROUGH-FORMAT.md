@@ -114,3 +114,9 @@ python tools/walkthrough/inspect_recording.py Walkthrough-20261125-1432.zip
 ```
 
 prints what is in it and writes `…-overview.png`: the path walked and every depth point seen from above.
+
+```
+python tools/walkthrough/build_plan.py Walkthrough-20261125-1432.zip
+```
+
+makes the floor plan: `…-plan.json`, which the app opens with **Import backup**, and `…-plan.png`.

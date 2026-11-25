@@ -29,9 +29,18 @@ Developers: `adb install -r app/build/outputs/apk/debug/app-debug.apk` after bui
 Tap the **camera icon** on the project list. Walk slowly through the rooms with the phone upright while it
 records what the camera sees and how the phone moves; tap **Stop and save**; then **Share** the file (Quick
 Share, Drive) or save it to **Downloads** and copy it to a computer over USB. Nothing is measured on the
-phone in this mode: a computer turns the recording into a floor plan afterwards. That computer-side step is
-being built; today `tools/walkthrough/inspect_recording.py` reads a recording and draws what the phone saw
-from above. The format is described in `docs/WALKTHROUGH-FORMAT.md`.
+phone in this mode: a computer turns the recording into a floor plan afterwards.
+
+On the computer (Python 3 with `numpy` and `pillow`):
+
+```
+python tools/walkthrough/inspect_recording.py Walkthrough-….zip   # what is in it, and a picture from above
+python tools/walkthrough/build_plan.py Walkthrough-….zip          # the floor plan: …-plan.json and …-plan.png
+```
+
+Send `…-plan.json` back to the phone and open it with **Import backup** on the project list. This first
+version uses only the depth the phone itself recorded and finds square-cornered rooms; a depth model on a
+GPU is the next step. The format is described in `docs/WALKTHROUGH-FORMAT.md`.
 
 ## Scanning a room — the short version
 

@@ -15,10 +15,22 @@ owner's PC (Ryzen 9 9950X, RTX 5090, 64 GB) takes that role here.
 * **Built, computer side:** `tools/walkthrough/recording.py` (reader), `inspect_recording.py` (summary and
   a top-down picture from the phone's own depth), `make_synthetic.py` and `test_recording.py` (run in CI
   against a synthetic room and a sample written by the app's Kotlin code, so the two sides cannot drift).
-* **Not built:** the pipeline that makes the plan. Plan: a depth model on the GPU for every frame, scaled
-  and fused with the recorded poses into one point cloud; walls extracted with the existing estimator and
-  room solver ideas; result imported into the editor as a project. Doors and windows by hand at first.
-  It needs a real recording first and the session attached to the PC (the cloud machine has no GPU).
+* **Built, baseline pipeline (no GPU):** `tools/walkthrough/build_plan.py` turns a recording into a project
+  the app imports ("Import backup"). It uses the phone's own depth: points thinned to 3 cm, floor and
+  ceiling from the height histogram, the building's main direction, wall lines where points pile up (with
+  a bandwidth taken from the scatter it sees), each wall's two faces from which side its points were seen,
+  free space from the rays, and rooms as free cells joined unless a wall (doorway gaps up to 1.25 m
+  closed) lies between them. On synthetic recordings: one room exact; two rooms with a 12 cm wall and a
+  doorway within 1 cm at 1 % per-pixel depth noise, 4 cm at 2 %, 6 cm at 3 %; it falls apart at 5 %.
+  Limits: square-cornered buildings only, no doors or windows, one floor, and nothing is known yet about
+  how it does on real phone depth.
+  Regenerate the app-side fixture after changing its output:
+  `python tools/walkthrough/make_synthetic.py /tmp/fix --scene two-rooms --frames 180 --turn 27` then
+  `python tools/walkthrough/build_plan.py /tmp/fix --out core/src/test/resources/walkthrough-plan-sample.json`.
+* **Not built:** a depth model on the GPU to replace the phone's depth (the function to replace is
+  `points_from_recording`), walls at other angles, doors and windows, sending the plan back to the phone
+  without a file. The GPU work needs the session attached to the PC or run on it (the cloud machine has
+  no GPU), and all of it needs a real recording first.
 * **Never run on a phone:** the recorder's camera path (image acquisition, JPEG encoding, depth copy) is
   compiled and its pure parts are tested, but ARCore cannot run here. The first recording is the test.
   If frames are 640 x 480, the phone did not offer a larger image to the app; the log line

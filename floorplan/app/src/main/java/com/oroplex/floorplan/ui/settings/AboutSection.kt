@@ -4,10 +4,12 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.ViewInAr
 import androidx.compose.material3.Icon
@@ -20,14 +22,21 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.core.content.pm.PackageInfoCompat
 import com.google.ar.core.ArCoreApk
+import com.oroplex.floorplan.diagnostics.ScanLog
+import com.oroplex.floorplan.export.ExportFiles
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val TAG = "AboutSection"
 
@@ -36,6 +45,8 @@ internal fun AboutSection() {
     val context = LocalContext.current
     val version = remember { appVersion(context) }
     val arStatus = rememberArCoreStatus()
+    val scope = rememberCoroutineScope()
+    var shareFailed by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth()) {
         ListItem(
             leadingContent = { Icon(Icons.Outlined.Info, contentDescription = null) },
@@ -49,6 +60,26 @@ internal fun AboutSection() {
             supportingContent = { Text(arStatus) },
             colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surface),
         )
+        ListItem(
+            leadingContent = { Icon(Icons.Outlined.BugReport, contentDescription = null) },
+            headlineContent = { Text("Share scan log") },
+            supportingContent = {
+                Text(
+                    if (shareFailed) {
+                        "Couldn't prepare the log. Try again."
+                    } else {
+                        "What the scanner measured in recent scans, and details of any crash. No photos or " +
+                            "location. Send it along when something goes wrong."
+                    },
+                )
+            },
+            colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surface),
+            modifier = Modifier.clickable(role = Role.Button, onClickLabel = "Share scan log") {
+                scope.launch {
+                    shareFailed = !shareScanLog(context, "FloorPlan Scan $version, ARCore: $arStatus")
+                }
+            },
+        )
         Text(
             "Measurements come from your phone's AR tracking and are approximate (typically within " +
                 "1–3 % with careful scanning). Verify critical dimensions with a tape measure.",
@@ -57,6 +88,24 @@ internal fun AboutSection() {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
+}
+
+/**
+ * Writes the scan log (with a header naming the app version and the phone) to the shared-exports folder and
+ * opens the system share sheet. False when the file could not be written or nothing can receive it.
+ */
+private suspend fun shareScanLog(context: Context, about: String): Boolean = try {
+    val header = "$about\n${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
+    val file = withContext(Dispatchers.IO) {
+        ExportFiles.write(context, "FloorPlanScan-log.txt") { out -> ScanLog.export(out, header) }
+    }
+    context.startActivity(ExportFiles.shareIntent(context, file, "text/plain", "FloorPlan Scan log"))
+    true
+} catch (e: CancellationException) {
+    throw e
+} catch (e: Exception) {
+    Log.w(TAG, "Sharing the scan log failed", e)
+    false
 }
 
 private fun appVersion(context: Context): String = try {

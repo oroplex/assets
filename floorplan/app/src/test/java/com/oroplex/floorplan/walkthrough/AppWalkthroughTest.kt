@@ -7,6 +7,7 @@ import androidx.compose.ui.test.click
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.isRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onFirst
@@ -174,6 +175,18 @@ class AppWalkthroughTest : WalkthroughBase() {
             scrollDown()
             shoot("settings", "scrolled-${it + 1}")
         }
+        // Sharing the scan log writes the file and opens the system share sheet.
+        repeat(3) { if (!exists("Share scan log")) scrollDown() }
+        rule.onAllNodesWithText("Share scan log").onFirst().performScrollTo().performClick()
+        rule.waitUntil(10_000) { org.robolectric.Shadows.shadowOf(rule.activity).peekNextStartedActivity() != null }
+        val chooser = org.robolectric.Shadows.shadowOf(rule.activity).nextStartedActivity
+        org.junit.Assert.assertEquals(android.content.Intent.ACTION_CHOOSER, chooser.action)
+        val send = chooser.getParcelableExtra<android.content.Intent>(android.content.Intent.EXTRA_INTENT)!!
+        org.junit.Assert.assertEquals("text/plain", send.type)
+        val uri = send.getParcelableExtra<android.net.Uri>(android.content.Intent.EXTRA_STREAM)!!
+        val shared = rule.activity.contentResolver.openInputStream(uri)!!.use { it.readBytes().toString(Charsets.UTF_8) }
+        org.junit.Assert.assertTrue(shared, shared.startsWith("FloorPlan Scan ") && shared.contains("App started on"))
+        shoot("settings", "after-share-scan-log")
     }
 
     /** "Scan room" without a camera or ARCore: the app must show its explanation screens, not crash. */

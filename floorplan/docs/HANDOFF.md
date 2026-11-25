@@ -4,8 +4,9 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
 
 ## Where things stand
 * Rounds 1 and 2 are merged. Round 3 (fixes for `REVIEW-2.md`, 55 confirmed findings) is being merged
-  package by package: capture flow and editor are in; core accuracy, core ops/render, export/shell and
-  the AR layer follow.
+  package by package: capture flow, editor and core ops/render are in; core accuracy, export/shell and the
+  AR layer are running (a container restart on 2026-11-25 interrupted them; they were relaunched, core
+  accuracy from its saved work on branch `round3-r1-wip`).
 * **The app has never run on a phone.** Until 2026-11-25 it had never run at all: every test was a logic
   test. A headless walkthrough now launches the real app on the JVM (see below). The camera / ARCore part
   can only be checked on a device.
@@ -22,17 +23,18 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
   1. "New project" and every rename dialog crashed (`FocusRequester is not initialized`) — fixed.
   2. Draw room / Scan room / New project buttons had no accessibility label — fixed.
   3. Capture review: both Save buttons were below the bottom of the screen — fixed (pinned).
-  4. **Open:** the plan is unreadable at phone size in the editor (and in the onboarding illustration):
-     wall lengths, room sizes and names overlap. Cause: label sizes are in points and the renderer's fit
-     logic assumes a ~560 pt wide plan, but a phone screen is only ~185 pt wide. Fix in `PlanRenderer`
-     using `RenderOptions.pointsPerMeter` (level of detail: name > area > size > wall lengths).
+  4. The plan was unreadable at phone size in the editor: wall lengths, room sizes and names overlapped,
+     because label sizes are in points and the layout assumed a ~560 pt wide plan (a phone screen is about
+     185 pt wide) — fixed: at a known scale (`RenderOptions.pointsPerMeter`) only labels that fit are drawn
+     (`core/render/LabelFit.kt`: name, then size, area, wall lengths). **Still open:** the onboarding
+     illustration does not pass its scale yet.
 * Known runtime quirk: a dialog containing a text field never reports "idle" on Robolectric, so those
   steps use `RawUi` (manual clock, direct semantics access). It is not an app bug.
 
 ## Known issues not yet fixed
 * `ArSessionFactory` sets `FocusMode.AUTO`. ARCore's docs say the default (fixed focus) tracks best; a
-  measuring app should use `FIXED`. Change after the AR package (round 3) is merged.
-* Plan label level of detail (item 4 above).
+  measuring app should use `FIXED`. Now part of the AR package (round 3); check it after the merge.
+* Onboarding illustration labels (item 4 above), after the export/shell package is merged.
 * Wall sampling uses 81 hit tests per frame instead of reading the depth image and its confidence map.
   Evaluate after the first device data.
 

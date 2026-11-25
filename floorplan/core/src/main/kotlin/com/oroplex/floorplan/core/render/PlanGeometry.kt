@@ -431,4 +431,53 @@ internal object PlanGeometry {
         val offsets = heights.map { h -> (top - h / 2).also { top -= h } }
         return LabelLayout(anchor, angle, lines, offsets)
     }
+
+    /** Rooms at least this much longer than wide may have their label turned along the long axis to show more. */
+    const val ELONGATED_ROOM = 1.5
+
+    /**
+     * [roomLabel] for a KNOWN output scale ([metersPerPt]): the same block (name, "L × W", area) at the same
+     * anchor, but only as much of it as fits inside the room at that scale, see [LabelFit]. The block is
+     * horizontal unless the room is a hallway-like strip ([NARROW_ROOM_WIDTH]), which reads along its long
+     * axis; a room at least [ELONGATED_ROOM] times longer than wide is turned the other way when that shows
+     * more lines or avoids shortening the name. Null when nothing fits or nothing is to be shown.
+     */
+    fun fittedRoomLabel(
+        room: DrawableRoom,
+        settings: PlanSettings,
+        showName: Boolean,
+        showDimensions: Boolean,
+        showArea: Boolean,
+        textScale: Double,
+        metersPerPt: Double,
+        textColor: Int = PlanColors.TEXT,
+        secondaryColor: Int = PlanColors.TEXT_SECONDARY,
+    ): LabelFit.RoomLabel? {
+        val corners = room.corners
+        val anchor = labelAnchor(corners)
+        val stats = Measurements.room(room.room)
+        val unit = settings.unitSystem
+        val name = if (showName) room.room.name.replace('\n', ' ').trim().ifEmpty { room.room.type.displayName } else null
+        val details = buildList {
+            if (showDimensions) {
+                val l = Units.formatLength(stats.length, unit, settings.imperialDenominator)
+                val w = Units.formatLength(stats.width, unit, settings.imperialDenominator)
+                add("$l × $w")
+            }
+            if (showArea) add(Units.formatArea(stats.area, unit))
+        }
+        val longAxis = stats.box.angle.takeIf { it.isFinite() }?.let(::uprightAngle)
+        val strip = stats.width < NARROW_ROOM_WIDTH && stats.length >= 2 * stats.width
+        val elongated = stats.length >= ELONGATED_ROOM * stats.width
+        val preferred = if (strip && longAxis != null) longAxis else 0.0
+        val alternative = when {
+            !elongated -> null
+            preferred == 0.0 -> longAxis
+            else -> 0.0
+        }
+        return LabelFit.roomLabel(
+            corners, anchor, preferred, alternative, name, details,
+            NAME_PT * textScale, DETAIL_PT * textScale, textColor, secondaryColor, metersPerPt,
+        )
+    }
 }

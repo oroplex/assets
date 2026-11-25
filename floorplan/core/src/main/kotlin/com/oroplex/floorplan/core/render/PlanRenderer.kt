@@ -31,8 +31,11 @@ data class RenderOptions(
     val highlightRoomIds: Set<String> = emptySet(),
     /**
      * Output scale in points per plan meter when the caller knows it (a PDF at a fixed architectural scale, the
-     * editor at its current zoom). Overall-dimension offsets, ticks and label gaps are then sized exactly in
-     * points. null (or not a positive finite number) = assume the plan spans about 560 pt (fit-to-page).
+     * editor at its current zoom, a thumbnail). Overall-dimension offsets, ticks and label gaps are then sized
+     * exactly in points, and room labels and wall lengths are only drawn where they fit at that scale
+     * ([LabelFit]): name first, then "L × W", area, wall lengths. null (or not a positive finite number) =
+     * assume the plan spans about 560 pt (fit-to-page) and draw every label. Every on-screen caller should
+     * pass it: a phone screen is only about 185 pt wide.
      */
     val pointsPerMeter: Double? = null,
 )
@@ -219,12 +222,23 @@ object PlanRenderer {
             }
         }
 
-        // Pass 5: room labels. Pass 6: wall lengths.
+        // Pass 5: room labels. Pass 6: wall lengths. At a known output scale only what fits is drawn (LabelFit).
+        val knownMetersPerPt = options.pointsPerMeter?.takeIf { it.isFinite() && it > 0.0 }?.let { 1.0 / it }
+            ?.takeIf { it.isFinite() && it > 0.0 }
+        val labelBoxes = HashMap<String, LabelFit.Box>()
         for (d in drawable) {
             if (d == null) continue
-            val label = PlanGeometry.roomLabel(
-                d, settings, options.showRoomNames, options.showRoomDimensions, showAreas, textScale,
-            ) ?: continue
+            val label = if (knownMetersPerPt != null) {
+                val fitted = PlanGeometry.fittedRoomLabel(
+                    d, settings, options.showRoomNames, options.showRoomDimensions, showAreas, textScale, knownMetersPerPt,
+                ) ?: continue
+                labelBoxes[d.room.id] = fitted.box
+                fitted.layout
+            } else {
+                PlanGeometry.roomLabel(
+                    d, settings, options.showRoomNames, options.showRoomDimensions, showAreas, textScale,
+                ) ?: continue
+            }
             val halo = fillOf(d.room)
             label.lines.forEachIndexed { i, line ->
                 ops += DrawOp.Text(
@@ -243,7 +257,7 @@ object PlanRenderer {
         if (showWallLengths) {
             for (d in drawable) {
                 if (d == null) continue
-                ops += wallLengthLabels(d, settings, textScale, fillOf(d.room))
+                ops += wallLengthLabels(d, settings, textScale, fillOf(d.room), knownMetersPerPt, labelBoxes[d.room.id])
             }
         }
 
@@ -263,30 +277,63 @@ object PlanRenderer {
      * One length label per edge of at least [MIN_LABELED_WALL]: centered on the edge, upright along it and
      * pushed [WALL_LABEL_OFFSET_PT] into the room (the sign is chosen from the room's inward normal versus
      * the text's up vector, so the label is inside whichever way the edge runs).
+     *
+     * At a known output scale ([metersPerPt] not null) a label is only kept when it fits its wall, lies inside
+     * the room and is clear of the room's label ([roomLabelBox]) and of the other wall lengths, longest walls
+     * first ([LabelFit.wallLabels]); otherwise labels of a small room would pile up on each other.
      */
-    private fun wallLengthLabels(d: DrawableRoom, settings: PlanSettings, textScale: Double, halo: Int): List<DrawOp.Text> {
+    private fun wallLengthLabels(
+        d: DrawableRoom,
+        settings: PlanSettings,
+        textScale: Double,
+        halo: Int,
+        metersPerPt: Double?,
+        roomLabelBox: LabelFit.Box?,
+    ): List<DrawOp.Text> {
         val c = d.corners
-        return c.indices.mapNotNull { i ->
+        val sizePt = WALL_LABEL_PT * textScale
+        val offsetPt = WALL_LABEL_OFFSET_PT * textScale
+        val labels = ArrayList<DrawOp.Text>()
+        val candidates = ArrayList<LabelFit.WallLabel>()
+        for (i in c.indices) {
             val a = c[i]
             val b = c[(i + 1) % c.size]
             val length = a.distanceTo(b)
-            if (length < MIN_LABELED_WALL) return@mapNotNull null
-            val dir = PlanGeometry.edgeDirection(c, i) ?: return@mapNotNull null
+            if (length < MIN_LABELED_WALL) continue
+            val dir = PlanGeometry.edgeDirection(c, i) ?: continue
             val inward = dir.perp() * d.orientation
             val angle = PlanGeometry.uprightAngle(dir.angle())
             val up = Vec2.fromAngle(angle + PI / 2)
             val sign = if ((up dot inward) >= 0) 1.0 else -1.0
-            DrawOp.Text(
-                anchor = Vec2.lerp(a, b, 0.5),
-                text = Units.formatLength(length, settings.unitSystem, settings.imperialDenominator),
-                sizePt = WALL_LABEL_PT * textScale,
+            val text = Units.formatLength(length, settings.unitSystem, settings.imperialDenominator)
+            val anchor = Vec2.lerp(a, b, 0.5)
+            if (metersPerPt != null) {
+                val widthPt = LabelFit.textWidthPt(text, sizePt, bold = false)
+                candidates += LabelFit.WallLabel(
+                    index = labels.size,
+                    length = length,
+                    widthPt = widthPt,
+                    box = LabelFit.Box(
+                        center = anchor + inward * (offsetPt * metersPerPt),
+                        along = dir * ((widthPt / 2 + 1.0) * metersPerPt),
+                        across = inward * ((sizePt / 2 + 1.0) * metersPerPt),
+                    ),
+                )
+            }
+            labels += DrawOp.Text(
+                anchor = anchor,
+                text = text,
+                sizePt = sizePt,
                 color = PlanColors.DIMENSION,
                 angle = angle,
-                offsetPt = Vec2(0.0, sign * WALL_LABEL_OFFSET_PT * textScale),
+                offsetPt = Vec2(0.0, sign * offsetPt),
                 haloColor = halo,
                 tag = "wall:${d.room.id}:$i",
             )
         }
+        if (metersPerPt == null) return labels
+        val keep = LabelFit.wallLabels(c, candidates, roomLabelBox, metersPerPt)
+        return labels.filterIndexed { index, _ -> index in keep }
     }
 
     private fun roomTag(room: Room) = "room:${room.id}"
@@ -331,7 +378,14 @@ internal data class DimensionLine(
  * scale too, so labels and their gaps stay in proportion.
  */
 internal object OverallDimensions {
+    /**
+     * Distance of a dimension line from the outer wall face: [OFFSET_FRACTION] of the floor's larger extent on
+     * the output, between [MIN_OFFSET_PT] (small outputs: on a phone a fixed 24 pt offset on both axes took a
+     * quarter of the screen away from the plan) and [OFFSET_PT] (a page).
+     */
     const val OFFSET_PT = 24.0
+    const val MIN_OFFSET_PT = 12.0
+    const val OFFSET_FRACTION = 0.045
     const val EXTENSION_GAP_PT = 3.0
     const val EXTENSION_OVERSHOOT_PT = 3.0
     const val TICK_PT = 8.0
@@ -378,6 +432,8 @@ internal object OverallDimensions {
         val b = Bounds(inner.minX - pad, inner.minY - pad, inner.maxX + pad, inner.maxY + pad)
         val m = metersPerPt * textScale
         val sizePt = LABEL_PT * textScale
+        val extentPt = max(b.width, b.height) / metersPerPt
+        val offset = (OFFSET_FRACTION * extentPt).coerceIn(MIN_OFFSET_PT, OFFSET_PT) * m
         val out = ArrayList<DimensionLine>(2)
 
         fun build(kind: String, start: Vec2, end: Vec2, extensions: List<Segment2>, outward: Vec2, length: Double) {
@@ -404,7 +460,7 @@ internal object OverallDimensions {
 
         // Extension lines start just off the outer face (interior corner + pad) of the outermost wall at each end.
         if (inner.width >= MIN_EXTENT) {
-            val y = b.maxY + OFFSET_PT * m
+            val y = b.maxY + offset
             val leftTop = frame.filter { it.x <= inner.minX + EXTREME_TOLERANCE }.maxOf { it.y } + pad
             val rightTop = frame.filter { it.x >= inner.maxX - EXTREME_TOLERANCE }.maxOf { it.y } + pad
             val beyond = y + EXTENSION_OVERSHOOT_PT * m
@@ -415,7 +471,7 @@ internal object OverallDimensions {
             build("width", Vec2(b.minX, y), Vec2(b.maxX, y), extensions, Vec2(0.0, 1.0), b.width)
         }
         if (inner.height >= MIN_EXTENT) {
-            val x = b.minX - OFFSET_PT * m
+            val x = b.minX - offset
             val bottomLeft = frame.filter { it.y <= inner.minY + EXTREME_TOLERANCE }.minOf { it.x } - pad
             val topLeft = frame.filter { it.y >= inner.maxY - EXTREME_TOLERANCE }.minOf { it.x } - pad
             val beyond = x - EXTENSION_OVERSHOOT_PT * m

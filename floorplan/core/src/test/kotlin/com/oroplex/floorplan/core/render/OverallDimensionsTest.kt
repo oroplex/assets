@@ -281,10 +281,18 @@ class OverallDimensionsTest {
         val ppm = 72 / 0.0254 / 50
         val dl = PlanRenderer.render(listOf(box), withDimensions, RenderOptions(pointsPerMeter = ppm))
         val w = mainLine(dl, "width")
-        // 24 pt offset from the outer face, at exactly that scale.
-        assertNear(24.0 / ppm, w.points[0].y - (3 + e), 1e-9)
+        // The offset from the outer face is 4.5 % of the floor's larger extent on the output, between 12 and
+        // 24 pt, at exactly that scale. This small room is about 240 pt wide at 1:50: 12 pt.
+        fun offsetPt(scale: Double) = (0.045 * (4 + 2 * e) * scale).coerceIn(12.0, 24.0)
+        assertNear(12.0, offsetPt(ppm), 1e-9)
+        assertNear(offsetPt(ppm) / ppm, w.points[0].y - (3 + e), 1e-9)
         val d = mainLine(dl, "depth")
-        assertNear(-24.0 / ppm, d.points[0].x + e, 1e-9)
+        assertNear(-offsetPt(ppm) / ppm, d.points[0].x + e, 1e-9)
+        // Enlarged until it is as wide as a page, the offset reaches its full 24 pt and stays there.
+        for (zoom in listOf(2.5, 4.0)) {
+            val big = mainLine(PlanRenderer.render(listOf(box), withDimensions, RenderOptions(pointsPerMeter = ppm * zoom)), "width")
+            assertNear(24.0 / (ppm * zoom), big.points[0].y - (3 + e), 1e-9, "zoom $zoom")
+        }
         // Ticks are 8 pt long.
         val tick = lines(dl, "width").first { it.widthPt == 1.0 }
         assertNear(8.0 / ppm, tick.points[0].distanceTo(tick.points[1]), 1e-9)
@@ -294,12 +302,12 @@ class OverallDimensionsTest {
             assertNear(3 + e + 3.0 / ppm, minOf(x.points[0].y, x.points[1].y), 1e-9)
             assertNear(w.points[0].y + 3.0 / ppm, maxOf(x.points[0].y, x.points[1].y), 1e-9)
         }
-        // A smaller output scale moves the line farther out in plan meters (it stays 24 pt on paper).
+        // A smaller output scale moves the line farther out in plan meters (it stays 12 pt on the output).
         val small = mainLine(PlanRenderer.render(listOf(box), withDimensions, RenderOptions(pointsPerMeter = ppm / 2)), "width")
-        assertNear(48.0 / ppm, small.points[0].y - (3 + e), 1e-9)
+        assertNear(24.0 / ppm, small.points[0].y - (3 + e), 1e-9)
         // Text scale still applies on top.
         val scaled = mainLine(PlanRenderer.render(listOf(box), withDimensions, RenderOptions(pointsPerMeter = ppm, textScale = 0.5)), "width")
-        assertNear(12.0 / ppm, scaled.points[0].y - (3 + e), 1e-9)
+        assertNear(6.0 / ppm, scaled.points[0].y - (3 + e), 1e-9)
         // Unusable scales fall back to the nominal fit-to-page scale.
         val nominal = mainLine(PlanRenderer.render(listOf(box), withDimensions), "width").points[0].y
         for (bad in listOf(0.0, -10.0, Double.NaN, Double.POSITIVE_INFINITY)) {

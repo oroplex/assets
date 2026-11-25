@@ -310,14 +310,20 @@ private fun animatorScale(context: android.content.Context): Float = try {
 }
 
 /**
- * Points per plan meter of [view] (what RenderOptions.pointsPerMeter expects), rounded to quarter steps on a
- * log2 scale (about 19 % apart) so the plan is only re-rendered when the zoom changes noticeably. Null for an
+ * Zoom steps per doubling of the scale. Labels are fitted to the rooms at the rounded scale, so the rounding
+ * error (here at most about 4 %) has to stay inside the padding the fit leaves around a label.
+ */
+private const val ZOOM_STEPS_PER_OCTAVE = 8.0
+
+/**
+ * Points per plan meter of [view] (what RenderOptions.pointsPerMeter expects), rounded to eighth steps on a
+ * log2 scale (about 9 % apart) so the plan is only re-rendered when the zoom changes noticeably. Null for an
  * unusable view.
  */
 internal fun quantizedPointsPerMeter(view: ViewTransform): Double? {
     val ppm = view.pxPerMeter / view.pxPerPt
     if (!ppm.isFinite() || ppm <= 0.0) return null
-    val step = Math.round(ln(ppm) / ln(2.0) * 4.0) / 4.0
+    val step = Math.round(ln(ppm) / ln(2.0) * ZOOM_STEPS_PER_OCTAVE) / ZOOM_STEPS_PER_OCTAVE
     return 2.0.pow(step)
 }
 

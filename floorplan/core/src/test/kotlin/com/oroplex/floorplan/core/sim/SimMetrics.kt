@@ -182,7 +182,11 @@ internal object SimReport {
             if (scan.result == null) add("UNSOLVED")
             if (e != null && !e.topologyOk) add("TOPOLOGY ${e.solvedCount}/${e.trueCount} corners")
             scan.captures.filter { it.observation != null && !it.onTarget }.forEach { c ->
-                val on = if (c.matchedEdge >= 0) "wall ${c.matchedEdge + 1}" else "no wall (furniture/clutter)"
+                val on = when {
+                    c.matchedEdge == c.edge -> "the right wall but > 5 deg / 5 cm off its face"
+                    c.matchedEdge >= 0 -> "wall ${c.matchedEdge + 1}"
+                    else -> "no wall (chord, furniture or clutter)"
+                }
                 add(
                     String.format(
                         Locale.ROOT, "WRONG-WALL aimed at wall %d from %.2f m, fit lies on %s",

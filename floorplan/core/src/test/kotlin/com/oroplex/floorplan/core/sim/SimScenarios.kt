@@ -384,6 +384,8 @@ internal object SimScenarios {
         append(sweepSection())
         appendLine()
         append(grazingSection())
+        appendLine()
+        append(HardScenarios.report())
     }
 
     private fun furnitureStats(scans: List<RoomScan>): List<String> {

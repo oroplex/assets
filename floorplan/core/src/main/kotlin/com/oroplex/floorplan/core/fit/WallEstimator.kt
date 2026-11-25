@@ -10,6 +10,7 @@ import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.ceil
 import kotlin.math.exp
+import kotlin.math.floor
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
@@ -27,22 +28,35 @@ enum class WallFitFailure(val message: String) {
  * Outcome of [WallEstimator.fromPoints]: exactly one of [observation] / [failure] is non-null.
  * [usedPoints] is the inlier count of the fitted wall line when a line was found, otherwise the number
  * of points that survived filtering; [totalPoints] is the number of raw samples supplied.
+ *
+ * [hint] is a more specific, actionable message for some failures (e.g. a short wall seen at an angle,
+ * which is reported as [WallFitFailure.NO_DOMINANT_PLANE]); show [message], which falls back to the
+ * failure's generic message.
  */
 data class WallFit(
     val observation: WallObservation?,
     val failure: WallFitFailure?,
     val usedPoints: Int,
     val totalPoints: Int,
-)
+    val hint: String? = null,
+) {
+    /** What to tell the user about a failed fit: [hint] when there is one, else the failure's message; null on success. */
+    val message: String? get() = if (failure == null) null else hint ?: failure.message
+}
 
 /**
  * Tuning of [WallEstimator.fromPoints].
  *
- * Depth noise grows with range (depth-from-motion: σ(d) ≈ 5 mm + 1.2 % of d), so the inlier band and the
- * noise gate are range-adaptive: at the median horizontal range d of the usable points the estimator uses
- * `max(inlierThreshold, 2σ(d))` as the RANSAC / refinement band and `max(maxRms, 1.5σ(d))` as the
- * TOO_NOISY limit (see [inlierThresholdAt], [noiseLimitAt]). A fixed 2.5 cm band rejects every correct
- * capture beyond ~2 m and, worse, favours thin grazing-incidence side walls over the wall aimed at.
+ * Depth noise grows with range (depth-from-motion: σ(d) ≈ 5 mm + 1.2 % of d), so the inlier band is
+ * range-adaptive: at the median horizontal range d of the usable points the estimator uses
+ * `max(inlierThreshold, 2σ(d))` as the RANSAC band ([inlierThresholdAt]). A fixed 2.5 cm band rejects every
+ * correct capture beyond ~2 m and, worse, favours thin grazing-incidence side walls over the wall aimed at.
+ *
+ * The noise model is a prior, not a fact (review round 2, MATH-4): a sensor that is 1.5–2× noisier than it
+ * must still measure walls, because with hundreds of samples the fitted LINE stays precise. So a capture is
+ * rejected for noise only when the per-point noise is grossly off the model ([grossNoiseFactor], see
+ * [noiseLimitAt]) or when the line itself is imprecise ([maxOffsetError], [maxDirectionErrorDeg]); in between,
+ * the measured-to-expected noise ratio only lowers the confidence.
  */
 data class WallEstimatorConfig(
     /** Ignore points lower than this above the floor (baseboards, floor bleed). */
@@ -61,9 +75,9 @@ data class WallEstimatorConfig(
     val inlierThreshold: Double = 0.025,
     val minInliers: Int = 25,
     /**
-     * Minimum per-point noise limit (m); widened to 1.5σ(d) at range. The noise compared against it is the
-     * larger of the inlier RMS and a robust (MAD-based) σ of the points near the line; see
-     * [WallEstimator.fromPoints].
+     * Per-point noise (m) that is always acceptable: the gross noise cap ([noiseLimitAt]) never goes below it,
+     * so close-range captures, where the model expects only millimetres, are not rejected for unmodeled
+     * centimetre-level texture. The noise is the robust (MAD-based) σ of the points near the line.
      */
     val maxRms: Double = 0.03,
     /**
@@ -76,6 +90,21 @@ data class WallEstimatorConfig(
     val noiseSigmaBase: Double = 0.005,
     /** Growth of the expected depth noise per meter of range (dimensionless; 0.012 = 1.2 %). */
     val noiseSigmaPerMeter: Double = 0.012,
+    /**
+     * Gross per-point noise cap, as a multiple of the expected noise: beyond it the samples are not a wall
+     * reading at all (motion blur, a glossy or dark surface, a moving person) → [WallFitFailure.TOO_NOISY].
+     */
+    val grossNoiseFactor: Double = 3.5,
+    /** Largest acceptable standard error (m) of the fitted line's offset. */
+    val maxOffsetError: Double = 0.01,
+    /** Largest acceptable standard error (degrees) of the fitted line's direction. */
+    val maxDirectionErrorDeg: Double = 1.5,
+    /**
+     * Cap on the sample count used for the line's standard errors: neighbouring depth samples (and all
+     * samples of one frame) share errors, so thousands of samples do not make a line thousands of times
+     * more precise.
+     */
+    val maxEffectivePoints: Int = 300,
 ) {
     /** Expected per-sample depth noise σ (m) at [range] meters (along the viewing ray); 0 for invalid input. */
     fun expectedSigma(range: Double): Double {
@@ -87,8 +116,25 @@ data class WallEstimatorConfig(
     /** Inlier band half-width at [range]: max([inlierThreshold], 2σ(range)). */
     fun inlierThresholdAt(range: Double): Double = max(inlierThreshold, 2.0 * expectedSigma(range))
 
-    /** TOO_NOISY limit at [range]: max([maxRms], 1.5σ(range)). */
-    fun noiseLimitAt(range: Double): Double = max(maxRms, 1.5 * expectedSigma(range))
+    /**
+     * Gross per-point noise cap for a wall seen head-on at [range]: max([maxRms], [grossNoiseFactor] · σ(range)).
+     * [WallEstimator.fromPoints] applies it to the noise expected across the wall, which is smaller for
+     * oblique views (range error runs along the ray).
+     */
+    fun noiseLimitAt(range: Double): Double = max(maxRms, grossNoiseFactor * expectedSigma(range))
+
+    /**
+     * Standard errors of a line fitted to [count] samples with per-point noise [sigma] (m) spread over
+     * [extent] (m): offset σ/√n and direction √12·σ/(√n·L) (radians), n capped at [maxEffectivePoints].
+     * Non-finite or non-positive input gives infinite errors.
+     */
+    fun lineErrors(sigma: Double, count: Int, extent: Double): Pair<Double, Double> {
+        val n = count.coerceIn(0, maxEffectivePoints.coerceAtLeast(1)).toDouble()
+        if (!(n > 0) || !sigma.isFinite() || sigma < 0 || !(extent > 0) || !extent.isFinite()) {
+            return Double.POSITIVE_INFINITY to Double.POSITIVE_INFINITY
+        }
+        return sigma / sqrt(n) to sqrt(12.0) * sigma / (sqrt(n) * extent)
+    }
 }
 
 /**
@@ -101,15 +147,16 @@ data class WallEstimatorConfig(
  */
 object WallEstimator {
     /** Fixed RANSAC seeds (one per extracted line): results are fully deterministic for identical input. */
-    private val SEEDS = longArrayOf(0x5EED_0001L, 0x5EED_0002L, 0x5EED_0003L)
+    private val SEEDS = longArrayOf(0x5EED_0001L, 0x5EED_0002L, 0x5EED_0003L, 0x5EED_0004L)
     private const val RANSAC_ITERATIONS = 300
 
     /**
      * Lines extracted, each from the points the previous ones did not explain: the aimed-at wall, furniture,
-     * a wall seen through a doorway, side walls. Without an aim point only the first two compete ("prefer
-     * farther"); with one, all three can match it.
+     * a wall seen through a doorway, side walls, and near a corner a chord through the corner's samples. Without
+     * an aim point only the first two compete ("prefer farther"); with one, every candidate through the aim
+     * point is tried in turn.
      */
-    private const val CANDIDATES = 3
+    private const val CANDIDATES = 4
 
     /**
      * Refinement band per sample, in units of its expected perpendicular deviation σᵢ·|n·r̂ᵢ| (range noise
@@ -121,10 +168,20 @@ object WallEstimator {
     /** Narrowest refinement band (m): unmodeled error (trim, slight bow, calibration) is never below this. */
     private const val MIN_REFINE_BAND = 0.01
 
+    /** Smallest expected perpendicular noise (m) of one sample (the refinement band floor in σ units). */
+    private const val MIN_PERP_SIGMA = MIN_REFINE_BAND / REFINE_BAND_SIGMAS
+
     /** Hypotheses tried with the per-sample refinement bands (see [refine]). */
     private const val TIGHT_ITERATIONS = 200
 
     private const val TIGHT_SEED = 0x5EED_0010L
+
+    /**
+     * Refinement re-selects its samples only within this multiple of the RANSAC band around the chosen
+     * candidate (the hypothesis search scores only the samples within one band): it may straighten a slightly
+     * tilted candidate, but never walk off onto the next face of a corner (review round 2, MATH-1).
+     */
+    private const val REFINE_UNIVERSE_FACTOR = 1.5
 
     /** Hypothesis pairs closer than this (m) give a poorly conditioned direction and are skipped. */
     private const val MIN_PAIR_DISTANCE = 0.1
@@ -147,6 +204,50 @@ object WallEstimator {
 
     /** At most this many trims (an end can be trimmed again when a wide, oblique corner remains). */
     private const val MAX_SPUR_TRIMS = 4
+
+    /**
+     * Lack-of-fit test (see [Refined.lackOfFit]): the inliers are split into up to [LOF_MAX_BINS] equal-count
+     * bins along the wall (by where their rays meet it), each of at least [LOF_MIN_BIN] samples; a bin whose
+     * mean residual is more than [LOF_Z] standard errors AND more than [LOF_MIN_DEVIATION_SIGMAS] expected
+     * per-point σ (and [LOF_MIN_DEVIATION] m) off the line shows that the "wall" bends: it is a chord across
+     * several faces of a corner, not one flat face.
+     */
+    private const val LOF_MAX_BINS = 6
+    private const val LOF_MIN_BINS = 3
+    private const val LOF_MIN_BIN = 25
+    private const val LOF_Z = 4.0
+    private const val LOF_MIN_DEVIATION = 0.004
+    private const val LOF_MIN_DEVIATION_SIGMAS = 0.2
+
+    /**
+     * Depth-profile segmentation (see [segment]): rays are binned by azimuth in bins this wide (degrees); a bin
+     * needs [SEGMENT_MIN_BIN] in-band samples to be judged; its median residual may be off the line by
+     * [SEGMENT_Z] standard errors of a median (√(π/2) σ/√n) or [SEGMENT_MIN_DEVIATION] (m), whichever is larger;
+     * the noise ratio used for the standard error is capped at [MAX_SEGMENT_NOISE_RATIO]. At most
+     * [SEGMENT_ROUNDS] segment / refit rounds.
+     */
+    private const val SEGMENT_BIN_DEG = 0.5
+    private const val SEGMENT_MIN_BIN = 8
+    private const val SEGMENT_Z = 3.5
+    private const val SEGMENT_MIN_DEVIATION = 0.005
+    private const val MAX_SEGMENT_NOISE_RATIO = 2.5
+    private const val SEGMENT_ROUNDS = 3
+    private const val MEDIAN_SE_FACTOR = 1.2533
+
+    /** The measured noise ratio widens the post-refinement aim window up to this factor (see [POST_AIM_SIGMAS]). */
+    private const val MAX_AIM_NOISE_RATIO = 1.5
+
+    /**
+     * After refinement the aim point must lie on the surface within [POST_AIM_SIGMAS] of its own expected
+     * error: [POST_AIM_SIGMA_FACTOR] × σ(range) (a median of a handful of center-ray hits) × the measured noise
+     * ratio when the sensor is noisier than the model; never tighter than [MIN_POST_AIM_WINDOW] (m).
+     */
+    private const val POST_AIM_SIGMA_FACTOR = 0.6
+    private const val POST_AIM_SIGMAS = 3.0
+    private const val MIN_POST_AIM_WINDOW = 0.03
+
+    /** The center ray must meet a refined surface within its robust extent ± this (m). */
+    private const val POST_AIM_EXTENT_MARGIN = 0.03
 
     /** Two surfaces count as parallel within this angle (furniture test). */
     private val PARALLEL_SIN = sin(Math.toRadians(15.0))
@@ -186,8 +287,9 @@ object WallEstimator {
 
     /**
      * Aim matching fallback: with no candidate through the aim point, the choice made without aim point is
-     * still used when the aim point lies within this multiple of the aim window of it (a noisy aim, a
-     * slightly curved patch); farther away the crosshair is clearly on another surface and the fit fails.
+     * still tried when the aim point lies within this multiple of the aim window of it (a noisy aim, a
+     * slightly curved patch); its refined line must then pass through the aim point like any other. Farther
+     * away the crosshair is clearly on another surface and the fit fails.
      */
     private const val AIM_FALLBACK_FACTOR = 2.0
 
@@ -199,6 +301,15 @@ object WallEstimator {
 
     /** Observed wall extents shorter than this (m) cannot define a direction reliably. */
     private const val MIN_EXTENT = 0.10
+
+    /**
+     * Observed extent: the [EXTENT_LOW]–[EXTENT_HIGH] quantiles of where the inliers' rays meet the wall,
+     * widened by the share they cut off (unbiased for evenly covered walls). The extreme inliers are not
+     * used: a few range outliers on rays that pass the wall's end land inside the band beyond the corner and
+     * stretched extents by up to 1.7 m in simulation (review round 2, MATH-6).
+     */
+    private const val EXTENT_LOW = 0.02
+    private const val EXTENT_HIGH = 0.98
 
     /** A viewer closer than this (m) to the fitted line cannot tell the interior side apart. */
     private const val MIN_VIEWER_DISTANCE = 0.05
@@ -240,6 +351,12 @@ object WallEstimator {
     /** Half-length (m) of the assumed extent of a detected plane without boundary points. */
     private const val DEFAULT_PLANE_HALF_EXTENT = 0.5
 
+    /** [WallFit.hint] when the surface at the crosshair is not one flat face (a chord across a corner). */
+    const val HINT_SHORT_WALL = "Short wall or corner in view. Stand square to this wall and capture again, or tap its base."
+
+    /** [WallFit.hint] when the wall was found but too little of it was seen for a precise line. */
+    const val HINT_IMPRECISE = "Too little of this wall was in view for a precise reading. Stand square to it, a little closer, and hold steady."
+
     /**
      * Fit a vertical wall to world-space sample points (depth hits) captured around the reticle.
      *
@@ -250,26 +367,25 @@ object WallEstimator {
      *    horizontal distance to [viewer] is ≤ `maxRange`.
      * 2. Fewer than `minInliers` survivors → [WallFitFailure.TOO_FAR] when the range filter removed most
      *    of the in-band points, else [WallFitFailure.TOO_FEW_POINTS].
-     * 3. Noise model: d = median horizontal range of the usable points; band = `inlierThresholdAt(d)`,
-     *    noise limit = `noiseLimitAt(d)` (see [WallEstimatorConfig]).
+     * 3. Noise model: d = median horizontal range of the usable points; band = `inlierThresholdAt(d)`.
      * 4. Candidate lines: RANSAC ([LineFit.ransac]) with that band, then again on the points the previous
-     *    lines did not explain, up to 3 lines (wall, furniture, adjacent walls); a line passing within 25 cm
-     *    of the viewer is a fan of range outliers along one ray, not a surface, and is skipped. No line →
+     *    lines did not explain, up to 4 lines (wall, furniture, adjacent walls, chords); a line passing within
+     *    25 cm of the viewer is a fan of range outliers along one ray, not a surface, and is skipped. No line →
      *    NO_DOMINANT_PLANE.
-     * 5. Choice:
-     *    * With a finite [aimPoint]: the wall is the candidate the aim point lies on. The aim point is a
-     *      range sample, so it is compared ALONG the center ray (viewer → aim): the ray must meet the line
-     *      within max(2 × band, 5 cm) of the aim point, inside the line's inlier span ± that window. When
-     *      several match (near a corner) the dominant, best-matching one wins: score = inliers ·
-     *      exp(−½(miss / σₐ)²) with σₐ = max(band / 2, 2 cm), the aim point's expected error, so a sparse
-     *      streak of samples cannot beat the wall it crosses. A side wall seen at grazing incidence can pass
-     *      a few centimetres from an aim point near the corner, but the center ray, almost parallel to it,
-     *      meets it far beyond the aim: it never wins (the hallway end wall), and neither does a parallel
-     *      wall seen through a doorway beside the aimed wall. If the aimed surface passes the furniture test
-     *      below (a low object in front of a taller parallel surface), the user aimed at furniture →
-     *      NO_DOMINANT_PLANE, whose message says to aim above it. If no candidate matches, the choice
-     *      without aim point is used when it matches within 2 × that window; otherwise the crosshair is
-     *      clearly on another surface → NO_DOMINANT_PLANE ("aim at the middle of the wall").
+     * 5. Choice: the surfaces to try, best first.
+     *    * With a finite [aimPoint]: the candidates the aim point lies on. The aim point is a range sample,
+     *      so it is compared ALONG the center ray (viewer → aim): the ray must meet the line within
+     *      max(2 × band, 5 cm) of the aim point, inside the line's inlier span ± that window. They are tried in
+     *      order of score = inliers · exp(−½(miss / σₐ)²) with σₐ = max(band / 2, 2 cm), the aim point's
+     *      expected error, so a sparse streak of samples cannot beat the wall it crosses. A side wall seen at
+     *      grazing incidence can pass a few centimetres from an aim point near the corner, but the center ray,
+     *      almost parallel to it, meets it far beyond the aim: it never matches (the hallway end wall), and
+     *      neither does a parallel wall seen through a doorway beside the aimed wall. If the best-scoring
+     *      surface passes the furniture test below (a low object in front of a taller parallel surface), the
+     *      user aimed at furniture → NO_DOMINANT_PLANE, whose message says to aim above it (lower-ranked
+     *      furniture surfaces are skipped). If no candidate matches, the choice without aim point is tried when
+     *      it matches within 2 × that window; otherwise the crosshair is clearly on another surface →
+     *      NO_DOMINANT_PLANE ("aim at the middle of the wall").
      *    * Without aim point: the best line, unless the second candidate is the wall behind furniture
      *      ("prefer farther"): it has ≥ `preferFartherRatio` × the best line's inliers and passes the
      *      furniture test. Confidence is then multiplied by 0.85.
@@ -279,24 +395,32 @@ object WallEstimator {
      *      elevation angle of the inliers seen from the camera; in angles because the same view covers more
      *      height on a farther surface). Overlap and height separate furniture (in front of the wall,
      *      lower) from a doorway or step (beside it, full height).
-     * 6. Refinement ([refine]) on all usable samples within a per-sample band of the chosen line (the noise
-     *    a range error can cause across this line: tight for oblique rays, so the adjacent wall's samples
-     *    near a corner stay out), weighted by 1/σᵢ² (σᵢ = the expected noise at the sample's own range,
-     *    projected to the plan): an MSAC hypothesis search, weighted TLS, then the along-ray
-     *    maximum-likelihood fit [LineFit.fitAlongRays] (depth error lies along the viewing ray, which tilts
-     *    orthogonal regression for oblique views), re-selecting the inliers after each pass; corner
-     *    clusters that still got in are trimmed ([cornerSpur]). A line that explains < 10 % of the usable
-     *    points (not counting furniture in front of it), or whose inliers span < 0.10 m → NO_DOMINANT_PLANE.
-     * 7. Noise = max(inlier RMS, robust σ of the usable points within 4 × band of the line whose rays meet it
-     *    in the core of the wall (10–90 % of the inliers), away from the ends where adjacent walls' smeared
-     *    samples and stray range outliers would count). The robust σ
-     *    (1.4826 · MAD of the residuals) is what actually detects a thick, noisy band: the inlier RMS alone
-     *    can never exceed the band. Noise > the noise limit → [WallFitFailure.TOO_NOISY].
-     * 8. Orient the line viewer-left; extents are the extreme inlier parameters in that orientation. A
-     *    viewer within 5 cm of the line (interior side undefined) → [WallFitFailure.NO_DOMINANT_PLANE].
-     *    The line's anchor (`line.point`) is the projection of the inliers' 1/σ²-weighted centroid: where
-     *    the wall's position is known best (RoomSolver rotates squared walls about it).
-     * 9. Confidence, see [depthFitConfidence] (noise relative to the range-adaptive limit).
+     * 6. Refinement ([refine]) on the usable samples near the chosen line, within a per-sample band (the noise
+     *    a range error can cause across this line: tight for oblique rays, so the adjacent wall's samples near
+     *    a corner stay out), weighted by 1/σᵢ² (σᵢ = the expected noise at the sample's own range, projected
+     *    to the plan): an MSAC hypothesis search, weighted TLS, then the along-ray maximum-likelihood fit
+     *    [LineFit.fitAlongRays] (depth error lies along the viewing ray, which tilts orthogonal regression for
+     *    oblique views), re-selecting the inliers after each pass; corner clusters that still got in are
+     *    trimmed ([cornerSpur]). A line that explains < 10 % of the usable points (not counting furniture in
+     *    front of it), or whose robust extent is < 0.10 m → NO_DOMINANT_PLANE.
+     * 7. One flat face? (review round 2, MATH-1: a short wall seen at an angle sits in a cluster of three
+     *    faces whose smeared samples all fit a diagonal chord.) The refined line must still pass through the
+     *    aim point (normal window), must not have turned more than 4° from its candidate, and must pass the
+     *    lack-of-fit test ([Refined.lackOfFit]: no stretch of the wall bends away from the line). A surface
+     *    that fails is not a wall: the next candidate through the aim point is tried; when none is left →
+     *    NO_DOMINANT_PLANE with [HINT_SHORT_WALL] (the capture screen then offers tapping the wall's base).
+     * 8. Noise (MATH-4): the robust σ (1.4826 · MAD) of the usable points within 4 × band of the line whose
+     *    rays meet it in the core of the wall (10–90 % of the inliers), in metres and relative to the noise
+     *    expected across the line. Grossly off the model (ratio > `grossNoiseFactor` and above `maxRms`) →
+     *    [WallFitFailure.TOO_NOISY]. Then the line's own precision ([WallEstimatorConfig.lineErrors]): offset
+     *    error > `maxOffsetError` or direction error > `maxDirectionErrorDeg` → TOO_NOISY with
+     *    [HINT_IMPRECISE]. Otherwise the ratio only lowers the confidence.
+     * 9. Orient the line viewer-left; the extent is the robust span of where the inliers' rays meet the line
+     *    (2–98 % quantiles, widened by the share they cut off). A viewer within 5 cm of the line (interior side
+     *    undefined) → [WallFitFailure.NO_DOMINANT_PLANE]. The line's anchor (`line.point`) is the projection of
+     *    the inliers' 1/σ²-weighted centroid: where the wall's position is known best (RoomSolver rotates
+     *    squared walls about it).
+     * 10. Confidence, see [depthFitConfidence] (noise ratio relative to the gross cap).
      *
      * Non-finite [floorY] / [viewer] degrade to [WallFitFailure.TOO_FEW_POINTS]; a non-finite [aimPoint]
      * is ignored; this never throws.
@@ -315,7 +439,7 @@ object WallEstimator {
         aimPoint: Vec3? = null,
     ): WallFit {
         val total = worldPoints.size
-        fun fail(reason: WallFitFailure, used: Int) = WallFit(null, reason, used, total)
+        fun fail(reason: WallFitFailure, used: Int, hint: String? = null) = WallFit(null, reason, used, total, hint)
 
         if (!floorY.isFinite() || !viewer.isFinite()) return fail(WallFitFailure.TOO_FEW_POINTS, 0)
         val viewerPlan = viewer.toPlan()
@@ -355,56 +479,136 @@ object WallEstimator {
         }
         val usable = samples.map { it.plan }
 
-        // 3) Range-adaptive noise model.
+        // 3) Range-adaptive band.
         val medianRange = RobustStats.median(samples.map { it.horizontalRange })
         val threshold = config.inlierThresholdAt(medianRange)
-        val noiseLimit = config.noiseLimitAt(medianRange)
 
         // 4) Candidate lines.
         val aimPlan = aimPoint?.takeIf { it.isFinite() }?.toPlan()
         val candidates = extractCandidates(usable, samples, viewerPlan, viewer.y - floorY, threshold, minInliers, CANDIDATES)
         if (candidates.isEmpty()) return fail(WallFitFailure.NO_DOMINANT_PLANE, usable.size)
 
-        // 5) Choice.
+
+        // 5) Choice: the surfaces to try, best first.
         val legacy = legacyChoice(candidates, viewerPlan, config, minInliers)
-        val choice = if (aimPlan == null) {
-            legacy
+        val window = max(2.0 * threshold, MIN_AIM_WINDOW)
+        val choices: List<Choice> = if (aimPlan == null) {
+            listOf(legacy)
         } else {
-            val window = max(2.0 * threshold, MIN_AIM_WINDOW)
             when (val aimed = aimChoice(candidates, aimPlan, window, threshold, viewerPlan, minInliers)) {
-                is AimOutcome.OnWall -> Choice(aimed.wall, null)
+                is AimOutcome.OnWall -> aimed.walls.map { Choice(it, null) }
                 AimOutcome.OnFurniture -> return fail(WallFitFailure.NO_DOMINANT_PLANE, usable.size)
-                AimOutcome.Elsewhere ->
-                    if (aimMiss(legacy.wall.fit, aimPlan, viewerPlan, AIM_FALLBACK_FACTOR * window) != null) {
-                        legacy
-                    } else {
+                AimOutcome.Elsewhere -> {
+                    val fit = legacy.wall.fit
+                    if (aimMiss(fit.line, fit.tMin, fit.tMax, aimPlan, viewerPlan, AIM_FALLBACK_FACTOR * window) == null) {
                         return fail(WallFitFailure.NO_DOMINANT_PLANE, usable.size)
                     }
+                    listOf(legacy)
+                }
             }
         }
 
-        // 6) Refinement on all usable points.
-        val sigmas = expectedPlanSigmas(samples, choice.wall.fit.line, viewerPlan, config)
+        // 6-11) Refine and check each in turn; the first surface that is one flat, precise face wins.
+        val context = FitContext(samples, usable, viewerPlan, aimPlan, threshold, minInliers, config, total)
+        var firstRejection: Rejection? = null
+        for (choice in choices) {
+            when (val outcome = evaluate(choice, context)) {
+                is Accepted -> return outcome.fit
+                is Rejection -> {
+                    if (firstRejection == null) firstRejection = outcome
+                    if (!outcome.tryNext) break
+                }
+            }
+        }
+        val rejection = firstRejection ?: return fail(WallFitFailure.NO_DOMINANT_PLANE, usable.size)
+        return fail(rejection.reason, rejection.used, rejection.hint)
+    }
+
+    /** Inputs shared by the steps after candidate extraction. */
+    private class FitContext(
+        val samples: List<Sample>,
+        val usable: List<Vec2>,
+        val viewer: Vec2,
+        val aim: Vec2?,
+        val threshold: Double,
+        val minInliers: Int,
+        val config: WallEstimatorConfig,
+        val total: Int,
+    ) {
+        /** Unit ray from the viewer to each usable sample. */
+        val rays: List<Vec2> = usable.map { (it - viewer).normalized() }
+    }
+
+    private sealed interface Outcome
+
+    private class Accepted(val fit: WallFit) : Outcome
+
+    /** A rejected surface; [tryNext] when it is not one flat face at all, so another candidate may be the wall. */
+    private class Rejection(val reason: WallFitFailure, val used: Int, val hint: String?, val tryNext: Boolean) : Outcome
+
+    /** Steps 6–11 of [fromPoints] for one chosen surface. */
+    private fun evaluate(choice: Choice, c: FitContext): Outcome {
+        // 6) Refinement on the samples near the chosen line, then 7) on its stretch of the depth profile.
+        val sigmas = expectedPlanSigmas(c.samples, choice.wall.fit.line, c.viewer, c.config)
         val weights = sigmas.map { s -> max(s, MIN_WEIGHT_SIGMA).let { 1.0 / (it * it) } }
-        val refined = refine(choice.wall.fit.line, usable, weights, sigmas, viewerPlan, threshold, minInliers)
-            ?: return fail(WallFitFailure.NO_DOMINANT_PLANE, choice.wall.fit.inlierCount)
-        val explained = usable.size - (choice.foreground?.fit?.inlierCount ?: 0)
+        var refined = refine(choice.wall.fit.line, c.usable, weights, sigmas, c.viewer, c.threshold, c.minInliers, null)
+            ?: return Rejection(WallFitFailure.NO_DOMINANT_PLANE, choice.wall.fit.inlierCount, null, tryNext = true)
+        val seed = c.aim ?: refined.line.point
+        var segment: BooleanArray? = null
+        for (round in 0 until SEGMENT_ROUNDS) {
+            val next = segment(refined.line, sigmas, seed, c) ?: return Rejection(WallFitFailure.NO_DOMINANT_PLANE, refined.count, HINT_SHORT_WALL, tryNext = true)
+            if (segment != null && next.contentEquals(segment)) break
+            segment = next
+            refined = refine(refined.line, c.usable, weights, sigmas, c.viewer, c.threshold, c.minInliers, next)
+                ?: return Rejection(WallFitFailure.NO_DOMINANT_PLANE, refined.count, HINT_SHORT_WALL, tryNext = true)
+        }
+        val explained = c.usable.size - (choice.foreground?.fit?.inlierCount ?: 0)
         val inlierRatio = if (explained > 0) min(1.0, refined.count.toDouble() / explained) else 0.0
         val extentLength = refined.tMax - refined.tMin
         if (inlierRatio < MIN_INLIER_RATIO || extentLength < MIN_EXTENT) {
-            return fail(WallFitFailure.NO_DOMINANT_PLANE, refined.count)
+            return Rejection(WallFitFailure.NO_DOMINANT_PLANE, refined.count, null, tryNext = true)
+        }
+        val noise = noiseNear(c.usable, sigmas, refined.line, NOISE_WINDOW_FACTOR * c.threshold, c.viewer, refined.centralLo, refined.centralHi)
+        diagnostics?.invoke(
+            mapOf(
+                "aimMiss" to (c.aim?.let { aimMiss(refined.line, refined.tMin, refined.tMax, it, c.viewer, Double.POSITIVE_INFINITY) } ?: -1.0),
+                "sigmaAim" to c.config.expectedSigma(c.aim?.distanceTo(c.viewer) ?: 0.0),
+                "window" to 1.0,
+                "aimOutside" to 0.0,
+                "turnDeg" to Math.toDegrees(Math.asin(refined.line.sinAngleTo(choice.wall.fit.line).coerceAtMost(1.0))),
+                "lofZ" to refined.maxBinZ,
+                "lofDev" to refined.maxBinDeviation,
+                "lofDevSigmas" to refined.maxBinDeviationSigmas,
+                "lx" to refined.line.point.x, "ly" to refined.line.point.y,
+                "ux" to refined.line.direction.x, "uy" to refined.line.direction.y,
+                "mx" to refined.line.at((refined.tMin + refined.tMax) / 2).x, "my" to refined.line.at((refined.tMin + refined.tMax) / 2).y,
+                "count" to refined.count.toDouble(), "extent" to extentLength,
+                "lofZin" to refined.extra[3], "lofDevIn" to refined.extra[4], "lofIdx" to refined.extra[5], "lofRatio" to noise.ratio,
+                "spanDeg" to Math.toDegrees(refined.span), "noiseSigma" to noise.sigma, "shared" to 0.0, "spread" to refined.spread,
+                "postAim" to (if (c.aim == null) 1.0 else if (throughAim(refined, noise, c)) 1.0 else 0.0),
+            ),
+        )
+
+        // 8) One flat face through the aim point?
+        if (!throughAim(refined, noise, c) || refined.lackOfFit) {
+            return Rejection(WallFitFailure.NO_DOMINANT_PLANE, refined.count, HINT_SHORT_WALL, tryNext = true)
         }
 
-        // 7) Noise.
-        val noise = maxOf(
-            refined.rms,
-            robustSigmaNear(usable, refined.line, NOISE_WINDOW_FACTOR * threshold, viewerPlan, refined.centralLo, refined.centralHi),
-        )
-        if (!(noise <= noiseLimit)) return fail(WallFitFailure.TOO_NOISY, refined.count)
+        // 9) Noise: gross cap, then the line's own precision.
+        val sigma = max(refined.rms, noise.sigma)
+        if (noise.ratio > c.config.grossNoiseFactor && sigma > c.config.maxRms) {
+            return Rejection(WallFitFailure.TOO_NOISY, refined.count, null, tryNext = false)
+        }
+        // The uniform-coverage equivalent of where the inliers' rays actually meet the line (a patch seen through
+        // one or two sampling columns has a long extent at grazing incidence but little spread).
+        val (offsetError, directionError) = c.config.lineErrors(noise.sigma, refined.count, sqrt(12.0) * refined.spread)
+        if (!(offsetError <= c.config.maxOffsetError) || !(directionError <= Math.toRadians(c.config.maxDirectionErrorDeg))) {
+            return Rejection(WallFitFailure.TOO_NOISY, refined.count, HINT_IMPRECISE, tryNext = false)
+        }
 
-        // 8) Orientation: viewer on the LEFT; extents along +direction in the final orientation.
-        val side = refined.line.signedDistance(viewerPlan)
-        if (abs(side) < MIN_VIEWER_DISTANCE) return fail(WallFitFailure.NO_DOMINANT_PLANE, refined.count)
+        // 10) Orientation: viewer on the LEFT; extents along +direction in the final orientation.
+        val side = refined.line.signedDistance(c.viewer)
+        if (abs(side) < MIN_VIEWER_DISTANCE) return Rejection(WallFitFailure.NO_DOMINANT_PLANE, refined.count, null, tryNext = false)
         val (line, tMin, tMax) = if (side > 0) {
             Triple(refined.line, refined.tMin, refined.tMax)
         } else {
@@ -414,16 +618,16 @@ object WallEstimator {
         val extentStart = line.at(tMin)
         val extentEnd = line.at(tMax)
 
-        // 9) Confidence.
-        val viewerDistance = Vec2.lerp(extentStart, extentEnd, 0.5).distanceTo(viewerPlan)
+        // 11) Confidence.
+        val viewerDistance = Vec2.lerp(extentStart, extentEnd, 0.5).distanceTo(c.viewer)
         val confidence = depthFitConfidence(
             inlierRatio = inlierRatio,
-            noise = noise,
-            maxRms = noiseLimit,
+            noise = noise.ratio,
+            maxRms = c.config.grossNoiseFactor,
             inlierCount = refined.count,
             extentLength = extentLength,
             viewerDistance = viewerDistance,
-            maxRange = config.maxRange,
+            maxRange = c.config.maxRange,
         ) * (if (choice.foreground != null) BEHIND_FURNITURE_CONFIDENCE else 1.0)
 
         val observation = WallObservation(
@@ -434,10 +638,99 @@ object WallEstimator {
             rmsResidual = refined.rms,
             pointCount = refined.count,
             confidence = confidence,
-            viewer = viewerPlan,
+            viewer = c.viewer,
         )
-        return WallFit(observation, null, refined.count, total)
+        return Accepted(WallFit(observation, null, refined.count, c.total))
     }
+
+    /**
+     * Step 7 of [fromPoints]: the wall's own stretch of the depth profile. Every ray sees exactly one surface, so
+     * the samples are binned by the AZIMUTH of their ray ([SEGMENT_BIN_DEG] bins, in-band samples only); starting at
+     * the [seed] direction (the aim point), bins are taken in both directions while each bin's median residual
+     * fits [line] (within max([SEGMENT_MIN_DEVIATION], [SEGMENT_Z] standard errors of a median, from the expected
+     * noise scaled by the measured noise ratio). Bins without in-band samples (a doorway, the gap between two
+     * sampling columns) are stepped over; the first bin that does not fit belongs to another face and ends the
+     * stretch on that side.
+     *
+     * Near a corner, the neighbouring face's samples are smeared along their rays into this face's band (by up to
+     * the band: ±4 cm at 2 m); a closet return has a convex and a reflex corner, so its neighbours' samples sit on
+     * opposite sides of its line and tilt it by 5–15° without any visible lack of fit, and a chord through such a
+     * corner cluster is made only of other faces' samples (review round 2, MATH-1). In azimuth the faces do not
+     * overlap: those samples are cut off at the corner, and a chord keeps only its crossing with the aimed face.
+     *
+     * Returns the samples this surface may use (in-band samples of the bins taken), or null when fewer than
+     * `minInliers` remain.
+     */
+    private fun segment(line: Line2, sigmas: List<Double>, seed: Vec2, c: FitContext): BooleanArray? {
+        val n = c.usable.size
+        val seedRay = (seed - c.viewer).normalized()
+        if (seedRay == Vec2.ZERO) return null
+        val minBand = min(MIN_REFINE_BAND, c.threshold)
+        val binWidth = Math.toRadians(SEGMENT_BIN_DEG)
+        val bins = HashMap<Int, MutableList<Int>>()
+        val normalized = ArrayList<Double>()
+        for (i in 0 until n) {
+            val r = c.rays[i]
+            val g = abs(line.normal dot r)
+            val perp = max(sigmas[i] * g, MIN_PERP_SIGMA)
+            val d = line.signedDistance(c.usable[i])
+            if (abs(d) > (REFINE_BAND_SIGMAS * perp).coerceIn(minBand, c.threshold)) continue
+            val azimuth = atan2(seedRay cross r, seedRay dot r)
+            bins.getOrPut(floor(azimuth / binWidth).toInt()) { ArrayList() } += i
+            normalized += d / perp
+        }
+        if (bins.isEmpty()) return null
+        val ratio = (RobustStats.MAD_TO_SIGMA * RobustStats.mad(normalized)).takeIf { it.isFinite() }?.coerceIn(1.0, MAX_SEGMENT_NOISE_RATIO) ?: 1.0
+        fun fits(members: List<Int>): Boolean {
+            val residuals = members.map { line.signedDistance(c.usable[it]) }
+            val perps = members.map { max(sigmas[it] * abs(line.normal dot c.rays[it]), MIN_PERP_SIGMA) }
+            val se = MEDIAN_SE_FACTOR * ratio * RobustStats.median(perps) / sqrt(members.size.toDouble())
+            return abs(RobustStats.median(residuals)) <= max(SEGMENT_MIN_DEVIATION, SEGMENT_Z * se)
+        }
+        val allowed = BooleanArray(n)
+        var count = 0
+        val keys = bins.keys
+        val lo = keys.min()
+        val hi = keys.max()
+        for (step in listOf(-1, 1)) {
+            var k = if (step < 0) 0 else 1
+            while (k in lo..hi) {
+                val members = bins[k]
+                // Bins with too few samples to judge are stepped over like empty ones.
+                if (members != null && members.size >= SEGMENT_MIN_BIN) {
+                    if (!fits(members)) break
+                    for (i in members) allowed[i] = true
+                    count += members.size
+                }
+                k += step
+            }
+        }
+        return if (count >= c.minInliers) allowed else null
+    }
+
+    /**
+     * The aim point lies on the refined surface: a refined line is precise, so it must meet the center ray within
+     * about 3 σ of the aim point (a median of a handful of center-ray hits: σₐ ≈ [POST_AIM_SIGMA_FACTOR] × σ(range),
+     * widened by the measured noise ratio up to [MAX_AIM_NOISE_RATIO], never below [MIN_POST_AIM_WINDOW]) and inside
+     * its own robust extent ± [POST_AIM_EXTENT_MARGIN]: near a corner the neighbouring face passes close to the aim
+     * point too, but only beyond its own end. Always true without an aim point.
+     */
+    private fun throughAim(refined: Refined, noise: Noise, c: FitContext): Boolean {
+        val aim = c.aim ?: return true
+        val sigmaAim = POST_AIM_SIGMA_FACTOR * c.config.expectedSigma(aim.distanceTo(c.viewer)) * noise.ratio.coerceIn(1.0, MAX_AIM_NOISE_RATIO)
+        val window = max(MIN_POST_AIM_WINDOW, POST_AIM_SIGMAS * sigmaAim)
+        // aimMiss allows its span ± window; shift the span so that only ± POST_AIM_EXTENT_MARGIN remains.
+        return aimMiss(
+            refined.line, refined.tMin + window - POST_AIM_EXTENT_MARGIN, refined.tMax - window + POST_AIM_EXTENT_MARGIN,
+            aim, c.viewer, window,
+        ) != null
+    }
+
+
+
+    /** Test-only probe of per-candidate statistics (threshold calibration); null in production. */
+    @Volatile
+    internal var diagnostics: ((Map<String, Double>) -> Unit)? = null
 
     /**
      * Wall from an ARCore vertical plane: [center] = plane center, [normal] = plane normal (world),
@@ -596,9 +889,10 @@ object WallEstimator {
     private class Choice(val wall: Candidate, val foreground: Candidate?)
 
     private sealed interface AimOutcome {
-        class OnWall(val wall: Candidate) : AimOutcome
+        /** The candidates the aim point lies on, best first (furniture surfaces left out). */
+        class OnWall(val walls: List<Candidate>) : AimOutcome
 
-        /** The aimed surface is a low object in front of a taller parallel surface. */
+        /** The best surface at the aim point is a low object in front of a taller parallel surface. */
         data object OnFurniture : AimOutcome
 
         /** No candidate passes through the aim point. */
@@ -654,8 +948,8 @@ object WallEstimator {
     }
 
     /**
-     * The dominant candidate the aim point lies on (see [fromPoints], step 5), unless that surface is
-     * furniture. [threshold] is the inlier band; ties keep the earlier (larger) candidate.
+     * The candidates the aim point lies on (see [fromPoints], step 5), best-matching first, unless the best of
+     * them is furniture. [threshold] is the inlier band; ties keep the earlier (larger) candidate.
      */
     private fun aimChoice(
         candidates: List<Candidate>,
@@ -666,47 +960,44 @@ object WallEstimator {
         minInliers: Int,
     ): AimOutcome {
         val aimSigma = max(threshold / 2, MIN_AIM_SIGMA)
-        var hit: Candidate? = null
-        var hitScore = 0.0
-        for (c in candidates) {
-            val miss = aimMiss(c.fit, aim, viewer, window) ?: continue
+        val scored = candidates.mapNotNull { c ->
+            val miss = aimMiss(c.fit.line, c.fit.tMin, c.fit.tMax, aim, viewer, window) ?: return@mapNotNull null
             val z = miss / aimSigma
-            val score = c.fit.inlierCount * exp(-0.5 * z * z)
-            if (hit == null || score > hitScore) {
-                hit = c
-                hitScore = score
-            }
+            c to c.fit.inlierCount * exp(-0.5 * z * z)
         }
-        val wall = hit ?: return AimOutcome.Elsewhere
-        val furniture = candidates.any { other ->
+        if (scored.isEmpty()) return AimOutcome.Elsewhere
+        // Stable sort: equal scores keep the extraction order (larger candidates first).
+        val ranked = scored.sortedByDescending { it.second }.map { it.first }
+        fun isFurniture(wall: Candidate) = candidates.any { other ->
             other !== wall && other.fit.inlierCount >= minInliers && isInFrontOf(wall, other, viewer)
         }
-        return if (furniture) AimOutcome.OnFurniture else AimOutcome.OnWall(wall)
+        if (isFurniture(ranked[0])) return AimOutcome.OnFurniture
+        return AimOutcome.OnWall(ranked.filterNot(::isFurniture))
     }
 
     /**
-     * How far (m) the aim point lies from where the center ray (viewer → [aim]) meets the candidate line,
-     * measured ALONG that ray, when that is within [window] and the meeting point within the line's inlier
-     * span ± [window]; else null.
+     * How far (m) the aim point lies from where the center ray (viewer → [aim]) meets [line], measured ALONG
+     * that ray, when that is within [window] and the meeting point within the line's span [tMin]..[tMax] ±
+     * [window]; else null.
      *
      * Along the ray, because that is how the aim point errs (it is a range sample); and it decides the
      * corner cases right: a side wall seen at grazing incidence can pass a few centimetres from an aim point
      * near the corner, but the center ray, nearly parallel to it, meets it far beyond the aim.
      */
-    private fun aimMiss(fit: LineFitResult, aim: Vec2, viewer: Vec2, window: Double): Double? {
+    private fun aimMiss(line: Line2, tMin: Double, tMax: Double, aim: Vec2, viewer: Vec2, window: Double): Double? {
         val toAim = aim - viewer
         val range = toAim.length
         if (!(range > 1e-6)) return null
         val ray = toAim / range
-        val n = fit.line.normal
+        val n = line.normal
         val g = n dot ray
         if (abs(g) < 1e-6) return null
-        val hitRange = (n dot (fit.line.point - viewer)) / g
+        val hitRange = (n dot (line.point - viewer)) / g
         if (!(hitRange > 0)) return null
         val miss = abs(hitRange - range)
         if (miss > window) return null
-        val t = fit.line.param(viewer + ray * hitRange)
-        return if (t >= fit.tMin - window && t <= fit.tMax + window) miss else null
+        val t = line.param(viewer + ray * hitRange)
+        return if (t >= tMin - window && t <= tMax + window) miss else null
     }
 
     /**
@@ -738,9 +1029,16 @@ object WallEstimator {
     }
 
     /**
-     * The refined wall: line, inlier count and RMS, inlier span [tMin]..[tMax], and [centralLo]..[centralHi],
-     * the 10–90 % range of where the inliers' rays meet the line (the wall's core, robust to stray samples
-     * at the ends).
+     * The refined wall: line, inlier count and RMS, robust extent [tMin]..[tMax] (see [EXTENT_LOW]), and
+     * [centralLo]..[centralHi], the 10–90 % range of where the inliers' rays meet the line (the wall's core).
+     *
+     * Lack of fit: the inliers, ordered by where their rays meet the line, in equal-count bins; per bin the
+     * mean residual, as a z-score against its standard error (the noise of the bin's samples, from the model
+     * scaled by the measured noise ratio, so a sensor noisier than the model does not trip it), in metres
+     * ([maxBinDeviation]) and in expected per-point σ ([maxBinDeviationSigmas]) of the bin with the largest |z|.
+     * A flat face scatters evenly about its line along its whole length; a chord across a corner cluster (a
+     * short return and its two neighbour faces seen at an angle) runs in front of the faces in some stretches
+     * and behind them in others, centimetres either way.
      */
     private class Refined(
         val line: Line2,
@@ -750,11 +1048,20 @@ object WallEstimator {
         val tMax: Double,
         val centralLo: Double,
         val centralHi: Double,
-    )
+        val maxBinZ: Double,
+        val maxBinDeviation: Double,
+        val maxBinDeviationSigmas: Double,
+    ) {
+        var extra: DoubleArray = DoubleArray(7)
+        var span: Double = 0.0
+        var spread: Double = 0.0
+        val lackOfFit: Boolean
+            get() = maxBinZ > LOF_Z && maxBinDeviation > LOF_MIN_DEVIATION && maxBinDeviationSigmas > LOF_MIN_DEVIATION_SIGMAS
+    }
 
     /**
-     * Step 6 of [fromPoints]: the chosen surface's line, re-estimated from all usable points. Every reported
-     * statistic is computed against the returned line; null when fewer than [minInliers] support it.
+     * Step 6 of [fromPoints]: the chosen surface's line, re-estimated from the usable samples near it. Every
+     * reported statistic is computed against the returned line; null when fewer than [minInliers] support it.
      *
      * A sample supports a line when it lies within its own band, `2.5 · σᵢ·|n·r̂ᵢ|` clamped to
      * [1 cm, [threshold]]: depth error runs along the viewing ray r̂ᵢ, so σᵢ·|n·r̂ᵢ| is the deviation it can
@@ -763,14 +1070,19 @@ object WallEstimator {
      * the line, and a uniform band lets them pull the line's end towards them (a side wall seen at grazing
      * incidence collected ~120 such points in simulation and tilted 1.4°; with per-sample bands, 0.01°).
      *
+     * Only samples within [threshold] of [initial] (the pool) score the hypotheses, and only samples within
+     * 1.5 × [threshold] of it can be selected: scoring every usable sample let a hypothesis through two
+     * points of a neighbouring face win by collecting that face (review round 2, MATH-1).
+     *
      * 1. Hypotheses: the [initial] line plus [TIGHT_ITERATIONS] lines through random pairs (seeded) of the
-     *    samples within [threshold] of it, scored MSAC-style, Σ min((dᵢ / sᵢ)², 2.5²) with sᵢ = bandᵢ / 2.5.
+     *    pool, scored MSAC-style over the pool, Σ min((dᵢ / sᵢ)², 2.5²) with sᵢ = bandᵢ / 2.5.
      *    Unlike a plain count this prefers the line that fits the bulk of the wall tightly over one tilted
      *    to grab a cluster at the edge of the band; and the uniform-band RANSAC line alone can sit in such a
      *    tilted optimum.
      * 2. Up to [REFINE_PASSES] passes of weighted TLS then the along-ray ML fit [LineFit.fitAlongRays] on
      *    the supporting samples (weights 1/σᵢ²), re-selecting them after each pass until stable.
      * 3. Corner clusters the bands still let in are trimmed ([cornerSpur]) and the passes repeated.
+     * 4. Extent, core and lack-of-fit statistics (see [Refined]).
      */
     private fun refine(
         initial: Line2,
@@ -780,23 +1092,27 @@ object WallEstimator {
         viewer: Vec2,
         threshold: Double,
         minInliers: Int,
+        /** Samples this surface may use (null = all): the joint refinement excludes those other surfaces own. */
+        allowed: BooleanArray?,
     ): Refined? {
-        val n = usable.size
         val rays = usable.map { (it - viewer).normalized() }
         val minBand = min(MIN_REFINE_BAND, threshold)
         fun band(line: Line2, i: Int) = (REFINE_BAND_SIGMAS * sigmas[i] * abs(line.normal dot rays[i])).coerceIn(minBand, threshold)
+        val universe = usable.indices.filter {
+            (allowed == null || allowed[it]) && initial.distance(usable[it]) <= REFINE_UNIVERSE_FACTOR * threshold
+        }
         fun select(line: Line2, excluded: Set<Int>): List<Int> =
-            (0 until n).filter { it !in excluded && line.distance(usable[it]) <= band(line, it) }
+            universe.filter { it !in excluded && line.distance(usable[it]) <= band(line, it) }
 
-        // 1) Hypothesis search with the per-sample bands (MSAC score).
-        val pool = (0 until n).filter { initial.distance(usable[it]) <= threshold }
+        // 1) Hypothesis search with the per-sample bands (MSAC score over the pool).
+        val pool = universe.filter { initial.distance(usable[it]) <= threshold }
         if (pool.size < minInliers) return null
         val capCost = REFINE_BAND_SIGMAS * REFINE_BAND_SIGMAS
         var line = initial
         var bestCost = Double.POSITIVE_INFINITY
         fun consider(hypothesis: Line2) {
             var cost = 0.0
-            for (i in 0 until n) {
+            for (i in pool) {
                 val d = hypothesis.distance(usable[i])
                 val z = if (d > threshold) REFINE_BAND_SIGMAS else d / band(hypothesis, i) * REFINE_BAND_SIGMAS
                 cost += min(z * z, capCost)
@@ -843,22 +1159,88 @@ object WallEstimator {
             inliers = inliers.filter { it !in excluded }
             fitPasses()
         }
+
+        // 4) Statistics against the final line.
         var sumSq = 0.0
-        var tMin = Double.POSITIVE_INFINITY
-        var tMax = Double.NEGATIVE_INFINITY
-        for (i in inliers) {
-            val p = usable[i]
-            val d = line.signedDistance(p)
+        val count = inliers.size
+        val ts = DoubleArray(count)
+        val residuals = DoubleArray(count)
+        val perp = DoubleArray(count)
+        for ((k, i) in inliers.withIndex()) {
+            val d = line.signedDistance(usable[i])
             sumSq += d * d
-            val t = line.param(p)
-            if (t < tMin) tMin = t
-            if (t > tMax) tMax = t
+            ts[k] = rayHitParam(line, viewer, usable[i])
+            residuals[k] = d
+            perp[k] = max(sigmas[i] * abs(line.normal dot rays[i]), MIN_PERP_SIGMA)
         }
-        val rayHits = inliers.map { rayHitParam(line, viewer, usable[it]) }.sorted()
+        val sortedTs = ts.sorted()
+        val lo = percentile(sortedTs, EXTENT_LOW)
+        val hi = percentile(sortedTs, EXTENT_HIGH)
+        val widen = (hi - lo) * EXTENT_LOW / (EXTENT_HIGH - EXTENT_LOW)
+        val lof = lackOfFit(ts, residuals, perp)
+        val angles = inliers.map { i -> rays[i] }.let { rs ->
+            val ref = rs.fold(Vec2.ZERO) { a, r -> a + r }.normalized()
+            rs.map { r -> atan2(ref cross r, ref dot r) }.sorted()
+        }
+        val span = percentile(angles, EXTENT_HIGH) - percentile(angles, EXTENT_LOW)
         return Refined(
-            line, inliers.size, sqrt(sumSq / inliers.size), tMin, tMax,
-            percentile(rayHits, NOISE_CORE_LOW), percentile(rayHits, NOISE_CORE_HIGH),
-        )
+            line, count, sqrt(sumSq / count), lo - widen, hi + widen,
+            percentile(sortedTs, NOISE_CORE_LOW), percentile(sortedTs, NOISE_CORE_HIGH),
+            lof[0], lof[1], lof[2],
+        ).also {
+            it.extra = lof
+            it.span = span
+            val meanT = ts.average()
+            it.spread = sqrt(ts.sumOf { t -> (t - meanT) * (t - meanT) } / count)
+        }
+    }
+
+    /**
+     * Lack-of-fit statistics of a fitted line (see [Refined]): (max |z|, |mean residual| (m) and |mean residual|
+     * in expected σ of the bin with that z). [ts] = where each inlier's ray meets the line, [residuals] = its
+     * signed distance from the line, [perp] = its expected perpendicular noise. Zeros when there are too few
+     * samples for [LOF_MIN_BINS] bins.
+     */
+    private fun lackOfFit(ts: DoubleArray, residuals: DoubleArray, perp: DoubleArray): DoubleArray {
+        val n = ts.size
+        val bins = min(LOF_MAX_BINS, n / LOF_MIN_BIN)
+        if (bins < LOF_MIN_BINS) return doubleArrayOf(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        // Measured-to-expected noise ratio of these samples (robust): the bins' standard errors use it.
+        val ratio = (RobustStats.MAD_TO_SIGMA * RobustStats.mad(List(n) { residuals[it] / perp[it] })).takeIf { it > 0 && it.isFinite() } ?: 1.0
+        val order = (0 until n).sortedBy { ts[it] }
+        var bestZ = 0.0
+        var bestDev = 0.0
+        var bestDevSigmas = 0.0
+        var bestZin = 0.0
+        var bestDevIn = 0.0
+        var bestIdx = 0.0
+        for (b in 0 until bins) {
+            val from = b * n / bins
+            val to = (b + 1) * n / bins
+            var sum = 0.0
+            var varSum = 0.0
+            var sigmaSum = 0.0
+            for (k in from until to) {
+                val i = order[k]
+                sum += residuals[i]
+                varSum += perp[i] * perp[i]
+                sigmaSum += perp[i]
+            }
+            val m = to - from
+            if (m <= 0 || !(varSum > 0)) continue
+            val z = abs(sum) / (ratio * sqrt(varSum))
+            if (z > bestZ) {
+                bestZ = z
+                bestDev = abs(sum) / m
+                bestDevSigmas = bestDev / (ratio * sigmaSum / m)
+                bestIdx = b.toDouble() / (bins - 1)
+            }
+            if (b > 0 && b < bins - 1 && z > bestZin) {
+                bestZin = z
+                bestDevIn = abs(sum) / m
+            }
+        }
+        return doubleArrayOf(bestZ, bestDev, bestDevSigmas, bestZin, bestDevIn, bestIdx, ratio)
     }
 
     /**
@@ -919,23 +1301,31 @@ object WallEstimator {
         return sorted[ceil((sorted.size - 1) * q).toInt().coerceIn(0, sorted.lastIndex)]
     }
 
+    /** Robust noise near a line: [sigma] (m, across the line) and [ratio] to the noise the model expects there. */
+    private class Noise(val sigma: Double, val ratio: Double)
+
     /**
-     * Robust noise estimate: 1.4826 · MAD of the signed residuals of the points within [window] of
-     * [line] whose rays meet it within [lo]..[hi] (the wall's core, see [Refined]); 0 when there are
-     * none. Near the span's ends the adjacent walls' samples, smeared along their grazing rays, and range
-     * outliers of the rays that just miss the wall also fall inside the wide window and would read as
+     * Robust noise estimate of the points within [window] of [line] whose rays meet it within [lo]..[hi]
+     * (the wall's core, see [Refined]): 1.4826 · MAD of their signed residuals, and of the residuals divided
+     * by each point's expected noise across the line ([sigmas] along its ray, projected on the normal); zeros
+     * when there are none. Near the span's ends the adjacent walls' samples, smeared along their grazing rays,
+     * and range outliers of the rays that just miss the wall also fall inside the wide window and would read as
      * noise.
      */
-    private fun robustSigmaNear(points: List<Vec2>, line: Line2, window: Double, viewer: Vec2, lo: Double, hi: Double): Double {
+    private fun noiseNear(points: List<Vec2>, sigmas: List<Double>, line: Line2, window: Double, viewer: Vec2, lo: Double, hi: Double): Noise {
         val residuals = ArrayList<Double>()
-        for (p in points) {
+        val normalized = ArrayList<Double>()
+        for ((i, p) in points.withIndex()) {
             val d = line.signedDistance(p)
             if (abs(d) > window) continue
             val t = rayHitParam(line, viewer, p)
-            if (t >= lo && t <= hi) residuals.add(d)
+            if (t < lo || t > hi) continue
+            residuals.add(d)
+            val r = (p - viewer).normalized()
+            normalized.add(d / max(sigmas[i] * abs(line.normal dot r), MIN_PERP_SIGMA))
         }
-        if (residuals.isEmpty()) return 0.0
-        return RobustStats.MAD_TO_SIGMA * RobustStats.mad(residuals)
+        if (residuals.isEmpty()) return Noise(0.0, 0.0)
+        return Noise(RobustStats.MAD_TO_SIGMA * RobustStats.mad(residuals), RobustStats.MAD_TO_SIGMA * RobustStats.mad(normalized))
     }
 
     /**

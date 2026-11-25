@@ -2,9 +2,11 @@ package com.oroplex.floorplan.core.solve
 
 import com.oroplex.floorplan.core.geometry.Polygons
 import com.oroplex.floorplan.core.geometry.RigidTransform2
+import com.oroplex.floorplan.core.geometry.Segment2
 import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.model.CaptureMethod
 import com.oroplex.floorplan.core.model.Floor
+import com.oroplex.floorplan.core.model.HandSetWall
 import com.oroplex.floorplan.core.model.Opening
 import com.oroplex.floorplan.core.model.OpeningType
 import com.oroplex.floorplan.core.model.Room
@@ -12,6 +14,7 @@ import kotlin.math.PI
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNotSame
 import kotlin.test.assertNull
@@ -197,8 +200,11 @@ class RoomOpsTest {
     @Test fun setWallLengthNeverCreatesTinyWalls() {
         // Shortening the L's base to 3.02 m would leave a 2 cm wall whichever side moves: rejected.
         assertSame(lRoom, RoomOps.setWallLength(lRoom, 0, 3.02))
-        // Same length: nothing to do.
-        assertSame(rect, RoomOps.setWallLength(rect, 0, 4.0))
+        // Same length: no corner moves, but the wall is now recorded as tape-checked; a second time is a no-op.
+        val confirmed = RoomOps.setWallLength(rect, 0, 4.0)
+        assertEquals(rect.corners, confirmed.corners)
+        assertEquals(listOf(HandSetWall(Segment2(v(0.0, 0.0), v(4.0, 0.0)), 4.0)), confirmed.handSetWalls)
+        assertSame(confirmed, RoomOps.setWallLength(confirmed, 0, 4.0))
         // A room with a broken corner is left alone.
         val broken = rect.copy(corners = listOf(v(0.0, 0.0), v(4.0, 0.0), v(Double.NaN, 3.0), v(0.0, 3.0)))
         assertSame(broken, RoomOps.setWallLength(broken, 0, 5.0))
@@ -336,6 +342,96 @@ class RoomOpsTest {
         )
         // Chord (0,0)->(4,3) would cut through the U's arm.
         assertSame(u, RoomOps.deleteCorner(u, 1))
+    }
+
+    // ---------------------------------------------------------------- hand-set walls (PREM-9, MATH-8)
+
+    private fun seg(a: Vec2, b: Vec2) = Segment2(a, b)
+
+    @Test fun setWallLengthRecordsTheTypedWallAndTheWallsItMoved() {
+        val r = RoomOps.setWallLength(rect, 0, 4.2)
+        // Wall 0 typed; walls 1 (moved sideways) and 2 (stretched) set by hand; wall 3 untouched.
+        assertEquals(4.2, RoomOps.handSetWallFor(r, 0)?.typedLength)
+        assertNotNull(RoomOps.handSetWallFor(r, 1)).also { assertNull(it.typedLength) }
+        assertNotNull(RoomOps.handSetWallFor(r, 2)).also { assertNull(it.typedLength) }
+        assertNull(RoomOps.handSetWallFor(r, 3))
+        assertEquals(3, r.handSetWalls.size)
+        // A wall that only moved sideways keeps a length typed earlier; a wall whose length changed loses it.
+        val typedRight = RoomOps.setWallLength(rect, 1, 3.0) // confirm the right wall at 3.0 m
+        val stretched = RoomOps.setWallLength(typedRight, 0, 4.2)
+        assertEquals(3.0, RoomOps.handSetWallFor(stretched, 1)?.typedLength, "moved, still 3.0 m")
+        val typedTop = RoomOps.setWallLength(rect, 2, 4.0)
+        assertNull(RoomOps.handSetWallFor(RoomOps.setWallLength(typedTop, 0, 4.2), 2)?.typedLength, "now 4.2 m long")
+        // Typing again replaces the record instead of piling up.
+        val again = RoomOps.setWallLength(r, 0, 4.3)
+        assertEquals(4.3, RoomOps.handSetWallFor(again, 0)?.typedLength)
+        assertEquals(3, again.handSetWalls.size)
+        // Rejected edits change nothing.
+        assertSame(r, RoomOps.setWallLength(r, 0, Double.NaN))
+    }
+
+    @Test fun cornerEditsRecordTheAffectedWalls() {
+        val typed = RoomOps.setWallLength(rect, 0, 4.0) // tape-checked bottom wall
+        // Dragging the top-right corner sets walls 1 and 2 by hand; the bottom wall keeps its tape value.
+        val dragged = RoomOps.moveCorner(typed, 2, v(4.3, 3.2))
+        assertEquals(4.0, RoomOps.handSetWallFor(dragged, 0)?.typedLength)
+        assertNotNull(RoomOps.handSetWallFor(dragged, 1))
+        assertNotNull(RoomOps.handSetWallFor(dragged, 2))
+        assertNull(RoomOps.handSetWallFor(dragged, 3))
+        // Dragging corner 1 moves the bottom wall: its typed length no longer applies.
+        val moved = RoomOps.moveCorner(typed, 1, v(4.2, 0.0))
+        assertNotNull(RoomOps.handSetWallFor(moved, 0)).also { assertNull(it.typedLength) }
+
+        // Insert a corner on the typed wall: both halves are hand-set, neither keeps the 4 m; later walls keep
+        // their records although their indices shifted.
+        val withTop = RoomOps.setWallLength(typed, 2, 4.0)
+        val split = RoomOps.insertCorner(withTop, 0, v(1.5, 0.0))
+        assertEquals(5, split.corners.size)
+        assertNull(RoomOps.handSetWallFor(split, 0)?.typedLength)
+        assertNull(RoomOps.handSetWallFor(split, 1)?.typedLength)
+        assertNotNull(RoomOps.handSetWallFor(split, 0))
+        assertNotNull(RoomOps.handSetWallFor(split, 1))
+        assertEquals(4.0, RoomOps.handSetWallFor(split, 3)?.typedLength, "the top wall is now edge 3")
+        assertEquals(3, split.handSetWalls.size, "the 4 m record of the split wall is pruned")
+
+        // Delete the inserted corner again: the merged wall is hand-set, the halves' records are pruned.
+        val merged = RoomOps.deleteCorner(split, 1)
+        assertEquals(4, merged.corners.size)
+        assertNotNull(RoomOps.handSetWallFor(merged, 0))
+        assertEquals(4.0, RoomOps.handSetWallFor(merged, 2)?.typedLength)
+        assertEquals(2, merged.handSetWalls.size)
+        // Every record matches a current edge.
+        for (r in listOf(dragged, moved, split, merged)) {
+            assertTrue(r.handSetWalls.all { h -> r.corners.indices.any { RoomOps.matchesHandSet(r.corners, it, h) } })
+        }
+    }
+
+    @Test fun transformCarriesAndResolveClearsHandSetWalls() {
+        val walls = wallsRoom.let { RoomOps.setWallLength(it, 0, 4.1) }
+        assertTrue(walls.handSetWalls.isNotEmpty())
+        val t = RigidTransform2(0.6, v(2.0, -1.0))
+        val moved = RoomOps.transform(walls, t)
+        assertEquals(4.1, RoomOps.handSetWallFor(moved, 0)?.typedLength)
+        assertEquals(walls.handSetWalls.size, moved.handSetWalls.size)
+        assertTrue(RoomOps.resolve(moved, SolverOptions()).handSetWalls.isEmpty(), "a re-solve restores the scan")
+    }
+
+    @Test fun handSetMatchingRule() {
+        val h = HandSetWall(seg(v(0.0, 0.0), v(4.0, 0.0)), 4.0)
+        fun edge(a: Vec2, b: Vec2) = RoomOps.matchesHandSet(listOf(a, b, v(2.0, 5.0)), 0, h)
+        assertTrue(edge(v(0.0, 0.0), v(4.0, 0.0)))
+        assertTrue(edge(v(4.0, 0.0), v(0.0, 0.0)), "either direction")
+        assertTrue(edge(v(0.0, 0.14), v(4.0, 0.14)), "within 15 cm")
+        assertFalse(edge(v(0.0, 0.16), v(4.0, 0.16)), "beyond 15 cm")
+        val turn14 = Vec2.fromAngle(Math.toRadians(14.0)) * 2.0
+        assertTrue(edge(v(2.0, 0.0) - turn14, v(2.0, 0.0) + turn14), "parallel within 15°")
+        val turn16 = Vec2.fromAngle(Math.toRadians(16.0)) * 2.0
+        assertFalse(edge(v(2.0, 0.0) - turn16, v(2.0, 0.0) + turn16))
+        assertFalse(edge(v(5.0, 0.0), v(7.0, 0.0)), "midpoint beyond the wall's extent")
+        assertFalse(RoomOps.matchesHandSet(listOf(v(0.0, 0.0)), 0, h))
+        assertFalse(RoomOps.matchesHandSet(listOf(v(0.0, 0.0), v(Double.NaN, 0.0)), 0, h))
+        assertNull(RoomOps.handSetWallFor(rect, 0))
+        assertNull(RoomOps.handSetWallFor(rect.copy(handSetWalls = listOf(h)), 7))
     }
 
     // ---------------------------------------------------------------- transform / scale

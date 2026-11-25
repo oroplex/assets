@@ -26,6 +26,9 @@ import kotlin.test.assertTrue
 class OverallDimensionsTest {
     private val box = room("a", rect(0.0, 0.0, 4.0, 3.0))
 
+    /** Default exterior wall thickness (6.5"): overall dimensions measure to the outside of walls this thick. */
+    private val e: Double = PlanGeometry.exteriorWallThickness(withDimensions)
+
     private fun dims(dl: DrawList, kind: String) = dl.ops.filter { it.tag == "dimension:$kind" }
     private fun lines(dl: DrawList, kind: String) = dims(dl, kind).filterIsInstance<DrawOp.Polyline>()
     private fun label(dl: DrawList, kind: String) = dims(dl, kind).filterIsInstance<DrawOp.Text>().single()
@@ -48,8 +51,8 @@ class OverallDimensionsTest {
         val dl = PlanRenderer.render(listOf(box), withDimensions)
         val width = label(dl, "width")
         val depth = label(dl, "depth")
-        assertEquals(Units.formatLength(4.0 + 2 * t, UnitSystem.IMPERIAL), width.text)
-        assertEquals(Units.formatLength(3.0 + 2 * t, UnitSystem.IMPERIAL), depth.text)
+        assertEquals(Units.formatLength(4.0 + 2 * e, UnitSystem.IMPERIAL), width.text)
+        assertEquals(Units.formatLength(3.0 + 2 * e, UnitSystem.IMPERIAL), depth.text)
         for (l in listOf(width, depth)) {
             assertTrue(l.bold)
             assertNear(8.0, l.sizePt)
@@ -58,7 +61,7 @@ class OverallDimensionsTest {
             assertEquals(TextAlign.CENTER, l.align)
         }
         val metric = PlanRenderer.render(listOf(box), withDimensions.copy(unitSystem = UnitSystem.METRIC))
-        assertEquals("4.23 m", label(metric, "width").text)
+        assertEquals("4.33 m", label(metric, "width").text)
         // Text scale applies to the labels.
         assertNear(6.4, label(PlanRenderer.render(listOf(box), withDimensions, RenderOptions(textScale = 0.8)), "width").sizePt)
     }
@@ -69,30 +72,30 @@ class OverallDimensionsTest {
         val d = mainLine(dl, "depth")
         // Width: horizontal, spanning the outer faces, above the top wall band.
         assertNear(w.points[0].y, w.points[1].y)
-        assertNear(-t, minOf(w.points[0].x, w.points[1].x))
-        assertNear(4 + t, maxOf(w.points[0].x, w.points[1].x))
+        assertNear(-e, minOf(w.points[0].x, w.points[1].x))
+        assertNear(4 + e, maxOf(w.points[0].x, w.points[1].x))
         val y = w.points[0].y
-        assertTrue(y > 3 + t + 0.1, "clear of the wall band: $y")
+        assertTrue(y > 3 + e + 0.1, "clear of the wall band: $y")
         // Depth: vertical, left of the left wall band.
         assertNear(d.points[0].x, d.points[1].x)
-        assertNear(-t, minOf(d.points[0].y, d.points[1].y))
-        assertNear(3 + t, maxOf(d.points[0].y, d.points[1].y))
+        assertNear(-e, minOf(d.points[0].y, d.points[1].y))
+        assertNear(3 + e, maxOf(d.points[0].y, d.points[1].y))
         val x = d.points[0].x
-        assertTrue(x < -t - 0.1, "clear of the wall band: $x")
+        assertTrue(x < -e - 0.1, "clear of the wall band: $x")
         // Offset ~24 pt at the nominal page scale.
-        assertNear(24.0 * (4 + 2 * t) / OverallDimensions.NOMINAL_PLAN_PT, y - (3 + t), 1e-9)
+        assertNear(24.0 * (4 + 2 * t) / OverallDimensions.NOMINAL_PLAN_PT, y - (3 + e), 1e-9)
 
         // Two extension lines per dimension, perpendicular to it, from just off the building to past the line.
         val wExt = lines(dl, "width").filter { it.widthPt == 0.5 }
         assertEquals(2, wExt.size)
-        for (e in wExt) {
-            assertNear(e.points[0].x, e.points[1].x)
-            val lo = minOf(e.points[0].y, e.points[1].y)
-            val hi = maxOf(e.points[0].y, e.points[1].y)
-            assertTrue(lo > 3 + t && lo < y, "starts off the building")
+        for (ext in wExt) {
+            assertNear(ext.points[0].x, ext.points[1].x)
+            val lo = minOf(ext.points[0].y, ext.points[1].y)
+            val hi = maxOf(ext.points[0].y, ext.points[1].y)
+            assertTrue(lo > 3 + e && lo < y, "starts off the outer face")
             assertTrue(hi > y, "runs past the dimension line")
         }
-        assertEquals(setOf(-t, 4 + t).map { "%.9f".format(it) }.toSet(), wExt.map { "%.9f".format(it.points[0].x) }.toSet())
+        assertEquals(setOf(-e, 4 + e).map { "%.9f".format(it) }.toSet(), wExt.map { "%.9f".format(it.points[0].x) }.toSet())
         // 45° slashes centered on both ends of each line.
         for (kind in listOf("width", "depth")) {
             val main = mainLine(dl, kind)
@@ -139,7 +142,7 @@ class OverallDimensionsTest {
         }
         val plain = PlanRenderer.render(listOf(box), settings).bounds
         assertTrue(dl.bounds.minX < plain.minX && dl.bounds.maxY > plain.maxY)
-        assertNear(plain.maxX, dl.bounds.maxX, 0.05)
+        assertNear(4 + e, dl.bounds.maxX, 0.05)
         // An SVG of it keeps every dimension on the page.
         val svg = SvgExporter.export(dl, 612.0, 792.0)
         assertTrue(svg.contains("<polyline"))
@@ -150,11 +153,11 @@ class OverallDimensionsTest {
         val turn = RigidTransform2.rotationAround(Vec2(2.0, 1.5), PI / 6)
         val tilted = RoomOps.transform(box, turn)
         val dl = PlanRenderer.render(listOf(tilted), withDimensions)
-        assertEquals(Units.formatLength(4.0 + 2 * t, UnitSystem.IMPERIAL), label(dl, "width").text)
-        assertEquals(Units.formatLength(3.0 + 2 * t, UnitSystem.IMPERIAL), label(dl, "depth").text)
+        assertEquals(Units.formatLength(4.0 + 2 * e, UnitSystem.IMPERIAL), label(dl, "width").text)
+        assertEquals(Units.formatLength(3.0 + 2 * e, UnitSystem.IMPERIAL), label(dl, "depth").text)
         val w = mainLine(dl, "width")
         assertNear(PI / 6, (w.points[1] - w.points[0]).angle(), 1e-9)
-        assertNear(4.0 + 2 * t, w.points[0].distanceTo(w.points[1]), 1e-9)
+        assertNear(4.0 + 2 * e, w.points[0].distanceTo(w.points[1]), 1e-9)
         assertNear(PI / 6, label(dl, "width").angle, 1e-9)
         // Tilted 60°: still dimensioned along the walls, the more horizontal direction is the "width".
         val steep = RoomOps.transform(box, RigidTransform2.rotationAround(Vec2(2.0, 1.5), PI / 3))
@@ -170,20 +173,22 @@ class OverallDimensionsTest {
         val ext = lines(dl, "width").filter { it.widthPt == 0.5 }
         val right = ext.single { it.points[0].x > 3.0 }
         val left = ext.single { it.points[0].x < 3.0 }
-        assertTrue(minOf(right.points[0].y, right.points[1].y) < 3 + t + 0.1, "right one starts at the 3 m arm")
-        assertTrue(minOf(left.points[0].y, left.points[1].y) > 5 + t, "left one starts above the 5 m wall")
+        assertTrue(minOf(right.points[0].y, right.points[1].y) < 3 + e + 0.1, "right one starts at the 3 m arm")
+        assertTrue(minOf(left.points[0].y, left.points[1].y) > 5 + e, "left one starts above the 5 m wall")
         assertTrue(maxOf(right.points[0].y, right.points[1].y) > y)
-        assertEquals(Units.formatLength(6.0 + 2 * t, UnitSystem.IMPERIAL), label(dl, "width").text)
-        assertEquals(Units.formatLength(5.0 + 2 * t, UnitSystem.IMPERIAL), label(dl, "depth").text)
+        assertEquals(Units.formatLength(6.0 + 2 * e, UnitSystem.IMPERIAL), label(dl, "width").text)
+        assertEquals(Units.formatLength(5.0 + 2 * e, UnitSystem.IMPERIAL), label(dl, "depth").text)
     }
 
     @Test fun wholeSampleHouseAndOrdering() {
         val sample = SampleProjects.demo(1L)
         val rooms = sample.floors.first().rooms
         val dl = PlanRenderer.render(rooms, sample.settings, RenderOptions(selectedRoomId = rooms[1].id, highlightRoomIds = setOf(rooms[2].id)))
-        val band = Bounds.of(rooms.flatMap { Polygons.offset(it.corners, sample.settings.wallThickness) })
-        assertEquals(Units.formatLength(band.width, UnitSystem.IMPERIAL), label(dl, "width").text)
-        assertEquals(Units.formatLength(band.height, UnitSystem.IMPERIAL), label(dl, "depth").text)
+        // Interior extents plus one exterior wall on each side.
+        val inner = Bounds.of(rooms.flatMap { it.corners })
+        val ext = PlanGeometry.exteriorWallThickness(sample.settings)
+        assertEquals(Units.formatLength(inner.width + 2 * ext, UnitSystem.IMPERIAL), label(dl, "width").text)
+        assertEquals(Units.formatLength(inner.height + 2 * ext, UnitSystem.IMPERIAL), label(dl, "depth").text)
         // Order: selection highlight < warning highlight < dimension lines < dimension labels < room labels.
         val ops = dl.ops
         val selection = ops.indexOfFirst { it is DrawOp.Polyline && it.color == PlanColors.SELECTION }
@@ -245,6 +250,65 @@ class OverallDimensionsTest {
             assertTrue(pts.all { (x, y) -> x in 0.0..792.0 && y in 0.0..612.0 })
         }
         assertTrue(texts.any { it.textContent == "Sample \"House\" <Main> & Co" })
+    }
+
+    @Test fun measuresToTheOutsideOfTheExteriorWalls() {
+        // MATH-9: a house 12.00 m wide inside with 0.30 m exterior walls is 12.60 m outside.
+        val house = room("h", rect(0.0, 0.0, 12.0, 8.0))
+        val thick = withDimensions.copy(unitSystem = UnitSystem.METRIC, exteriorWallThickness = 0.30)
+        val dl = PlanRenderer.render(listOf(house), thick)
+        assertEquals("12.60 m", label(dl, "width").text)
+        assertEquals("8.60 m", label(dl, "depth").text)
+        val w = mainLine(dl, "width")
+        assertNear(-0.30, minOf(w.points[0].x, w.points[1].x))
+        assertNear(12.30, maxOf(w.points[0].x, w.points[1].x))
+        // The drawn wall bands stay at the interior thickness (it is also the snapping gap).
+        val band = dl.opsOf<DrawOp.FillPolygon>().first { it.color == PlanColors.WALL }
+        assertNear(-t, band.points.minOf { it.x }, 1e-9)
+        // null: measure with the interior wall thickness; 0: the interior extents; bad numbers fall back too.
+        val metric = withDimensions.copy(unitSystem = UnitSystem.METRIC)
+        assertEquals("12.23 m", label(PlanRenderer.render(listOf(house), metric.copy(exteriorWallThickness = null)), "width").text)
+        assertEquals("12.00 m", label(PlanRenderer.render(listOf(house), metric.copy(exteriorWallThickness = 0.0)), "width").text)
+        for (bad in listOf(Double.NaN, -0.1, Double.POSITIVE_INFINITY)) {
+            assertEquals("12.23 m", label(PlanRenderer.render(listOf(house), metric.copy(exteriorWallThickness = bad)), "width").text, "$bad")
+        }
+        // The default is 6.5".
+        assertNear(0.1651, e, 1e-12)
+    }
+
+    @Test fun pointsPerMeterSizesTheDimensionsAtTheOutputScale() {
+        // 1:50 on paper is 72 / 0.0254 / 50 ≈ 56.7 pt per plan meter.
+        val ppm = 72 / 0.0254 / 50
+        val dl = PlanRenderer.render(listOf(box), withDimensions, RenderOptions(pointsPerMeter = ppm))
+        val w = mainLine(dl, "width")
+        // 24 pt offset from the outer face, at exactly that scale.
+        assertNear(24.0 / ppm, w.points[0].y - (3 + e), 1e-9)
+        val d = mainLine(dl, "depth")
+        assertNear(-24.0 / ppm, d.points[0].x + e, 1e-9)
+        // Ticks are 8 pt long.
+        val tick = lines(dl, "width").first { it.widthPt == 1.0 }
+        assertNear(8.0 / ppm, tick.points[0].distanceTo(tick.points[1]), 1e-9)
+        // Extension lines start 3 pt off the outer face and overshoot the line by 3 pt.
+        val ext = lines(dl, "width").filter { it.widthPt == 0.5 }
+        for (x in ext) {
+            assertNear(3 + e + 3.0 / ppm, minOf(x.points[0].y, x.points[1].y), 1e-9)
+            assertNear(w.points[0].y + 3.0 / ppm, maxOf(x.points[0].y, x.points[1].y), 1e-9)
+        }
+        // A smaller output scale moves the line farther out in plan meters (it stays 24 pt on paper).
+        val small = mainLine(PlanRenderer.render(listOf(box), withDimensions, RenderOptions(pointsPerMeter = ppm / 2)), "width")
+        assertNear(48.0 / ppm, small.points[0].y - (3 + e), 1e-9)
+        // Text scale still applies on top.
+        val scaled = mainLine(PlanRenderer.render(listOf(box), withDimensions, RenderOptions(pointsPerMeter = ppm, textScale = 0.5)), "width")
+        assertNear(12.0 / ppm, scaled.points[0].y - (3 + e), 1e-9)
+        // Unusable scales fall back to the nominal fit-to-page scale.
+        val nominal = mainLine(PlanRenderer.render(listOf(box), withDimensions), "width").points[0].y
+        for (bad in listOf(0.0, -10.0, Double.NaN, Double.POSITIVE_INFINITY)) {
+            assertNear(nominal, mainLine(PlanRenderer.render(listOf(box), withDimensions, RenderOptions(pointsPerMeter = bad)), "width").points[0].y, 1e-12, "$bad")
+        }
+        // The bounds cover the label box at that scale.
+        val widthLabel = label(dl, "width")
+        val top = widthLabel.anchor.y + (widthLabel.offsetPt.y + widthLabel.sizePt / 2) / ppm
+        assertTrue(dl.bounds.maxY >= top - 1e-9, "${dl.bounds.maxY} >= $top")
     }
 
     private fun DrawOp.colorOrNull(): Int? = when (this) {

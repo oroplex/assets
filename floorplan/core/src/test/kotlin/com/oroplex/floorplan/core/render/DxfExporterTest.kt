@@ -5,6 +5,7 @@ import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.io.SampleProjects
 import com.oroplex.floorplan.core.model.DoorSwing
 import com.oroplex.floorplan.core.model.OpeningType
+import com.oroplex.floorplan.core.model.RoomType
 import com.oroplex.floorplan.core.model.UnitSystem
 import com.oroplex.floorplan.core.render.Fixtures.opening
 import com.oroplex.floorplan.core.render.Fixtures.rect
@@ -171,14 +172,16 @@ class DxfExporterTest {
         // Per dimension: the line, two extension lines and two ticks, plus its label.
         assertEquals(10, dims.count { it.type == "LINE" })
         val labels = dims.filter { it.type == "TEXT" }
-        assertEquals(listOf("4.23 m", "3.23 m"), labels.map { it.first(1) })
+        // To the outside of the 6.5" exterior walls: 4 m + 2 x 0.1651 m.
+        assertEquals(listOf("4.33 m", "3.33 m"), labels.map { it.first(1) })
         assertTrue(labels.all { it.double(40) > 0 && it.first(72) == "1" && it.first(73) == "2" })
         assertNear(0.0, labels[0].double(50), 1e-9)
         assertNear(90.0, labels[1].double(50), 1e-9)
-        // The width line is horizontal, above the top wall band (y in mm), and spans the outer faces.
+        // The width line is horizontal, above the top wall (y in mm), and spans the outer faces of the exterior walls.
+        val e = PlanGeometry.exteriorWallThickness(metric)
         val lines = dims.filter { it.type == "LINE" }
-        val widthLine = lines.single { abs(it.double(20) - it.double(21)) < 1e-6 && abs(abs(it.double(11) - it.double(10)) - (4 + 2 * t) * 1000) < 1e-3 }
-        assertTrue(widthLine.double(20) > (3 + t) * 1000)
+        val widthLine = lines.single { abs(it.double(20) - it.double(21)) < 1e-6 && abs(abs(it.double(11) - it.double(10)) - (4 + 2 * e) * 1000) < 1e-3 }
+        assertTrue(widthLine.double(20) > (3 + e) * 1000)
         // The header extents include the dimensions.
         val hdr = records.first().groups
         val extMax = hdr.indexOfFirst { it.value == "\$EXTMAX" }
@@ -186,6 +189,37 @@ class DxfExporterTest {
         // Off in the settings: no dimension entities (the layer is still defined).
         val off = section(records(parse(DxfExporter.export(listOf(r), settings.copy(unitSystem = UnitSystem.METRIC)))), "ENTITIES")
         assertTrue(off.none { it.groups.any { g -> g.code == 8 && g.value == "DIMENSIONS" } })
+    }
+
+    @Test fun exportSwitchesOverrideTheProjectSettings() {
+        // SEAM-3: the export screen's "Overall dimensions" switch reaches the DXF file.
+        val r = room("a", rect(0.0, 0.0, 4.0, 3.0))
+        fun dimensionEntities(dxf: String) =
+            section(records(parse(dxf)), "ENTITIES").filter { it.groups.any { g -> g.code == 8 && g.value == "DIMENSIONS" } }
+        val switchedOff = DxfExporter.export(listOf(r), Fixtures.withDimensions, showOverallDimensions = false)
+        assertTrue(dimensionEntities(switchedOff).isEmpty(), "no DIMENSIONS entities when the switch is off")
+        assertTrue(section(records(parse(switchedOff)), "TABLES").any { it.type == "LAYER" && it.first(2) == "DIMENSIONS" }, "layer still declared")
+        val switchedOn = DxfExporter.export(listOf(r), settings, showOverallDimensions = true)
+        assertEquals(10, dimensionEntities(switchedOn).count { it.type == "LINE" })
+        // The same for room areas: the switch, not the project setting, decides whether the TEXT layer shows them.
+        fun texts(dxf: String) = section(records(parse(dxf)), "ENTITIES").filter { it.type == "TEXT" && "TEXT" in it.all(8) }.map { it.first(1) }
+        val metric = settings.copy(unitSystem = UnitSystem.METRIC)
+        assertTrue(texts(DxfExporter.export(listOf(r), metric, showAreas = true)).any { it.endsWith("m2") })
+        assertTrue(texts(DxfExporter.export(listOf(r), metric, showAreas = false)).none { it.endsWith("m2") })
+        // Defaults follow the settings.
+        assertEquals(DxfExporter.export(listOf(r), metric), DxfExporter.export(listOf(r), metric, showAreas = metric.showRoomAreas))
+    }
+
+    @Test fun stairRoomsGetTheirSymbolOnTheStairsLayer() {
+        val stairs = room("s", rect(0.0, 0.0, 1.0, 3.0)).copy(type = RoomType.STAIRS)
+        val records = records(parse(DxfExporter.export(listOf(stairs), settings)))
+        assertTrue(section(records, "TABLES").any { it.type == "LAYER" && it.first(2) == DxfExporter.LAYER_STAIRS })
+        val lines = section(records, "ENTITIES").filter { it.type == "LINE" && DxfExporter.LAYER_STAIRS in it.all(8) }
+        // 3 m run at ~0.27 m: 11 treads -> 10 inner tread lines, plus the arrow shaft and its two head strokes.
+        assertEquals(10 + 1 + 2, lines.size)
+        // Other rooms get none.
+        val plain = records(parse(DxfExporter.export(listOf(stairs.copy(type = RoomType.HALLWAY)), settings)))
+        assertTrue(section(plain, "ENTITIES").none { DxfExporter.LAYER_STAIRS in it.all(8) })
     }
 
     @Test fun textIsAsciiSafe() {

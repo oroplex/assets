@@ -80,8 +80,12 @@ class FloorOpsTest {
         b.cornerTaps.forEachIndexed { i, p -> assertVecEquals(scaledAbout(origin, factor, bath.cornerTaps[i]), p, 1e-12) }
         assertEquals(2.4384, b.ceilingHeight)
         assertTrue(b.ceilingEstimated)
-        // The drawn closet keeps its typed size exactly.
-        assertSame(closet, c.room("closet"))
+        // The drawn closet keeps its typed size exactly, but stays snapped to both scanned neighbours.
+        val k = c.room("closet")
+        assertSameShape(closet.corners, k.corners)
+        assertEquals(T, k.corners[0].x - l.corners[1].x, 1e-9, "one wall from the living room")
+        assertEquals(T, k.corners[0].y - b.corners[2].y, 1e-9, "one wall from the bath")
+        assertEquals(closet.ceilingHeight, k.ceilingHeight)
     }
 
     @Test fun calibrateRefusesDrawnRooms() {
@@ -103,7 +107,10 @@ class FloorOpsTest {
             twice.room(raw.id).corners.forEachIndexed { i, p -> assertVecEquals(scaledAbout(origin, total, raw.corners[i]), p, 1e-12) }
         }
         assertEquals(2.1, twice.room("bath").let { it.corners[1].distanceTo(it.corners[2]) }, 1e-12)
-        assertSame(closet, twice.room("closet"))
+        val k = twice.room("closet")
+        assertSameShape(closet.corners, k.corners)
+        assertEquals(T, k.corners[0].x - twice.room("living").corners[1].x, 1e-9)
+        assertEquals(T, k.corners[0].y - twice.room("bath").corners[2].y, 1e-9)
     }
 
     @Test fun applyCalibrationScalesALaterScanLikeItsNeighbours() {
@@ -145,6 +152,190 @@ class FloorOpsTest {
     }
 
     private fun cal(factor: Double) = Calibration(factor, "living", 0, 5.0, 5.0 * factor, 1L, Vec2(1.0, 1.0))
+
+    // ---------------------------------------------------------------- calibration provenance (SEAM-5, MATH-8, APPX-2)
+
+    @Test fun typedAndEstimatedCeilingsKeepTheirValues() {
+        val typed = living.copy(ceilingHeight = 2.70, ceilingTyped = true)
+        val c = FloorOps.calibrate(floor(typed, bath), "living", 0, 5.15, now = 1L)
+        assertEquals(2.70, c.room("living").ceilingHeight, "a tape-typed ceiling is not rescaled")
+        assertTrue(c.room("living").ceilingTyped)
+        assertEquals(2.4384, c.room("bath").ceilingHeight, "an estimated ceiling is not rescaled")
+        // A measured (AR) ceiling is.
+        assertEquals(2.4 * 1.03, assertNotNull(FloorOps.calibrate(floor(living, bath), "living", 0, 5.15, 1L).room("living").ceilingHeight), 1e-12)
+    }
+
+    @Test fun typedOpeningsKeepTheirWidthAndMoveWithTheirWall() {
+        val typedDoor = door("td", 0, 1.0, width = 0.8128).copy(typed = true)
+        val arDoor = door("ad", 2, 2.0, width = 0.9)
+        val room = living.copy(openings = listOf(typedDoor, arDoor))
+        val f = 1.03
+        val c = FloorOps.calibrate(floor(room, bath), "living", 0, 5.0 * f, now = 1L).room("living")
+        val td = c.openings.single { it.id == "td" }
+        // The 32" door stays 32"; its centre keeps its place along the scaled wall.
+        assertEquals(0.8128, td.width, 0.0)
+        assertEquals((1.0 + 0.8128 / 2) * f, td.offset + td.width / 2, 1e-12)
+        assertTrue(td.typed)
+        // An AR-marked opening scales with the wall.
+        val ad = c.openings.single { it.id == "ad" }
+        assertEquals(0.9 * f, ad.width, 1e-12)
+        assertEquals(2.0 * f, ad.offset, 1e-12)
+        // A typed opening at the very end of a wall that shrinks stays inside it.
+        val atEnd = living.copy(openings = listOf(door("e", 0, 5.0 - 0.8128, 0.8128).copy(typed = true)))
+        val shrunk = FloorOps.calibrate(floor(atEnd, bath), "living", 0, 4.85, now = 1L).room("living")
+        val e = shrunk.openings.single()
+        assertEquals(0.8128, e.width, 0.0)
+        assertTrue(e.offset + e.width <= shrunk.corners[0].distanceTo(shrunk.corners[1]) + 1e-9)
+    }
+
+    @Test fun typedWallLengthsSurviveCalibration() {
+        // The user tapes the bedroom's south wall at 3.500 m, then calibrates the floor from the living room (x1.02).
+        val bedroom = scanned("bed", rect(5.0 + T, 0.0, 8.6, 3.0), name = "Bedroom")
+        val typed = RoomOps.setWallLength(bedroom, 0, 3.5)
+        assertEquals(3.5, typed.corners[0].distanceTo(typed.corners[1]), 1e-12)
+        val c = FloorOps.calibrate(floor(living, typed), "living", 0, 5.1, now = 1L)
+        val bed = c.room("bed")
+        assertEquals(3.5, bed.corners[0].distanceTo(bed.corners[1]), 1e-9, "the tape value is kept")
+        assertEquals(3.0 * 1.02, bed.corners[1].distanceTo(bed.corners[2]), 1e-9, "AR walls are scaled")
+        assertEquals(3.5, RoomOps.handSetWallFor(bed, 0)?.typedLength)
+        assertTrue(Polygons.isCounterClockwise(bed.corners))
+        // Two typed walls at right angles both survive (indices are found before either is restored).
+        val both = RoomOps.setWallLength(typed, 1, 2.9)
+        val c2 = FloorOps.calibrate(floor(living, both), "living", 0, 5.1, now = 1L).room("bed")
+        assertEquals(3.5, c2.corners[0].distanceTo(c2.corners[1]), 1e-9)
+        assertEquals(2.9, c2.corners[1].distanceTo(c2.corners[2]), 1e-9)
+        assertEquals(3.5, RoomOps.handSetWallFor(c2, 0)?.typedLength)
+        assertEquals(2.9, RoomOps.handSetWallFor(c2, 1)?.typedLength)
+        // Calibrating from the typed wall itself: the new tape value wins on that wall (restoring must not undo it).
+        val self = FloorOps.calibrate(floor(living, typed), "bed", 0, 3.55, now = 1L).room("bed")
+        assertEquals(3.55, self.corners[0].distanceTo(self.corners[1]), 1e-9)
+        assertEquals(3.55, RoomOps.handSetWallFor(self, 0)?.typedLength)
+        // And a later room calibrated on arrival (applyCalibration) follows the same rule.
+        val calibrated = FloorOps.calibrate(floor(living), "living", 0, 5.1, now = 1L)
+        val arriving = FloorOps.applyCalibration(calibrated, typed.copy(ceilingHeight = 2.5, ceilingTyped = true))
+        assertEquals(3.5, arriving.corners[0].distanceTo(arriving.corners[1]), 1e-9)
+        assertEquals(2.5, arriving.ceilingHeight)
+    }
+
+    // ---------------------------------------------------------------- drawn rooms under calibration (SEAM-6, APPX-3)
+
+    @Test fun drawnRoomsMoveWithTheScaledPlanAndStaySnapped() {
+        // A scanned bedroom 6 m from the floor centre and a drawn closet snapped to its east wall.
+        val west = scanned("w", rect(-7.0, -2.0, -3.0, 2.0), name = "West")
+        val bed = scanned("bed", rect(3.0, -2.0, 6.0, 2.0), name = "Bedroom")
+        val drawnCloset = drawn("c", rect(6.0 + T, 0.2, 6.0 + T + 0.9, 1.4), name = "Closet")
+        val f0 = floor(west, bed, drawnCloset)
+        for (factor in listOf(1.03, 0.97)) {
+            val c = FloorOps.calibrate(f0, "bed", 1, 4.0 * factor, now = 1L)
+            val b = c.room("bed")
+            val k = c.room("c")
+            assertSameShape(drawnCloset.corners, k.corners)
+            assertEquals(T, k.corners[0].x - b.corners[1].x, 1e-9, "x$factor: still one wall thickness from the bedroom")
+            assertTrue(FloorChecks.overlappingRooms(c).isEmpty(), "x$factor: no overlap")
+            // It moved along the wall with the plan too (its centre keeps its relative place).
+            val origin = assertNotNull(c.calibration).origin
+            val before = Polygons.centroid(drawnCloset.corners)
+            assertEquals(origin.y + (before.y - origin.y) * factor, Polygons.centroid(k.corners).y, 1e-9)
+        }
+        // A drawn room attached to nothing just moves with the plan: by (f - 1) x (centroid - origin).
+        val shed = drawn("shed", rect(20.0, 10.0, 22.0, 12.0), name = "Shed")
+        val c = FloorOps.calibrate(floor(west, bed, shed), "bed", 1, 4.12, now = 1L)
+        val origin = assertNotNull(c.calibration).origin
+        val centroid = Polygons.centroid(shed.corners)
+        val expected = origin + (centroid - origin) * 1.03
+        assertVecEquals(expected, Polygons.centroid(c.room("shed").corners), 1e-9)
+        assertSameShape(shed.corners, c.room("shed").corners)
+    }
+
+    @Test fun chainsOfDrawnRoomsStayTogether() {
+        // Bedroom (scanned) <- drawn closet <- drawn shelf alcove snapped to the closet.
+        val bed = scanned("bed", rect(3.0, -2.0, 6.0, 2.0), name = "Bedroom")
+        val other = scanned("o", rect(-6.0, -2.0, -2.0, 2.0), name = "Other")
+        val closet = drawn("c", rect(6.0 + T, -0.6, 7.0, 0.6), name = "Closet")
+        val alcove = drawn("a", rect(7.0 + T, -0.4, 7.6, 0.4), name = "Alcove")
+        val c = FloorOps.calibrate(floor(other, bed, closet, alcove), "bed", 1, 4.12, now = 1L)
+        assertEquals(T, c.room("c").corners[0].x - c.room("bed").corners[1].x, 1e-9)
+        assertEquals(T, c.room("a").corners[0].x - c.room("c").corners[1].x, 1e-9)
+        assertSameShape(alcove.corners, c.room("a").corners)
+    }
+
+    // ---------------------------------------------------------------- placement frames
+
+    private val sessionRooms = listOf(
+        scanned("b1", rect(0.0, 0.0, 3.0, 3.0), session = "s2"),
+        scanned("b2", rect(3.0 + T, 0.0, 6.0, 3.0), session = "s2"),
+        scanned("b3", rect(6.0 + 2 * T, 0.0, 9.0, 3.0), session = "s2"),
+    )
+
+    @Test fun movingOneRoomOfAScanAloneLeavesItsFrame() {
+        val f = floor(*sessionRooms.toTypedArray())
+        val shift = RigidTransform2(0.0, v(0.0, 1.0))
+        val one = FloorOps.transformRooms(f, setOf("b2"), shift)
+        assertEquals("b2", one.room("b2").frameId)
+        assertNull(one.room("b1").frameId)
+        assertNull(one.room("b3").frameId)
+        // Two of three moved together share a new frame of their own.
+        val two = FloorOps.transformRooms(f, setOf("b1", "b2"), shift)
+        assertEquals("frame:b1", two.room("b1").frameId)
+        assertEquals("frame:b1", two.room("b2").frameId)
+        assertNull(two.room("b3").frameId)
+        // The whole scan moved as one keeps its frame.
+        val all = FloorOps.transformRooms(f, setOf("b1", "b2", "b3"), shift)
+        assertTrue(all.rooms.all { it.frameId == null })
+        assertVecEquals(v(0.0, 1.0), all.room("b1").corners[0])
+        // Moving b2 alone again from its own frame keeps it; the identity and unknown ids change nothing.
+        assertEquals("b2", FloorOps.transformRooms(one, setOf("b2"), shift).room("b2").frameId)
+        assertSame(f, FloorOps.transformRooms(f, setOf("b2"), RigidTransform2.IDENTITY))
+        assertSame(f, FloorOps.transformRooms(f, setOf("zzz"), shift))
+        assertSame(f, FloorOps.transformRooms(f, emptySet(), shift))
+    }
+
+    @Test fun snappingOneRoomOfAScanLeavesItsFrameButAGroupSnapKeepsIt() {
+        // A second scan of three rooms (not touching each other), its first room 30 cm from the kitchen.
+        val kitchen = scanned("k", rect(-4.0, 0.0, -0.3, 3.0), name = "Kitchen", session = "s1")
+        val scan = listOf(
+            scanned("b1", rect(0.0, 0.0, 3.0, 3.0), session = "s2"),
+            scanned("b2", rect(0.0, 5.0, 3.0, 8.0), session = "s2"),
+            scanned("b3", rect(5.0, 5.0, 8.0, 8.0), session = "s2"),
+        )
+        val f = floor(kitchen, *scan.toTypedArray())
+        val single = assertNotNull(FloorOps.snapRoom(f, "b1", T))
+        assertEquals(-0.3 + T, single.room("b1").corners[0].x, 1e-9)
+        assertEquals("b1", single.room("b1").frameId)
+        assertNull(single.room("b2").frameId)
+        assertSame(f.room("b2"), single.room("b2"))
+        val group = assertNotNull(FloorOps.snapGroup(f, "b1", setOf("b1", "b2", "b3"), T))
+        assertTrue(group.rooms.all { it.frameId == null })
+        // The group moved rigidly: b2 moved exactly as b1 did.
+        assertEquals(-0.3 + T, group.room("b1").corners[0].x, 1e-9)
+        assertEquals(group.room("b1").corners[0].x, group.room("b2").corners[0].x, 1e-9)
+    }
+
+    // ---------------------------------------------------------------- floor axis
+
+    @Test fun floorAxisFollowsTheMajorityOfWallsNotTheirMean() {
+        // Two scans of one floor: the main one (5 rooms) square, a second one (3 rooms) turned 37°.
+        val main = (0 until 5).map { i -> scanned("m$i", rect(i * 4.2, 0.0, i * 4.2 + 4.0, 4.0)) }
+        val turnedScan = (0 until 3).map { i -> turned(scanned("t$i", rect(i * 3.7, 8.0, i * 3.7 + 3.5, 11.5), session = "s2"), 37.0) }
+        val axis = assertNotNull(FloorAxis.of(main + turnedScan))
+        assertTrue(angleDistance(axis, 0.0) < 1e-9, "axis ${Math.toDegrees(axis)}°")
+        // A plain 4θ mean lands between the two and matches neither.
+        val all = main + turnedScan
+        val plain = RoomSolver.dominantAngle(
+            all.flatMap { r -> Polygons.edges(r.corners).map { (it.b - it.a).angle() } },
+            all.flatMap { r -> Polygons.edges(r.corners).map { it.length } },
+        )
+        assertTrue(angleDistance(plain, 0.0) > Math.toRadians(3.0), "plain mean ${Math.toDegrees(plain)}°")
+        // Straightening such a floor turns nothing (the main scan is already square).
+        val f = floor(*all.toTypedArray())
+        assertSame(f, FloorOps.straighten(f))
+        // Tilted by 23°, it comes back square.
+        val tilted = FloorOps.rotate(f, Math.toRadians(23.0))
+        assertEquals(23.0, Math.toDegrees(FloorAxis.tilt(assertNotNull(FloorAxis.of(tilted.rooms)))), 1e-9)
+        val back = FloorOps.straighten(tilted)
+        for (r in back.rooms.take(5)) for (e in Polygons.edges(r.corners)) assertTrue(offAxis(e.b - e.a) < 1e-9)
+        assertNull(FloorAxis.of(emptyList()))
+    }
 
     // ---------------------------------------------------------------- rotate / straighten
 

@@ -6,6 +6,7 @@ import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.Project
 import com.oroplex.floorplan.core.model.Room
 import com.oroplex.floorplan.core.solve.FloorIssue
+import com.oroplex.floorplan.core.solve.FloorIssueAction
 import com.oroplex.floorplan.core.solve.IssueSeverity
 import com.oroplex.floorplan.export.ExportFormat
 import org.junit.Assert.assertEquals
@@ -143,5 +144,76 @@ class PreExportCheckTest {
         val off = project.copy(settings = PlanSettings(showOverallDimensions = false))
         assertFalse(ExportSelection().resolve(off).showOverallDimensions)
         assertTrue(ExportSelection(showOverallDimensions = true).resolve(off).showOverallDimensions)
+    }
+
+    // ---- Tapping a row (PREM-14) ----
+
+    private val snap = FloorIssue(IssueSeverity.INFO, "b", "Room b was scanned separately — snap it to a neighbour", FloorIssueAction.SNAP_ROOM)
+    private val straighten = FloorIssue(IssueSeverity.INFO, null, "Plan is turned 4° — straighten the floor", FloorIssueAction.STRAIGHTEN_FLOOR)
+
+    @Test
+    fun `a row about a room shows that room in the editor`() {
+        val report = PreExportChecks.build(listOf(main), settings, checker(mapOf("f1" to listOf(overlap, warning, snap))))
+        assertEquals(
+            listOf(CheckTarget.Room("a"), CheckTarget.Room("b"), CheckTarget.Room("b")),
+            report.items.map { it.target },
+        )
+        // The one-tap fix is carried along, but the export screen only ever leads to the editor.
+        assertEquals(listOf(null, null, FloorIssueAction.SNAP_ROOM), report.items.map { it.action })
+    }
+
+    @Test
+    fun `a floor wide row with a fix goes back to the editor, others are plain text`() {
+        val report = PreExportChecks.build(listOf(main), settings, checker(mapOf("f1" to listOf(straighten, info))))
+        assertEquals(listOf(CheckTarget.Editor, CheckTarget.None), report.items.map { it.target })
+        assertEquals(FloorIssueAction.STRAIGHTEN_FLOOR, report.items[0].action)
+        assertNull(report.items[0].roomId)
+    }
+
+    @Test
+    fun `a snap fix for a room that no longer exists is not offered`() {
+        val gone = snap.copy(roomId = "deleted")
+        val item = PreExportChecks.build(listOf(main), settings, checker(mapOf("f1" to listOf(gone)))).items.single()
+        assertNull(item.roomId)
+        assertNull(item.action)
+        assertEquals(CheckTarget.None, item.target)
+    }
+
+    @Test
+    fun `back to editor lands on the first problem that names a room`() {
+        val floorWide = FloorIssue(IssueSeverity.ERROR, null, "Something is wrong with the whole floor")
+        val report = PreExportChecks.build(
+            listOf(main, upper),
+            settings,
+            checker(mapOf("f1" to listOf(floorWide, warning), "f2" to listOf(overlap.copy(roomId = "c")))),
+        )
+        assertEquals("c", report.firstErrorRoomId)
+        // Warnings and notes do not count: without an error that names a room there is nowhere to land.
+        val noRoom = PreExportChecks.build(listOf(main), settings, checker(mapOf("f1" to listOf(floorWide, warning, snap))))
+        assertNull(noRoom.firstErrorRoomId)
+        assertNull(PreExportReport.EMPTY.firstErrorRoomId)
+    }
+
+    @Test
+    fun `the fix does not change which errors were acknowledged`() {
+        val plain = PreExportChecks.build(listOf(main), settings, checker(mapOf("f1" to listOf(overlap))))
+        val withFix = PreExportChecks.build(
+            listOf(main),
+            settings,
+            checker(mapOf("f1" to listOf(overlap.copy(action = FloorIssueAction.SNAP_ROOM)))),
+        )
+        assertEquals(plain.errorKey, withFix.errorKey)
+    }
+
+    // ---- Empty floors (PREM-12) ----
+
+    @Test
+    fun `the hint names the floors an all floors export leaves out`() {
+        assertNull(ExportHints.skippedFloors(emptyList()))
+        assertEquals("“Third Floor” has no rooms, so it is left out.", ExportHints.skippedFloors(listOf("Third Floor")))
+        assertEquals(
+            "2 floors have no rooms, so they are left out: Basement, Floor.",
+            ExportHints.skippedFloors(listOf("Basement", "  ")),
+        )
     }
 }

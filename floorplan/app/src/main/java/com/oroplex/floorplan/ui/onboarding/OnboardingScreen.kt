@@ -30,8 +30,12 @@ import androidx.compose.material.icons.outlined.Straighten
 import androidx.compose.material.icons.outlined.TaskAlt
 import androidx.compose.material.icons.outlined.ViewInAr
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -52,12 +56,16 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.oroplex.floorplan.core.io.SampleProjects
+import com.oroplex.floorplan.core.model.UnitSystem
 import com.oroplex.floorplan.core.render.DrawList
 import com.oroplex.floorplan.core.render.PlanColors
 import com.oroplex.floorplan.core.render.PlanRenderer
 import com.oroplex.floorplan.core.render.RenderOptions
 import com.oroplex.floorplan.core.render.ViewTransform
+import com.oroplex.floorplan.data.LocaleDefaults
+import com.oroplex.floorplan.data.appContainer
 import com.oroplex.floorplan.render.PlanPainter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -73,6 +81,14 @@ fun OnboardingScreen(onFinish: () -> Unit) {
     val pagerState = rememberPagerState { pages.size }
     val scope = rememberCoroutineScope()
     val current = pagerState.currentPage
+    // The last page asks for the units. They are the app-wide defaults for NEW projects (existing projects
+    // keep their own), so the choice is saved the moment it is tapped, whether the tour ends with
+    // "Get started", Back or a swipe away.
+    val settingsRepository = appContainer().settings
+    val defaults by settingsRepository.defaults.collectAsStateWithLifecycle()
+    val selectUnits: (UnitSystem) -> Unit = { system ->
+        settingsRepository.update { LocaleDefaults.switchUnits(it, system) }
+    }
 
     BackHandler(enabled = Onboarding.previousPage(current) != null) {
         Onboarding.previousPage(current)?.let { scope.launch { pagerState.animateScrollToPage(it) } }
@@ -96,7 +112,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                     .weight(1f)
                     .fillMaxWidth(),
             ) { index ->
-                PageContent(pages[index])
+                PageContent(pages[index], units = defaults.unitSystem, onSelectUnits = selectUnits)
             }
             Row(
                 Modifier
@@ -118,7 +134,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
 }
 
 @Composable
-private fun PageContent(page: OnboardingPage) {
+private fun PageContent(page: OnboardingPage, units: UnitSystem, onSelectUnits: (UnitSystem) -> Unit) {
     Column(
         Modifier
             .fillMaxSize()
@@ -155,6 +171,10 @@ private fun PageContent(page: OnboardingPage) {
             textAlign = TextAlign.Center,
             modifier = Modifier.widthIn(max = 480.dp),
         )
+        if (page.asksUnits) {
+            Spacer(Modifier.height(20.dp))
+            UnitsChoice(units, onSelectUnits, Modifier.widthIn(max = 480.dp).fillMaxWidth())
+        }
         if (page.points.isNotEmpty()) {
             Spacer(Modifier.height(20.dp))
             Column(
@@ -167,6 +187,39 @@ private fun PageContent(page: OnboardingPage) {
             }
         }
         Spacer(Modifier.height(16.dp))
+    }
+}
+
+/**
+ * "Measure in: Feet & inches / Metric" (see [Onboarding.UNITS_TITLE]). The selected button is the current
+ * app-wide default, which a fresh install takes from the device's country.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun UnitsChoice(selected: UnitSystem, onSelect: (UnitSystem) -> Unit, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Text(
+            Onboarding.UNITS_TITLE,
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.semantics { heading() },
+        )
+        Spacer(Modifier.height(8.dp))
+        val choices = Onboarding.unitChoices
+        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+            choices.forEachIndexed { index, system ->
+                SegmentedButton(
+                    selected = system == selected,
+                    onClick = { onSelect(system) },
+                    shape = SegmentedButtonDefaults.itemShape(index, choices.size),
+                ) { Text(Onboarding.unitLabel(system), maxLines = 1) }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            Onboarding.UNITS_HINT,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

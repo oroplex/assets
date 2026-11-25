@@ -12,6 +12,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -119,6 +120,10 @@ internal fun DollhouseCanvas(
 
     Canvas(
         modifier
+            // Faces, outlines and label pills are drawn at projected pixel positions that leave the canvas
+            // when the model is zoomed in or panned. Compose does not clip drawing by default, so without
+            // this they would paint over the navigation-bar inset (and, in a pop-up window, the sides).
+            .clipToBounds()
             .onSizeChanged { onViewport(it.width, it.height, marginPx) }
             .pointerInput(Unit) { detectDollhouseGestures { currentCallbacks } }
             .semantics {

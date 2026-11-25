@@ -82,6 +82,11 @@ import kotlinx.coroutines.launch
 
 private const val TAG = "ExportScreen"
 
+/** What a DXF holds (the layers DxfExporter writes), shown under the DXF options. */
+private const val DXF_LAYERS_NOTE =
+    "DXF has separate layers for walls, room outlines, doors, windows, stairs, room labels and overall " +
+        "dimensions. Wall lengths aren't labeled; measure them in your CAD app."
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ExportScreen(
@@ -184,6 +189,7 @@ fun ExportScreen(
                 padding = padding,
                 vm = vm,
                 onBackToEditor = onBack,
+                onOpenRoom = onOpenRoom,
             )
         }
     }
@@ -216,6 +222,7 @@ private fun ExportContent(
     padding: PaddingValues,
     vm: ExportViewModel,
     onBackToEditor: () -> Unit,
+    onOpenRoom: (roomId: String) -> Unit,
 ) {
     val request = state.request
     LazyColumn(
@@ -237,6 +244,7 @@ private fun ExportContent(
                     acknowledged = state.errorsAcknowledged,
                     onExportAnyway = vm::acknowledgeErrors,
                     onBackToEditor = onBackToEditor,
+                    onOpenRoom = onOpenRoom,
                     modifier = Modifier.padding(horizontal = 16.dp),
                 )
             }
@@ -290,18 +298,25 @@ private fun ExportContent(
                     if (request.format == ExportFormat.PDF) {
                         PaperSizeRow(request.paper, vm::selectPaper)
                     }
-                    if (request.format != ExportFormat.DXF) {
-                        SwitchRow("Wall lengths", request.showWallLengths, vm::setShowWallLengths)
-                        SwitchRow("Room areas", request.showAreas, vm::setShowAreas)
-                        SwitchRow(
-                            "Overall dimensions",
-                            request.showOverallDimensions,
-                            vm::setShowOverallDimensions,
-                            supporting = "Total width and depth outside the plan",
-                        )
-                    } else {
+                    val dxf = request.format == ExportFormat.DXF
+                    // DXF has no per-wall length labels (CAD users dimension walls themselves), so that
+                    // switch is hidden; the other two reach the file like for every other drawing.
+                    if (!dxf) SwitchRow("Wall lengths", request.showWallLengths, vm::setShowWallLengths)
+                    SwitchRow(
+                        "Room areas",
+                        request.showAreas,
+                        vm::setShowAreas,
+                        supporting = if (dxf) "In the room labels on the TEXT layer" else null,
+                    )
+                    SwitchRow(
+                        "Overall dimensions",
+                        request.showOverallDimensions,
+                        vm::setShowOverallDimensions,
+                        supporting = if (dxf) "Total width and depth, on the DIMENSIONS layer" else "Total width and depth outside the plan",
+                    )
+                    if (dxf) {
                         Text(
-                            "DXF contains walls, doors, windows and room labels on separate layers.",
+                            DXF_LAYERS_NOTE,
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,

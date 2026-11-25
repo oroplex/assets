@@ -15,7 +15,6 @@ import com.oroplex.floorplan.core.render.DrawList
 import com.oroplex.floorplan.core.render.PlanColors
 import com.oroplex.floorplan.core.render.PlanRenderer
 import com.oroplex.floorplan.core.render.RenderOptions
-import com.oroplex.floorplan.core.render.ViewTransform
 import com.oroplex.floorplan.render.PlanPainter
 import java.text.DateFormat
 import java.util.Date
@@ -30,17 +29,22 @@ data class FloorSheet(
     /** Null when there is nothing to draw; [emptyMessage] is printed in the plan area instead. */
     val drawList: DrawList?,
     val emptyMessage: String,
-    /** e.g. "Total net floor area: 1,234 sq ft". */
+    /** e.g. "Net living area (interior): 1,234 sq ft" (see [FloorSheets.livingAreaText]). */
     val areaText: String,
     /** e.g. "7 rooms". */
     val roomCountText: String,
     val unitSystem: UnitSystem,
     /** e.g. "Page 1 of 3"; null to omit. */
     val pageLabel: String? = null,
-    /** Print the "1:N at 100 %" ratio under the scale bar (only meaningful for paper output). */
+    /** Print the scale under the scale bar (only meaningful for paper output), see [ScaleBars.scaleNote]. */
     val showScaleRatio: Boolean = false,
     /** Company block for the header; null prints the project in its place. */
     val branding: SheetBranding? = null,
+    /**
+     * The standard scale the plan is drawn at ([drawList] was rendered for it); null fits the plan to the
+     * plan area instead (PNG, the preview of drawings, and PDFs too large for any standard scale).
+     */
+    val scale: PlanScale? = null,
 )
 
 object FloorSheets {
@@ -66,12 +70,17 @@ object FloorSheets {
     /**
      * Renders [floor] with the project's settings and the export toggles. Returns null for a floor
      * without rooms. Throws [ExportException] when the rooms cannot be drawn (corrupt geometry).
+     *
+     * [pointsPerMeter] is the scale the drawing will be printed at when it is known (a PDF sheet at a
+     * standard scale): the renderer then sizes dimension-line offsets exactly in points. Null assumes a plan
+     * fitted to a page.
      */
     fun renderFloor(
         project: Project,
         floor: Floor,
         labels: PlanLabels,
         textScale: Double = SHEET_TEXT_SCALE,
+        pointsPerMeter: Double? = null,
     ): DrawList? {
         if (floor.rooms.isEmpty()) return null
         val drawList = try {
@@ -83,6 +92,7 @@ object FloorSheets {
                     showWallLengths = labels.showWallLengths,
                     showAreas = labels.showAreas,
                     showOverallDimensions = labels.showOverallDimensions,
+                    pointsPerMeter = pointsPerMeter,
                 ),
             )
         } catch (e: Exception) {
@@ -97,34 +107,51 @@ object FloorSheets {
         return drawList
     }
 
-    /** Net floor area formatted for the project's units, or an em dash when it cannot be computed. */
-    fun formatFloorArea(floor: Floor, system: UnitSystem): String =
-        try {
-            val area = Measurements.floorArea(floor)
-            if (area.isFinite()) Units.formatArea(area, system) else "—"
+    /**
+     * The area figure of a sheet's title block: "Net living area (interior): 1,234 sq ft", the sum of the
+     * interior (net) areas of the floor's living rooms (garages, unfinished and outdoor spaces are left
+     * out, see [Measurements.areaSummary]). It is deliberately not called GLA: ANSI Z765 gross living area
+     * is measured to the exterior faces and comes out roughly 8-10 % larger. An em dash stands in when the
+     * area cannot be computed.
+     */
+    fun livingAreaText(floor: Floor, system: UnitSystem): String {
+        val area = try {
+            Measurements.areaSummary(floor.rooms).living.takeIf { it.isFinite() }
         } catch (e: Exception) {
-            "—"
+            null
         }
+        return "$LIVING_AREA_LABEL: ${area?.let { Units.formatArea(it, system) } ?: "—"}"
+    }
 
+    /** Label of the living-area figure on sheets and in the schedule (never "GLA", see [livingAreaText]). */
+    const val LIVING_AREA_LABEL = "Net living area (interior)"
+
+    /**
+     * One floor's sheet. With [scale] the plan is rendered for, and later drawn at, that standard scale
+     * (PDF); without, it is fitted to the sheet's plan area (PNG).
+     */
     fun build(
         project: Project,
         floor: Floor,
         labels: PlanLabels,
         dateText: String,
         branding: SheetBranding? = null,
+        scale: PlanScale? = null,
     ): FloorSheet {
         val system = project.settings.unitSystem
+        val drawList = renderFloor(project, floor, labels, pointsPerMeter = scale?.pointsPerMeter)
         return FloorSheet(
             projectName = project.name.trim().ifEmpty { "Untitled project" },
             address = project.address.trim(),
             floorName = floor.name.trim().ifEmpty { "Floor" },
             dateText = dateText,
-            drawList = renderFloor(project, floor, labels),
+            drawList = drawList,
             emptyMessage = EMPTY_FLOOR_MESSAGE,
-            areaText = "Total net floor area: ${formatFloorArea(floor, system)}",
+            areaText = livingAreaText(floor, system),
             roomCountText = roomCountText(floor.rooms.size),
             unitSystem = system,
             branding = branding,
+            scale = scale?.takeIf { drawList != null },
         )
     }
 }
@@ -136,6 +163,10 @@ object FloorSheets {
  * the plan itself is drawn unscaled through [PlanPainter] with `pxPerPt = scale`, so line widths and
  * label sizes in the DrawList come out at their intended point sizes on every output
  * (PDF: scale 1, PNG: bitmap px per pt, preview: screen px per pt).
+ *
+ * A sheet with a [FloorSheet.scale] is drawn at exactly that drawing scale, centered in the plan area;
+ * other sheets are fitted to it (see [SheetLayout.planView]). The scale bar and the scale line under it
+ * always describe the scale actually drawn.
  *
  * Layout (see [SheetLayout]): the header band names who made the plan (company block, when branding
  * is set) and for which property; the footer title block names the sheet (floor), its area and room
@@ -154,13 +185,7 @@ object PlanSheetPainter {
         var ptPerMeter: Double? = null
         val drawList = sheet.drawList
         if (drawList != null) {
-            val view = ViewTransform.fit(
-                drawList.bounds,
-                planRect.width * scale,
-                planRect.height * scale,
-                SheetLayout.PLAN_FIT_MARGIN * scale,
-                pxPerPt = scale,
-            )
+            val view = SheetLayout.planView(drawList.bounds, planRect, sheet.scale?.pointsPerMeter, pxPerPt = scale)
             canvas.save()
             canvas.translate((planRect.left * scale).toFloat(), (planRect.top * scale).toFloat())
             PlanPainter.draw(canvas, drawList, view)
@@ -255,7 +280,16 @@ object PlanSheetPainter {
 
         val maxBar = minOf(rect.width * 0.38, 230.0)
         val bar = ptPerMeter?.let { ScaleBars.choose(it, planWidthPt, sheet.unitSystem, maxBar) }
-        val leftMax = rect.width - (bar?.lengthPt ?: 0.0) - 24.0
+        // The scale line belongs to the bar: the standard scale the sheet was drawn at, or the fitted ratio.
+        val scaleNote = if (bar != null && sheet.showScaleRatio) {
+            ScaleBars.scaleNote(sheet.scale, bar.lengthPt / bar.lengthMeters)
+        } else {
+            null
+        }
+        val notePaint = SheetText.paint(SCALE_NOTE_PT, color = PlanColors.TEXT_SECONDARY, align = Paint.Align.RIGHT)
+        val noteWidth = scaleNote?.let { notePaint.measureText(it).toDouble() } ?: 0.0
+        // The left block stops short of whichever is wider, the bar or the scale line under it.
+        val leftMax = rect.width - maxOf(bar?.lengthPt ?: 0.0, noteWidth) - 24.0
 
         val titlePaint = SheetText.paint(12.0, bold = true)
         val detailPaint = SheetText.paint(9.0, color = PlanColors.TEXT_SECONDARY)
@@ -263,10 +297,7 @@ object PlanSheetPainter {
         SheetText.draw(canvas, SheetText.ellipsize(sheet.floorName, titlePaint, leftMax), rect.left, rect.top + 17, titlePaint)
         SheetText.draw(canvas, SheetText.ellipsize(detail, detailPaint, leftMax), rect.left, rect.top + 31, detailPaint)
 
-        if (bar != null) {
-            val ratio = if (sheet.showScaleRatio) ScaleBars.ratio(bar.lengthPt / bar.lengthMeters) else null
-            drawScaleBar(canvas, bar, right = rect.right, top = rect.top + 10, ratio = ratio)
-        }
+        if (bar != null) drawScaleBar(canvas, bar, right = rect.right, top = rect.top + 10, note = scaleNote, notePaint = notePaint)
 
         drawBottomLine(canvas, widthPt, heightPt, FloorSheets.bottomLineText(sheet.dateText, sheet.pageLabel))
     }
@@ -293,8 +324,11 @@ object PlanSheetPainter {
         )
     }
 
-    /** Alternating black / white blocks with "0" and the length label underneath, right-aligned at [right]. */
-    private fun drawScaleBar(canvas: Canvas, bar: ScaleBarSpec, right: Double, top: Double, ratio: Long?) {
+    /**
+     * Alternating black / white blocks with "0" and the length label underneath, right-aligned at [right];
+     * [note] (the scale line, see [ScaleBars.scaleNote]) goes under the labels.
+     */
+    private fun drawScaleBar(canvas: Canvas, bar: ScaleBarSpec, right: Double, top: Double, note: String?, notePaint: Paint) {
         val height = 5.0
         val left = right - bar.lengthPt
         val segment = bar.lengthPt / bar.segments
@@ -319,11 +353,11 @@ object PlanSheetPainter {
         val labelBaseline = top + height + 8.5
         SheetText.draw(canvas, "0", left, labelBaseline, SheetText.paint(7.0, align = Paint.Align.LEFT))
         SheetText.draw(canvas, bar.label, right, labelBaseline, SheetText.paint(7.0, bold = true, align = Paint.Align.RIGHT))
-        if (ratio != null) {
-            val ratioPaint = SheetText.paint(6.0, color = PlanColors.TEXT_SECONDARY, align = Paint.Align.RIGHT)
-            SheetText.draw(canvas, "Scale 1:$ratio when printed at 100%", right, labelBaseline + 8.5, ratioPaint)
-        }
+        if (note != null) SheetText.draw(canvas, note, right, labelBaseline + 8.5, notePaint)
     }
+
+    /** Text size of the scale line under the scale bar. */
+    private const val SCALE_NOTE_PT = 6.5
 }
 
 /** Small text helpers for sheet drawing; sizes are in the canvas' current units (points). */

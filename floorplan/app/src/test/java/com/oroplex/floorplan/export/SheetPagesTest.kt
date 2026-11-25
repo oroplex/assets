@@ -142,19 +142,56 @@ class PdfPagesTest {
     fun `a long schedule spills onto several pages`() {
         val floors = listOf(floor("a", 70))
         val prepared = PdfExporter.prepare(project(*floors.toTypedArray()), floors, PdfOptions(paper = PaperSize.A4), "d")
-        val expectedRows = 70 + 1 // rooms + grand total
+        val expectedRows = 70 + 2 // rooms + living area + total
         val capacity = ScheduleLayout.rowsPerPage(PaperSize.A4.heightPt.toDouble())
         val expectedSchedulePages = (expectedRows + capacity - 1) / capacity
         assertEquals(1 + expectedSchedulePages, prepared.pageCount)
+        assertEquals(1, prepared.planPageCount)
         assertEquals("Page ${prepared.pageCount} of ${prepared.pageCount}", prepared.pageLabels.last())
     }
 
     @Test
-    fun `empty floors still get a page with a message`() {
+    fun `a floor the user picked still gets a page with a message when it is empty`() {
         val floors = listOf(Floor("e", "Attic"))
         val prepared = PdfExporter.prepare(project(*floors.toTypedArray()), floors, PdfOptions(), "d")
         assertEquals(2, prepared.pageCount)
         assertNull(prepared.labeledSheets.single().drawList)
+        // Nothing to scale: no scale is claimed, on the sheet or in the summary.
+        assertNull(prepared.sheetScale)
+        assertNull(prepared.labeledSheets.single().scale)
+        assertEquals("Letter portrait · 2 pages", prepared.summary)
+    }
+
+    @Test
+    fun `all floors of a project skip the empty ones, in pages, schedule and summary alike`() {
+        val used = floor("a", 2)
+        val p = project(used, Floor("e", "Attic"), floor("b", 1))
+        val request = ExportRequest(ExportFormat.PDF, null, paper = PaperSize.A4)
+        val covered = ProjectExporter.floorsFor(p, request)
+        val prepared = PdfExporter.prepare(p, covered, PdfOptions(paper = PaperSize.A4), "d")
+        assertEquals(2, prepared.planPageCount)
+        assertEquals(3, prepared.pageCount)
+        assertEquals(listOf("Floor a", "Floor b"), prepared.labeledSheets.map { it.floorName })
+        assertTrue(prepared.labeledSheets.all { it.drawList != null })
+        val scheduleRows = prepared.schedulePages.flatten()
+        assertEquals(
+            listOf("Floor a", "Floor b"),
+            scheduleRows.filterIsInstance<ScheduleRow.FloorHeading>().map { it.title },
+        )
+        assertTrue(scheduleRows.none { it is ScheduleRow.Note })
+        assertTrue(prepared.summary.endsWith("· 3 pages"))
+    }
+
+    @Test
+    fun `sheets state the net living area`() {
+        val floors = listOf(floor("a", 2))
+        val sheet = PdfExporter.prepare(project(*floors.toTypedArray()), floors, PdfOptions(), "d").labeledSheets.single()
+        assertEquals("Net living area (interior): 18.0 m²", sheet.areaText)
+        assertEquals("2 rooms", sheet.roomCountText)
+        // The PNG image is the same sheet: same wording.
+        val png = FloorSheets.build(project(*floors.toTypedArray()), floors.single(), PlanLabels(), "d")
+        assertEquals(sheet.areaText, png.areaText)
+        assertNull(png.scale) // an image has no paper scale
     }
 
     @Test

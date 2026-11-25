@@ -1,14 +1,21 @@
 package com.oroplex.floorplan
 
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -30,14 +37,31 @@ import com.oroplex.floorplan.ui.view3d.DollhouseScreen
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // SystemBarStyle.auto (the default) picks light / dark bar icons from the system night mode,
-        // which is also what FloorPlanTheme follows.
+        // Before the first frame: edge-to-edge with bar icons matching the night mode at launch.
         enableEdgeToEdge()
         setContent {
-            FloorPlanTheme {
+            val dark = isSystemInDarkTheme()
+            // The manifest handles uiMode changes without recreating the Activity (a recreation would tear
+            // down the AR session), so Compose re-themes in place. enableEdgeToEdge only looks at the night
+            // mode when it is called; without re-applying it here, the status-bar clock and battery would
+            // keep their launch-time colour and vanish against the new background after a dark-mode switch.
+            DisposableEffect(dark) {
+                enableEdgeToEdge(
+                    statusBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT) { dark },
+                    navigationBarStyle = SystemBarStyle.auto(LIGHT_NAV_SCRIM, DARK_NAV_SCRIM) { dark },
+                )
+                onDispose {}
+            }
+            FloorPlanTheme(darkTheme = dark) {
                 FloorPlanNavHost()
             }
         }
+    }
+
+    private companion object {
+        // androidx.activity's own default scrims behind a 3-button navigation bar.
+        val LIGHT_NAV_SCRIM = Color.argb(0xe6, 0xFF, 0xFF, 0xFF)
+        val DARK_NAV_SCRIM = Color.argb(0x80, 0x1b, 0x1b, 0x1b)
     }
 }
 
@@ -57,6 +81,12 @@ internal object Routes {
     const val EXPORT = "export/{$ARG_PROJECT}"
     const val VIEW_3D = "view3d/{$ARG_PROJECT}/{$ARG_FLOOR}"
     const val SETTINGS = "settings"
+
+    /**
+     * Key in the editor entry's SavedStateHandle: the id of a room the editor should select and zoom to when
+     * it comes back (set by the export screen's pre-flight list); null once the editor has handled it.
+     */
+    const val KEY_FOCUS_ROOM = "focusRoom"
 
     fun editor(projectId: String) = "editor/${Uri.encode(projectId)}"
     fun capture(projectId: String, floorId: String) = "capture/${Uri.encode(projectId)}/${Uri.encode(floorId)}"
@@ -106,12 +136,19 @@ private fun FloorPlanNavHost() {
                 LeaveInvalidRoute(nav, entry)
                 return@composable
             }
+            // A room another screen asked the editor to show (see Routes.KEY_FOCUS_ROOM). Cleared by writing
+            // null rather than removing the key: remove() detaches the StateFlow, which would then miss the
+            // next request.
+            val focusRoomFlow = remember(entry) { entry.savedStateHandle.getStateFlow<String?>(Routes.KEY_FOCUS_ROOM, null) }
+            val focusRoomId by focusRoomFlow.collectAsStateWithLifecycle()
             PlanEditorScreen(
                 projectId = projectId,
                 onScanRoom = { p, floorId -> nav.navigateFrom(entry, Routes.capture(p, floorId)) },
                 onExport = { p -> nav.navigateFrom(entry, Routes.export(p)) },
                 onBack = { nav.popFrom(entry) },
                 onOpen3d = { p, floorId -> nav.navigateFrom(entry, Routes.view3d(p, floorId)) },
+                focusRoomId = focusRoomId,
+                onFocusRoomConsumed = { entry.savedStateHandle[Routes.KEY_FOCUS_ROOM] = null },
             )
         }
         composable(
@@ -153,7 +190,11 @@ private fun FloorPlanNavHost() {
                 LeaveInvalidRoute(nav, entry)
                 return@composable
             }
-            ExportScreen(projectId = projectId, onBack = { nav.popFrom(entry) })
+            ExportScreen(
+                projectId = projectId,
+                onBack = { nav.popFrom(entry) },
+                onOpenRoom = { roomId -> nav.showRoomInEditor(entry, roomId) },
+            )
         }
         composable(Routes.SETTINGS) { entry ->
             SettingsScreen(
@@ -193,6 +234,19 @@ private fun NavHostController.replaceFrom(from: NavBackStackEntry, route: String
             launchSingleTop = true
         }
     }
+}
+
+/**
+ * Leaves [from] (the export screen) for the editor underneath it and asks the editor to select and zoom to
+ * [roomId]: the request travels in the editor entry's SavedStateHandle ([Routes.KEY_FOCUS_ROOM]), so it
+ * survives process death, and the editor clears it once handled. Does nothing unless [from] is still on top
+ * with the editor right below it; the plan itself is never changed from here.
+ */
+private fun NavHostController.showRoomInEditor(from: NavBackStackEntry, roomId: String) {
+    val editor = previousBackStackEntry ?: return
+    if (currentBackStackEntry?.id != from.id || editor.destination.route != Routes.EDITOR) return
+    editor.savedStateHandle[Routes.KEY_FOCUS_ROOM] = roomId
+    popBackStack()
 }
 
 /**

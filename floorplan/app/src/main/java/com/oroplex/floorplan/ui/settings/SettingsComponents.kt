@@ -26,6 +26,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.oroplex.floorplan.core.measure.Units
+import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.model.UnitSystem
 import kotlin.math.abs
 
@@ -67,6 +68,25 @@ internal fun parseSettingLength(text: String, system: UnitSystem, allowZero: Boo
 }
 
 private val ZERO_LENGTH = Regex("""^0+(?:[.,]0*)?\s*(?:m|cm|mm|in|inch|inches|ft|feet|'|")?$""", RegexOption.IGNORE_CASE)
+
+/** Small pure rules of the settings screen (unit-tested). */
+internal object SettingsRules {
+    /** Explains the interior wall thickness with a typical value in the user's own units. */
+    fun interiorWallHelp(system: UnitSystem): String = when (system) {
+        UnitSystem.IMPERIAL -> "Drawn on the plan. Interior walls are typically 4 1/2\"."
+        UnitSystem.METRIC -> "Drawn on the plan. Interior walls are typically about 10 cm."
+    }
+
+    /** Explains the exterior wall thickness, in the words of the editor's project settings. */
+    const val EXTERIOR_WALL_HELP = "Used for overall dimensions, which measure to the outside of the exterior walls."
+
+    /**
+     * The exterior wall thickness in effect, which is what the field shows: the stored value, or the interior
+     * wall thickness when none is set ([PlanSettings.exteriorWallThickness] null means "same as interior").
+     */
+    fun exteriorWallThickness(settings: PlanSettings): Double =
+        settings.exteriorWallThickness?.takeIf { it.isFinite() && it > 0.0 } ?: settings.wallThickness
+}
 
 /**
  * A length setting edited as text in the user's units (e.g. `4 1/2"`, `11.4 cm`).

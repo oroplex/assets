@@ -1,6 +1,7 @@
 package com.oroplex.floorplan.ui.onboarding
 
 import com.oroplex.floorplan.Routes
+import com.oroplex.floorplan.core.model.UnitSystem
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -72,5 +73,25 @@ class OnboardingTest {
     @Test
     fun `3d route matches its builder`() {
         assertEquals("view3d/{projectId}/{floorId}", Routes.VIEW_3D)
+    }
+
+    @Test
+    fun `only the last page asks for the units`() {
+        assertEquals(listOf(false, false, false, true), Onboarding.pages.map { it.asksUnits })
+        assertEquals(listOf(UnitSystem.IMPERIAL, UnitSystem.METRIC), Onboarding.unitChoices)
+        assertEquals("Feet & inches", Onboarding.unitLabel(UnitSystem.IMPERIAL))
+        assertEquals("Metric", Onboarding.unitLabel(UnitSystem.METRIC))
+        // Every unit system has a button.
+        assertEquals(UnitSystem.entries.toSet(), Onboarding.unitChoices.toSet())
+        assertTrue(Onboarding.UNITS_TITLE.length <= 20)
+        // The hint says the choice is for new projects and is not final.
+        assertTrue(Onboarding.UNITS_HINT.contains("new projects"))
+        assertTrue(Onboarding.UNITS_HINT.contains("Settings"))
+        assertTrue(Onboarding.UNITS_HINT.length <= 80)
+    }
+
+    @Test
+    fun `the room to show in the editor travels under one key`() {
+        assertEquals("focusRoom", Routes.KEY_FOCUS_ROOM)
     }
 }

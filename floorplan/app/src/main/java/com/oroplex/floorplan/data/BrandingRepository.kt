@@ -249,7 +249,10 @@ object BrandingRules {
     }
 }
 
-/** The few key-value operations [PrefsBrandingRepository] needs (SharedPreferences in the app). */
+/**
+ * The few key-value operations [PrefsBrandingRepository] and [PrefsSettingsRepository] need
+ * (SharedPreferences in the app, an in-memory map in unit tests).
+ */
 internal interface KeyValueStore {
     fun getString(key: String): String?
     fun getBoolean(key: String): Boolean
@@ -257,7 +260,7 @@ internal interface KeyValueStore {
     fun putBoolean(key: String, value: Boolean)
 }
 
-private class SharedPreferencesStore(private val prefs: SharedPreferences) : KeyValueStore {
+internal class SharedPreferencesStore(private val prefs: SharedPreferences) : KeyValueStore {
     // A value of another type under one of our keys (old build, hand-edited backup) reads as absent.
     override fun getString(key: String): String? = try {
         prefs.getString(key, null)

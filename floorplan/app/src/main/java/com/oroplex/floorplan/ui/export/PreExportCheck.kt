@@ -3,6 +3,7 @@ package com.oroplex.floorplan.ui.export
 import com.oroplex.floorplan.core.model.Floor
 import com.oroplex.floorplan.core.model.PlanSettings
 import com.oroplex.floorplan.core.solve.FloorIssue
+import com.oroplex.floorplan.core.solve.FloorIssueAction
 import com.oroplex.floorplan.core.solve.IssueSeverity
 
 /** One line of the "Before you export" card. */
@@ -13,9 +14,36 @@ data class CheckItem(
     val floorName: String?,
     val floorId: String,
     val roomId: String?,
+    /** The one-tap fix the editor offers for this issue; the export screen only leads the user there. */
+    val action: FloorIssueAction? = null,
 ) {
     /** What the card prints: "Upper Floor: message" for multi-floor exports. */
     val text: String get() = if (floorName != null) "$floorName: $message" else message
+
+    /**
+     * Where tapping the row leads. The export screen never changes the plan itself: an item about a room
+     * shows that room in the editor (where "Snap" and the corner handles are); a floor-wide item with a fix
+     * (straighten the floor) goes back to the editor, where the floor check offers it; other floor-wide
+     * items are plain text.
+     */
+    val target: CheckTarget
+        get() = when {
+            roomId != null -> CheckTarget.Room(roomId)
+            action != null -> CheckTarget.Editor
+            else -> CheckTarget.None
+        }
+}
+
+/** What a tap on a [CheckItem] does (see [CheckItem.target]). */
+sealed interface CheckTarget {
+    /** Not tappable. */
+    data object None : CheckTarget
+
+    /** Select and zoom to the room in the editor. */
+    data class Room(val roomId: String) : CheckTarget
+
+    /** Go back to the editor (the fix is offered by its floor check). */
+    data object Editor : CheckTarget
 }
 
 /**
@@ -27,6 +55,9 @@ data class PreExportReport(val items: List<CheckItem>) {
     val warningCount: Int get() = items.count { it.severity == IssueSeverity.WARNING }
     val hasErrors: Boolean get() = items.any { it.severity == IssueSeverity.ERROR }
     val isClean: Boolean get() = items.isEmpty()
+
+    /** The room "Back to editor" should land on: the first error that names one, or null. */
+    val firstErrorRoomId: String? get() = errors.firstNotNullOfOrNull { it.roomId }
 
     /**
      * Identifies the current set of errors. "Export anyway" acknowledges exactly this set: when the plan
@@ -82,7 +113,9 @@ object PreExportChecks {
                 .distinct()
                 .forEach { issue ->
                     val roomId = issue.roomId?.takeIf { id -> floor.rooms.any { it.id == id } }
-                    items += index to CheckItem(issue.severity, issue.message.trim(), label, floor.id, roomId)
+                    // An action that needs a room is dropped with a room that no longer exists.
+                    val action = issue.action?.takeIf { it != FloorIssueAction.SNAP_ROOM || roomId != null }
+                    items += index to CheckItem(issue.severity, issue.message.trim(), label, floor.id, roomId, action)
                 }
         }
         val sorted = items.sortedWith(compareBy<Pair<Int, CheckItem>>({ it.second.severity.ordinal }, { it.first }))

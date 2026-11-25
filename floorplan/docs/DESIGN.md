@@ -129,6 +129,8 @@ Driven by `docs/REVIEW-2.md` (finding ids SEAM-n, ARX-n, MATH-n, CAPX-n, APPX-n,
   max(0.5°, 2 standard errors) and applied as a rigid turn, `ar/SamplingPolicy.kt WallOutcome.decide` (a depth
   fit is only returned with an aim point; a plane stands in for a failed fit only when the crosshair's depth
   lies on it), `render/LabelFit.kt` (labels fitted at `RenderOptions.pointsPerMeter`), `diagnostics/ScanLog`
-  (on-device log fed by `ar/ArLog`, shared from Settings), `ui/capture CaptureDialogs` and
+  (on-device log fed by `ar/ArLog`, shared from Settings), `core/fit/WallCaptureRecord` and
+  `diagnostics/WallCaptureLog` (the raw samples of each wall capture, kept for replay through
+  `WallEstimator.fromPoints` and shared with the log), `ui/capture CaptureDialogs` and
   `ui/common FocusOnShow` (never request focus from outside a dialog's content), and the headless
   walkthrough in `app/src/test/.../walkthrough` (`WalkthroughBase`).

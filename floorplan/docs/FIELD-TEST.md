@@ -41,7 +41,10 @@ longest wall of scan 1, tap it, choose **Calibrate floor**, type its tape length
 ## What to send back
 * The filled table (a photo of it is fine).
 * **Export → JSON backup** of the project (it contains the raw measurements behind every wall).
-* The scan log, if the app offers **Share scan log** in Settings → About.
+* The scan log: **Settings → About → Share scan log**, after the three scans. It is one text file (a few MB)
+  holding what the app measured and the wall points it sampled, so every scan can be re-measured here with
+  other settings instead of you scanning again. No photos, no location. Attach it to the chat, or save it to
+  Google Drive from the share sheet and say so.
 * Anything that went wrong, in a sentence each: a wall that would not capture and what it looked like
   (plain, glossy, window, dark), a wrong floor or ceiling, a message that made no sense, a freeze or crash,
   a screen that looked wrong (a screenshot helps), anything that took more than two tries.

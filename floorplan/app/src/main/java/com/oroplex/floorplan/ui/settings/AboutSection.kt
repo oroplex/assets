@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.pm.PackageInfoCompat
 import com.google.ar.core.ArCoreApk
 import com.oroplex.floorplan.diagnostics.ScanLog
+import com.oroplex.floorplan.diagnostics.WallCaptureLog
 import com.oroplex.floorplan.export.ExportFiles
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -68,8 +69,8 @@ internal fun AboutSection() {
                     if (shareFailed) {
                         "Couldn't prepare the log. Try again."
                     } else {
-                        "What the scanner measured in recent scans, and details of any crash. No photos or " +
-                            "location. Send it along when something goes wrong."
+                        "What the scanner measured in recent scans, the wall points it sampled, and details " +
+                            "of any crash. No photos or location. Send it along when something goes wrong."
                     },
                 )
             },
@@ -91,13 +92,16 @@ internal fun AboutSection() {
 }
 
 /**
- * Writes the scan log (with a header naming the app version and the phone) to the shared-exports folder and
- * opens the system share sheet. False when the file could not be written or nothing can receive it.
+ * Writes the scan log (with a header naming the app version and the phone), followed by the raw samples of
+ * recent wall captures, to the shared-exports folder and opens the system share sheet. False when the file could not be written or nothing can receive it.
  */
 private suspend fun shareScanLog(context: Context, about: String): Boolean = try {
     val header = "$about\n${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
     val file = withContext(Dispatchers.IO) {
-        ExportFiles.write(context, "FloorPlanScan-log.txt") { out -> ScanLog.export(out, header) }
+        ExportFiles.write(context, "FloorPlanScan-log.txt") { out ->
+            ScanLog.export(out, header)
+            WallCaptureLog.export(out)
+        }
     }
     context.startActivity(ExportFiles.shareIntent(context, file, "text/plain", "FloorPlan Scan log"))
     true

@@ -4,12 +4,15 @@ import com.google.ar.core.Frame
 import com.google.ar.core.HitResult
 import com.google.ar.core.Plane
 import com.oroplex.floorplan.core.fit.RobustStats
+import com.oroplex.floorplan.core.fit.WallCaptureRecord
 import com.oroplex.floorplan.core.fit.WallEstimator
 import com.oroplex.floorplan.core.fit.WallEstimatorConfig
 import com.oroplex.floorplan.core.fit.WallFit
+import com.oroplex.floorplan.core.geometry.Segment2
 import com.oroplex.floorplan.core.geometry.Vec2
 import com.oroplex.floorplan.core.geometry.Vec3
 import com.oroplex.floorplan.core.model.WallObservation
+import com.oroplex.floorplan.diagnostics.WallCaptureLog
 import kotlinx.coroutines.CompletableDeferred
 import java.util.Queue
 import kotlin.math.min
@@ -238,7 +241,9 @@ internal class MeasurementEngine(private val incoming: Queue<PendingMeasurement>
     private fun report(a: Active, result: MeasureResult?, nowNs: Long) {
         try {
             val detail = a.sampler.describe()
-            ArLog.i(MeasurementReport.line(a.job.request, result, nowNs - a.job.createdAtNs, a.frames, detail))
+            val line = MeasurementReport.line(a.job.request, result, nowNs - a.job.createdAtNs, a.frames, detail)
+            ArLog.i(line)
+            a.sampler.keepRawData(line)
         } catch (e: Exception) {
             // Diagnostics must never cost a measurement or a frame.
         }
@@ -263,6 +268,12 @@ private sealed class Sampler {
      * Called once the measurement ended, successfully or not; plain numbers only.
      */
     abstract fun describe(): String
+
+    /**
+     * Called once when the measurement ended, whatever the outcome, with its diagnostics line: a sampler
+     * whose raw samples are worth replaying later hands them to the on-device log. Must only queue work.
+     */
+    open fun keepRawData(outcome: String) {}
 
     companion object {
         /** Upper bound on requested frame counts (the 4 s timeout would end longer requests anyway). */
@@ -403,6 +414,11 @@ private class WallSampler(
     private val points = ArrayList<Vec3>(maxFrames * WallSampleGrid.COUNT)
     private val centerPoints = ArrayList<Vec3>(maxFrames)
     private val aimDistances = ArrayList<Double>(maxFrames)
+
+    /** Raw data for [keepRawData]: the camera position of every frame and every sample with its frame and kind. */
+    private val cameras = ArrayList<Vec3>(maxFrames)
+    private val recorded = ArrayList<WallCaptureRecord.Sample>(maxFrames * WallSampleGrid.COUNT)
+    private var measured: Measured? = null
     private val grid = FloatArray(WallSampleGrid.COUNT * 2)
     private val kindCounts = IntArray(WallSampleKind.entries.size)
     private var frames = 0
@@ -442,7 +458,7 @@ private class WallSampler(
         // The crosshair sample follows the same rule as the grid, so the aim point is not min(depth, plane).
         val center = HitTesting.wallSample(input.centerHits, camera, input.depthEnabled)
         if (center != null) {
-            add(center)
+            add(center, crosshair = true)
             centerPoints += center.world
             aimDistances += center.world.distanceTo(camera)
         } else {
@@ -450,6 +466,7 @@ private class WallSampler(
         }
         // Plane evidence is kept apart from the samples: it backs the fallback and the diagnostics.
         HitTesting.firstVerticalPlane(input.centerHits, camera)?.let { centerPlane = it }
+        cameras += camera
         viewerX += camera.x
         viewerY += camera.y
         viewerZ += camera.z
@@ -459,9 +476,11 @@ private class WallSampler(
         return if (done) finish(aimDistance) else null
     }
 
-    private fun add(sample: WallSample) {
+    private fun add(sample: WallSample, crosshair: Boolean = false) {
         points += sample.world
         kindCounts[sample.kind.ordinal]++
+        // `frames` is still the index of the frame being sampled (it is counted at the end of the frame).
+        recorded += WallCaptureRecord.Sample(frames, KIND_CODES[sample.kind.ordinal], crosshair, sample.world)
     }
 
     private fun finish(aimDistance: Double?): MeasureResult {
@@ -480,6 +499,7 @@ private class WallSampler(
         }
         // Which evidence may be returned (never an un-aimed fit, never a plane that is not at the crosshair).
         val decision = WallOutcome.decide(sampleFit, aimPoint, centerPoints, band, planeObservation, viewer, points.size)
+        measured = Measured(viewer, aimPoint, planeObservation?.let { Segment2(it.extentStart, it.extentEnd) })
         summary = try {
             summarize(aimDistance, aimPoint, band, sampleFit, planeObservation, viewer) +
                 " | result " + decision.source.name + (decision.fit.hint?.let { " (\"$it\")" } ?: "")
@@ -547,9 +567,43 @@ private class WallSampler(
     /** After a result: the full summary. After a timeout or lost tracking: what was collected so far. */
     override fun describe(): String = summary.ifEmpty { sampleCounts() }
 
+    /**
+     * Keeps the samples of this capture for a later replay ([WallCaptureRecord.replay]), also when it timed
+     * out or tracking was lost: those are the captures worth looking at. This sampler gets no more frames
+     * once its measurement ended, so the lists can be handed over as they are.
+     */
+    override fun keepRawData(outcome: String) {
+        if (frames == 0 || recorded.isEmpty()) return
+        // Without a result, what the estimator WOULD have been given (the same rules as in finish()).
+        val used = measured ?: Measured(
+            Vec3(viewerX / frames, viewerY / frames, viewerZ / frames),
+            WallSampling.aimPoint(centerPoints, frames, WallSampling.wallBand(request.floorY, request.ceilingY)),
+            null,
+        )
+        WallCaptureLog.record(
+            WallCaptureRecord(
+                timeMillis = System.currentTimeMillis(),
+                floorY = request.floorY,
+                ceilingY = request.ceilingY,
+                viewer = used.viewer,
+                aimPoint = used.aimPoint,
+                cameras = cameras,
+                samples = recorded,
+                plane = used.plane,
+                note = outcome,
+            ),
+        )
+    }
+
+    /** What finish() handed to the estimator, and the wall plane it saw under the crosshair. */
+    private class Measured(val viewer: Vec3, val aimPoint: Vec3?, val plane: Segment2?)
+
     private companion object {
         /** Samples within this many inlier bands of the fitted line count toward the logged robust sigma. */
         const val SIGMA_WINDOW_FACTOR = 4.0
+
+        /** [WallCaptureRecord.Sample.kind] for each [WallSampleKind], by ordinal. */
+        val KIND_CODES = CharArray(WallSampleKind.entries.size) { WallSampleKind.entries[it].name[0] }
     }
 }
 

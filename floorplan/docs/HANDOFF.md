@@ -11,8 +11,14 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
   the camera / ARCore part can only be checked on a device.
 * **Feature freeze.** Fixes only until the first on-device test (`docs/FIELD-TEST.md`).
 * A narrow regression check of round 3 (major problems only, each finding verified by a second agent) found
-  two bugs in the first four packages, both fixed; the check of the accuracy and AR packages was running
-  when this was written.
+  three bugs in the first four packages, all fixed (confirming a wall at its shown length did nothing; the
+  "Scan interrupted" dialog could discard a restorable room; calibrating from a hand-set wall stored a
+  meaningless factor). The check of the accuracy and AR packages was running when this was written.
+* **Every wall capture keeps its raw samples on the phone** (`diagnostics/WallCaptureLog`, newest 60, in the
+  app's private storage). "Share scan log" appends them to the shared text file. On a computer,
+  `WallCaptureRecord.decodeAll(text)` reads them out of the whole file and `record.replay(config)` runs the
+  estimator on them again, so thresholds can be tuned on real captures without a re-scan. Timed-out and
+  tracking-lost captures are kept too.
 
 ## Headless UI walkthrough (the only check that the UI starts and draws)
 * `./gradlew :app:testDebugUnitTest` runs `walkthrough/AppWalkthroughTest` and `CaptureWalkthroughTest` on
@@ -53,6 +59,24 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
   reading the depth image and its confidence map. Evaluate after the first device data.
 * Every threshold in the AR layer and the estimator is calibrated on simulation only.
 
+## Ideas from similar projects (after the first phone test; nothing here is being built now)
+A GitHub survey (November 2026, READMEs only) found no open Android project that produces a multi-room
+dimensioned plan: the field is iPhone LiDAR apps on Apple RoomPlan, CubiCasa's capture-only SDK sample (the
+plan is made on their servers), a few early-alpha ARCore depth tools and offline research pipelines. Worth
+taking, in order:
+1. Read ARCore's raw depth image and its confidence map instead of hit tests (`depthfold`, `denseframe`,
+   Depth Lab). Note from `depthfold`: the depth image can belong to an earlier frame, so pair it with the
+   pose of its own timestamp. Decide from the recorded captures.
+2. Fixture and furniture symbols placed by hand (toilet, tub, sink, counters, appliances): the biggest
+   visible difference from a CubiCasa plan.
+3. Job-site outputs: a materials take-off (flooring with waste, paint, drywall, baseboard) and CSV from the
+   areas `Measurements` already computes; photos pinned to the plan with their direction.
+4. A ± on every dimension, only once the phone data shows the estimator's precision figures are honest.
+5. Small: mark tape-checked dimensions on the exported plan (today only the editor shows them); a low-light
+   warning; aligning rooms from separate scans by a shared doorway; GLB / OBJ export of the 3D model.
+Not planned: cloud drafting, accounts and sync, AI furniture layout, damage detection, voice room labels,
+a compass north arrow.
+
 ## Accuracy: what is and is not known
 `core/build/sim-report.txt` (written by `:core:test`) is the full report. Summary, wall-length error in mm:
 
@@ -82,6 +106,7 @@ _Last updated 2026-11-25. Branch: `claude/floorplan-generation-app-hlws61`._
 * Follow `docs/FIELD-TEST.md`. Diagnostics come back either way: **Settings → About → Share scan log** on
   the phone alone, or `adb logcat -s FloorPlanScan` with the phone on USB. One line per measurement: samples
   by kind, noise against expected, the depth fit and the ARCore plane side by side, the result or the hint.
+  The shared file also carries the raw samples of every wall capture (see above).
 * One ordinary room. Tape-measure its four walls first. Scan it three times, in one session.
 * Compare each wall with the tape. Then calibrate from one wall and compare again.
 * Note any wall that would not capture, and what it looked like (plain, glossy, window).
